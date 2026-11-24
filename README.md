@@ -13,9 +13,11 @@ One owned home for your files and context, with a computer attached. Agents conn
 | `server/` | Drive service: store, reading, ring check, policy, sessions, merge, sandboxes, MCP, app API |
 | `app/` | Phone-first web app |
 | `cli/` | `drive put`, `drive watch`, `drive stats` |
-| `sandbox/` | Session sandbox image, with `dsearch`, `dgrep`, `dmeta` |
+| `toolchain/` | Read-only tools for session sandboxes (mxc): `dsearch`, `dgrep`, `dmeta` |
 | `test/` | Synthetic fixtures, invariant tests, leak suite, end-to-end tests |
 | `spikes/` | Phase A experiments; throwaway |
 | `docs/decisions/` | Decision records |
 
 Test data is always synthetic. Real data lives outside the checkout.
+
+MIT licensed; see [LICENSE](LICENSE).
