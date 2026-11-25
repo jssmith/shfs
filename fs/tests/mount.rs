@@ -474,6 +474,41 @@ fn inode_table_stays_bounded(e: Env) {
     assert_eq!(last.ino(), fs::metadata(e.p("big/n19999")).unwrap().ino());
 }
 
+fn hard_links_are_refused(e: Env) {
+    fs::write(e.p("notes/mine.txt"), b"mine\n").unwrap();
+    fs::create_dir(e.p("notes/dir")).unwrap();
+    let before = (e.ls("notes"), e.whiteouts());
+    for src in ["notes/todo.txt", "notes/mine.txt", "notes/dir", "_by/project/acme/plan.md"] {
+        for dst in ["notes/link", "projects/link", "brand-new"] {
+            assert_eq!(errno(fs::hard_link(e.p(src), e.p(dst))), libc::EPERM, "{src} -> {dst}");
+        }
+    }
+    assert_eq!((e.ls("notes"), e.whiteouts()), before);
+    assert!(!e.upper("notes/link").exists() && !e.upper("brand-new").exists());
+    assert!(!e.upper("notes/todo.txt").exists(), "no copy-up for a refused link");
+    // Git creates object files with link() and falls back to rename.
+    if std::process::Command::new("git").arg("--version").output().is_ok() {
+        let repo = e.p("repo");
+        fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(["-c", "user.name=a8", "-c", "user.email=a8@example.invalid", "-c", "init.defaultBranch=main"])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        };
+        git(&["init", "-q"]);
+        fs::write(repo.join("a.txt"), b"a\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "one"]);
+        assert_eq!(git(&["log", "--format=%s"]).trim(), "one");
+        assert_eq!(git(&["status", "--porcelain"]).trim(), "");
+    }
+}
+
 macro_rules! both_modes {
     ($($name:ident),* $(,)?) => {
         mod zero_timeouts { $( #[test] fn $name() { super::$name(super::Env::new(false)) } )* }
@@ -504,4 +539,5 @@ both_modes!(
     unannounced_change_is_picked_up,
     added_item_appears,
     inode_table_stays_bounded,
+    hard_links_are_refused,
 );

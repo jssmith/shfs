@@ -1023,6 +1023,13 @@ impl FileSystem for DriveFs {
         Ok(())
     }
 
+    /// Hard links are not supported: always EPERM, before anything is touched. EPERM is what
+    /// link(2) returns on a file system that has no hard links (it is what the kernel returns
+    /// itself when a file system has no `link` operation), and tools that use links fall back
+    /// on it: Git renames its object files instead, `cp -l` and `ln` report the error.
+    /// Supporting them would mean two inodes sharing content in a path-based file system, with
+    /// the kernel's cached size and times of one going stale when the other is written, and
+    /// nothing in the store to keep the link in.
     fn link(&self, _ctx: &Context, _ino: u64, _np: u64, _nn: &CStr) -> io::Result<Entry> {
         Err(err(libc::EPERM))
     }
