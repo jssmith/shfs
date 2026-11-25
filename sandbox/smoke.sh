@@ -108,5 +108,5 @@ t6=$(ms)
 size=$(du -s --apparent-size --block-size=1M "$rootfs" | cut -f1)
 files=$(find "$rootfs" -xdev | wc -l)
 printf '{"platform":"%s","rootfs_mb":%s,"rootfs_files":%s,"run_detach_ms":%s,"cold_start_to_first_exec_ms":%s,"warm_exec_ms":%s,"stop_ms":%s,"checks_ok":%s}\n' \
-  "$platform" "$size" "$files" $((t1-t0)) $((t2-t0)) $((t4-t3)) $((t6-t5)) $([ $fail = 0 ] && echo true || echo false)
+  "$platform" "$size" "$files" $((t1-t0)) $((t2-t0)) $((t4-t3)) $((t6-t5)) "$([ $fail = 0 ] && echo true || echo false)"
 exit $fail

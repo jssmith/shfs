@@ -35,6 +35,7 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 : "${NODE_MAJOR:=22}"
 : "${SKIP_STEPS:=}"
 export DEBIAN_FRONTEND=noninteractive
+export HOME="${HOME:-/root}"   # cloud-init user data may run without HOME; npm needs it
 
 has_systemd() { [ -d /run/systemd/system ]; }
 log() { printf '\n[setup] %s\n' "$*"; }
@@ -105,7 +106,7 @@ s_gvisor() {
 
 s_cloudflared() {
   if ! command -v cloudflared >/dev/null; then
-    mkdir -p --mode=0755 /usr/share/keyrings
+    install -d -m 0755 /usr/share/keyrings
     curl -fsSL --retry 3 https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg
     echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
       > /etc/apt/sources.list.d/cloudflared.list

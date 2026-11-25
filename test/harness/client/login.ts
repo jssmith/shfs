@@ -23,9 +23,9 @@ export interface LoginOptions extends Credentials {
   screenshot?: string;
 }
 
-const USER_SEL = process.env.LOGIN_USER_SELECTOR ?? 'input[name="username"], input[name="user"], input[name="email"], input[type="email"]';
-const PASS_SEL = process.env.LOGIN_PASSWORD_SELECTOR ?? 'input[type="password"]';
-const SUBMIT_SEL = process.env.LOGIN_SUBMIT_SELECTOR ?? 'button[type="submit"], input[type="submit"]';
+export const USER_SEL = process.env.LOGIN_USER_SELECTOR ?? 'input[name="username"], input[name="user"], input[name="email"], input[type="email"]';
+export const PASS_SEL = process.env.LOGIN_PASSWORD_SELECTOR ?? 'input[type="password"]';
+export const SUBMIT_SEL = process.env.LOGIN_SUBMIT_SELECTOR ?? 'button[type="submit"], input[type="submit"]';
 
 /** Load Playwright from wherever it is installed (it is preinstalled globally here). */
 // Playwright is not a dependency of the repository (it is preinstalled here, with

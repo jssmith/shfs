@@ -16,7 +16,7 @@
 import { parseArgs } from 'node:util';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { loadPlaywright } from '../client/login.ts';
+import { loadPlaywright, USER_SEL, PASS_SEL, SUBMIT_SEL } from '../client/login.ts';
 
 const { values } = parseArgs({
   options: {
@@ -90,10 +90,10 @@ try {
   await page.goto(authorize);
   const driveOrigin = new URL(mcpUrl).origin;
   if (new URL(page.url()).origin === driveOrigin) {
-    const user = page.locator('input[name="username"], input[type="email"]').first();
+    const user = page.locator(USER_SEL).first();
     if (await user.count()) await user.fill(process.env.AGENT_DRIVE_TEST_USER ?? 'test');
-    await page.locator('input[type="password"]').first().fill(process.env.AGENT_DRIVE_TEST_PASSWORD ?? 'test-password');
-    await page.locator('button[type="submit"], input[type="submit"]').first().click();
+    await page.locator(PASS_SEL).first().fill(process.env.AGENT_DRIVE_TEST_PASSWORD ?? 'test-password');
+    await page.locator(SUBMIT_SEL).first().click();
     await page.waitForURL((u: URL) => u.origin === new URL(owui).origin, { timeout: 30_000 });
   }
   report.oauthLandedOn = new URL(page.url()).pathname;
