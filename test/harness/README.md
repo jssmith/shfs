@@ -23,3 +23,13 @@ What the real server's sign-in page needs for these to work unchanged: a
 
 Everything a run writes (tokens, OpenCode's home, Open WebUI's data) goes to
 `/tmp/a3-data/…`, never the repository. Tokens there are for the test user only.
+
+## Multi-turn session experiments (`sessions/`)
+
+`sessions/run-matrix.ts` runs scripted conversations (`sessions/conversations.ts`)
+in OpenCode and Open WebUI against a fresh drive per run, in parallel slots,
+checks each turn against the drive, and writes an ATIF-v1.8 trajectory per run
+(`sessions/atif.ts`, validated by `sessions/validate_atif.py` with Harbor's
+models and the `atif` package). `sessions/report.ts` prints the tables from the
+trajectories. Data goes under `/tmp/a6-*`. Decision record:
+`docs/decisions/0006-session-continuity-experiments.md`, which has the commands.

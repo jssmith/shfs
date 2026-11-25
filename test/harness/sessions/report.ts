@@ -107,7 +107,10 @@ const agg = [...groups].map(([k, rs]) => {
   };
 });
 
-if (values.json) { console.log(JSON.stringify({ agg, runs: pr }, null, 2)); process.exit(0); }
+// process.exit() would cut off a large piped JSON write, so the rest is skipped instead.
+if (values.json) process.stdout.write(`${JSON.stringify({ agg, runs: pr.map(({ _turns, ...r }) => ({ ...r, turns: _turns })) }, null, 2)}\n`);
+else printTables();
+function printTables() {
 const versions = [...new Set(trajs.map((t) => t.schema_version))].join(', ');
 console.log(table(agg));
 if (values.runs) { console.log(); console.log(table(pr)); }
@@ -122,3 +125,4 @@ if (values.turns) {
 }
 const sum = (f: (t: Traj) => number | undefined) => trajs.reduce((a, t) => a + (f(t) ?? 0), 0);
 console.log(`\n${trajs.length} trajectories (${versions}); tokens in ${(sum((t) => t.final_metrics?.total_prompt_tokens) / 1e6).toFixed(2)} M (cached, where reported, ${(sum((t) => t.final_metrics?.total_cached_tokens) / 1e6).toFixed(2)} M), out ${(sum((t) => t.final_metrics?.total_completion_tokens) / 1e3).toFixed(1)} k`);
+}
