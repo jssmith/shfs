@@ -14,6 +14,7 @@ Everything lives under `$AGENT_DRIVE_DATA` (default `./data`, never inside the c
 | `sessions/<dir_id>/whiteouts` | fs daemon writes, server reads | One path per line: items the session deleted or renamed away |
 | `sessions/<dir_id>/work/` | sandbox | Mounted at `/work`; never merged |
 | `sessions/<dir_id>/mnt/` | fs daemon | Where the daemon mounts the session's `/drive` on the host |
+| `sessions/<dir_id>/sock/` | server | `drive.sock`, the Unix socket the session's `drive` command talks to (v2, v3). Mounted read-only at `/run/drive` into that session's sandbox only; never merged, never shown to another session |
 
 ## 2. The session file system (server ↔ `fs/`)
 
