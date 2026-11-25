@@ -40,6 +40,12 @@ The real apps (claude.ai, ChatGPT, Claude Code) give the final answers on uncert
 | **[OpenCode](https://opencode.ai)** | Agent-in-the-loop tests: the E1 tasks over `/drive`, scripted and repeatable; long and compacted conversations to see whether the session id survives; regression runs in CI | Runs unattended (`opencode run`, JSON output); remote MCP over Streamable HTTP with OAuth (discovery, PKCE, refresh); any model provider. OAuth is done once with `opencode mcp auth`, then runs reuse the stored token |
 | **[Open WebUI](https://docs.openwebui.com/features/extensibility/mcp)** | The chat-app case: OAuth with dynamic client registration, several conversations against one drive, tools used from a chat | Native MCP (Streamable HTTP) with OAuth 2.1 and dynamic client registration documented; the closest open stand-in for a claude.ai connector |
 
+**How the build agents drive them, without a person at a browser:**
+
+1. A scripted MCP client on the official SDK for protocol tests with no model: sign-in, session ids, pending approvals, every tool. Fast and deterministic; most bugs are caught here.
+2. OpenCode as a command-line tool, here and in CI, reading its JSON output. Its first OAuth sign-in is scripted with headless Chromium (preinstalled), or test runs use a token issued directly by the drive.
+3. Open WebUI in Docker, driven through its HTTP API, with Playwright for the OAuth step and screenshots. If its API can't start tool calls on its own (to check), Playwright drives the chat page.
+
 LibreChat is the fallback for the chat-app case if Open WebUI's OAuth gets in the way. Both test clients need a model API key (§ What Johann needs).
 
 ## Who does what
