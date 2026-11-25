@@ -59,11 +59,11 @@ test('a merge with a conflict changes nothing', async () => {
   writeFileSync(path.join(ctx.sessions.dirs(s2.dir_id).upper, 'a.txt'), 'one by s2');
   writeFileSync(path.join(ctx.sessions.dirs(s2.dir_id).upper, 'c.txt'), 'three');
   expect((await mergeSession(ctx.sessions, s1.dir_id, 'checkpoint', '')).ok).toBe(true);
-  const before = JSON.stringify([ctx.drive.snapshot().entries().toArray(), ctx.drive.packages().length]);
+  const before = JSON.stringify([[...ctx.drive.snapshot().entries()], ctx.drive.packages().length]);
   const r2 = await mergeSession(ctx.sessions, s2.dir_id, 'checkpoint', '');
   expect(r2.ok).toBe(false);
   expect(r2.conflicts.map((c) => c.path)).toEqual(['a.txt']);
-  expect(JSON.stringify([ctx.drive.snapshot().entries().toArray(), ctx.drive.packages().length])).toBe(before);
+  expect(JSON.stringify([[...ctx.drive.snapshot().entries()], ctx.drive.packages().length])).toBe(before);
 });
 
 test('undo never overwrites later work', async () => {
