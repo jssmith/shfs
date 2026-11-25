@@ -91,7 +91,7 @@ try {
   const driveOrigin = new URL(mcpUrl).origin;
   if (new URL(page.url()).origin === driveOrigin) {
     const user = page.locator(USER_SEL).first();
-    if (await user.count()) await user.fill(process.env.AGENT_DRIVE_TEST_USER ?? 'test');
+    if (await user.isVisible()) await user.fill(process.env.AGENT_DRIVE_TEST_USER ?? 'test');
     await page.locator(PASS_SEL).first().fill(process.env.AGENT_DRIVE_TEST_PASSWORD ?? 'test-password');
     await page.locator(SUBMIT_SEL).first().click();
     await page.waitForURL((u: URL) => u.origin === new URL(owui).origin, { timeout: 30_000 });
