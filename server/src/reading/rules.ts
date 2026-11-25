@@ -101,8 +101,9 @@ const ASSIGNMENT = /(?<![A-Za-z])(pass(?:word|wd|phrase)?|pw|pwd|secret|token|ap
 function credentialSignals(text: string, name: string): Signal[] {
   const out: Signal[] = [];
   const squeezed = text.replace(/[ \t]*([-_])[ \t]*/g, '$1'); // OCR adds spaces around - and _
+  const despaced = text.replace(/[ \t]+/g, ''); // and inside long tokens
   for (const [rule, re] of KEY_PATTERNS) {
-    const m = re.exec(text) ?? re.exec(squeezed);
+    const m = re.exec(text) ?? re.exec(squeezed) ?? re.exec(despaced);
     if (m && !/EXAMPLE/.test(m[0])) out.push({ ring: 'ring:credentials', score: 0.97, rule, detail: mask(m[0]) });
   }
   // key = value assignments with a real-looking value
@@ -115,7 +116,7 @@ function credentialSignals(text: string, name: string): Signal[] {
       break;
     }
   }
-  const env = /^\s*(?:export\s+)?[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIALS?)[A-Z0-9_]*\s*[=:]\s*["']?([^\s"']{2,})/m.exec(text);
+  const env = /^\s*(?:export\s+)?[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIALS?)[A-Z0-9_]*\s*[=:]\s*["']?([^\s"']+)/m.exec(text);
   if (env && !PLACEHOLDER.test(env[2]!)) out.push({ ring: 'ring:credentials', score: 0.85, rule: 'env-secret', detail: `${env[1]}=${mask(env[2]!)}` });
   // password-manager export: a CSV header naming password and user columns
   const header = text.split('\n', 3).find((l) => /password/i.test(l) && /user|login/i.test(l) && /,/.test(l));
