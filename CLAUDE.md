@@ -16,7 +16,7 @@ Agent Drive: one owned home for a person's files and context, with a computer at
 - TypeScript, ES modules, strict mode, Node 22 or later. Small modules, plain functions, no framework unless it earns its place.
 - Rust for `fs/` only.
 - Writing in docs: plain, short sentences; tables for comparisons.
-- Commit messages: imperative subject; body says why. Do not include model names or identifiers in commits, code or docs.
+- Commit messages: imperative subject; body says why. Do not name the AI assistant or model that wrote the code in commits, code or docs. Naming the models a component or test uses (a local ring-check model, a test client's model) is fine and belongs in decision records.
 
 ## The shared machine
 
