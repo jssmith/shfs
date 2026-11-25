@@ -1,6 +1,7 @@
 // The shell surfaces end to end in gVisor: bash, the drive command over the
-// session's Unix socket, automatic merge (landing, coalescing, conflicts),
-// and one session's socket out of another's reach.
+// session's Unix socket, the save at the end of each changing call (and its
+// conflicts), idle sessions coming back, and one session's socket out of
+// another's reach.
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -9,7 +10,6 @@ import { put } from '../../../cli/src/index.js';
 import { connectAgent, startDrive, RUNSC, ROOTFS, type Agent, type Drive } from './harness.js';
 
 const haveSandbox = !!(RUNSC && ROOTFS);
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function content(d: Drive, p: string): Promise<string | null> {
   const e = d.ctx.drive.reachableView().find((v) => v.path === p);
@@ -43,45 +43,43 @@ describe.skipIf(!haveSandbox)('v2 in gVisor (needs AGENT_DRIVE_RUNSC and AGENT_D
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  test('bash changes merge automatically, once per burst; drive save merges at once', async () => {
+  test('each changing bash command is saved before its result returns; drive save sets the message', async () => {
     const sid = String((await agent.call('start_session', { purpose: 'update the garden plan' })).structured.session_id);
     const which = await agent.call('bash', { session_id: sid, command: 'command -v drive; echo $0; ls -la /run/drive; drive help | head -3', description: 'Look at the drive command' });
     expect(which.text).toContain('/opt/drive/bin/drive');
     expect(which.text).toContain('bash');
     expect(which.text).toMatch(/drive\.sock/);
     expect(which.text).toContain('name: agent-drive');
-    expect(which.structured.unsaved_changes).toEqual([]);
+    expect(which.structured.save).toBeNull();
 
-    // Three changing commands in a burst: one package after the last.
     const b1 = await agent.call('bash', { session_id: sid, command: "sed -i 's/tomatoes/basil/' home/notes/plan.md", description: 'Plant basil instead' });
-    expect(b1.text).toContain('Unsaved changes under /drive: update home/notes/plan.md. They save to the drive automatically in about 2 s.');
-    await agent.call('bash', { session_id: sid, command: 'echo "Water daily." >> home/notes/plan.md' });
-    await agent.call('bash', { session_id: sid, command: 'sort home/notes/seeds.txt > home/notes/sorted.txt', description: 'Sort the seed list' });
-    expect(packages(d)).toHaveLength(0);
-    await sleep(2600);
-    expect(packages(d)).toHaveLength(1);
-    expect(packages(d)[0]!.summary_claimed).toBe('Saved automatically after: Plant basil instead; echo "Water daily." >> home/notes/plan.md; Sort the seed list');
-    expect(await content(d, 'home/notes/plan.md')).toBe('# Garden plan\n\nPlant basil in May.\nWater daily.\n');
+    expect(b1.text).toMatch(/Saved to the drive: update home\/notes\/plan\.md \(package pk_[a-z2-7]+\)\.$/);
+    expect(b1.structured.save).toMatchObject({ ok: true, changes: [{ kind: 'update', path: 'home/notes/plan.md' }] });
+    expect(await content(d, 'home/notes/plan.md')).toBe('# Garden plan\n\nPlant basil in May.\n');
+    const b2 = await agent.call('bash', { session_id: sid, command: 'echo "Water daily." >> home/notes/plan.md && sort home/notes/seeds.txt > home/notes/sorted.txt' });
+    expect(b2.text).toContain('Saved to the drive: update home/notes/plan.md, create home/notes/sorted.txt');
+    expect(packages(d).map((p) => p.summary_claimed)).toEqual(['Plant basil instead', 'echo "Water daily." >> home/notes/plan.md && sort home/notes/seeds.txt > home/notes/sorted.txt']);
     expect(await content(d, 'home/notes/sorted.txt')).toBe('basil\ntomato\n');
 
     const st = await agent.call('bash', { session_id: sid, command: 'drive status' });
-    expect(st.text).toMatch(/^\[drive\] Saved to the drive: update home\/notes\/plan\.md, create home\/notes\/sorted\.txt/);
+    expect(st.text).not.toContain('[drive]');
     expect(st.text).toContain('Purpose: update the garden plan');
     expect(st.text).toContain('Unsaved changes: none.');
     expect(st.text).toContain('may not include everything the person has');
 
-    // A command that changes nothing (or only /work, or a tool cache) schedules nothing.
+    // A command that changes nothing (or only /work, or a tool cache) saves nothing.
     const quiet = await agent.call('bash', { session_id: sid, command: 'cat home/notes/plan.md > /work/copy.md; mkdir -p home/__pycache__ && echo x > home/__pycache__/a.pyc' });
-    expect(quiet.structured.unsaved_changes).toEqual([]);
+    expect(quiet.structured.save).toBeNull();
+    expect(packages(d)).toHaveLength(2);
 
     const save = await agent.call('bash', { session_id: sid, command: 'echo "- compost" >> home/notes/plan.md && drive save "Add compost to the plan" && drive status | grep "Last save"' });
     expect(save.text).toContain('exit code: 0');
     expect(save.text).toMatch(/Saved to the drive: update home\/notes\/plan\.md \(package pk_/);
     expect(save.text).toContain('(drive save)');
+    expect(save.structured.save).toBeNull(); // drive save took the change; nothing left for the end of the call
     expect(packages(d).at(-1)!.summary_claimed).toBe('Add compost to the plan');
+    expect(packages(d)).toHaveLength(3);
     expect(await content(d, 'home/notes/plan.md')).toContain('- compost');
-    await sleep(2600);
-    expect(packages(d)).toHaveLength(2); // the save took the changes; no extra automatic package
 
     const search = await agent.call('bash', { session_id: sid, command: 'drive search basil; drive search --all basil; cat /work/search-1.txt' });
     expect(search.text).toContain('/drive/home/notes/plan.md');
@@ -89,17 +87,33 @@ describe.skipIf(!haveSandbox)('v2 in gVisor (needs AGENT_DRIVE_RUNSC and AGENT_D
     expect(search.text).toContain('# drive search basil');
   }, 60_000);
 
-  test('a conflicting automatic merge is reported plainly on the next call', async () => {
+  test('a conflicting save is reported plainly in the same call', async () => {
     const sid = String((await agent.call('start_session', { purpose: 'edit the seeds' })).structured.session_id);
-    await agent.call('bash', { session_id: sid, command: 'echo carrot >> home/notes/seeds.txt' });
     await seed(d, tmp, { 'notes/seeds.txt': 'tomato\nbasil\nfrom the person\n' }); // the person, meanwhile
-    await sleep(2600);
-    const r = await agent.call('bash', { session_id: sid, command: 'cat home/notes/seeds.txt; cat /work/conflicts/home/notes/seeds.txt' });
-    expect(r.text).toMatch(/^\[drive\] merge_conflict: nothing was saved to the drive by the automatic save\. home\/notes\/seeds\.txt: changed in the drive/);
+    const r = await agent.call('bash', { session_id: sid, command: 'echo carrot >> home/notes/seeds.txt' });
+    expect(r.text).toMatch(/merge_conflict: nothing was saved to the drive\. home\/notes\/seeds\.txt: changed in the drive/);
     expect(r.text).toContain('/work/conflicts/home/notes/seeds.txt');
-    expect(r.text).toContain('from the person');
-    expect(r.text).toContain('carrot');
+    expect(r.structured.save).toMatchObject({ ok: false, reason: 'merge_conflict' });
+    const look = await agent.call('bash', { session_id: sid, command: 'cat home/notes/seeds.txt; cat /work/conflicts/home/notes/seeds.txt' });
+    expect(look.text).toContain('from the person');
+    expect(look.text).toContain('carrot');
     expect(await content(d, 'home/notes/seeds.txt')).toBe('tomato\nbasil\nfrom the person\n');
+  }, 60_000);
+
+  test('an idle session loses its sandbox and the next call carries on in a new one', async () => {
+    const sid = String((await agent.call('start_session', { purpose: 'idle and back' })).structured.session_id);
+    await agent.call('bash', { session_id: sid, command: 'echo remembered > /work/note.txt' });
+    const dir = (d.ctx.drive.db.prepare("SELECT dir_id FROM sessions WHERE purpose = 'idle and back'").get() as { dir_id: string }).dir_id;
+    const id = d.ctx.sessions.sandboxId(dir);
+    expect(await d.ctx.sessions.sandbox.list()).toContain(id);
+    d.ctx.drive.db.prepare('UPDATE sessions SET last_call_at = ? WHERE dir_id = ?').run(new Date(Date.now() - d.ctx.sessions.idleAfterMs - 1000).toISOString(), dir);
+    expect((await d.ctx.sessions.sweep()).idle).toEqual([dir]);
+    expect(await d.ctx.sessions.sandbox.list()).not.toContain(id);
+    const back = await agent.call('bash', { session_id: sid, command: 'cat /work/note.txt; drive status | head -1' });
+    expect(back.isError).toBe(false);
+    expect(back.text).toContain('remembered');
+    expect(back.text).toContain('Purpose: idle and back');
+    expect(await d.ctx.sessions.sandbox.list()).toContain(id);
   }, 60_000);
 
   test("one session's socket is out of another session's reach", async () => {
@@ -151,10 +165,8 @@ describe.skipIf(!haveSandbox)('v3 in gVisor (needs AGENT_DRIVE_RUNSC and AGENT_D
     const sid = String((await agent.call('start_session', { purpose: 'number the plan' })).structured.session_id);
     const cat = await agent.call('bash', { session_id: sid, command: 'cat -n home/notes/plan.md' });
     expect(cat.text).toContain('     2\ttwo');
-    await agent.call('bash', { session_id: sid, command: "cat > home/notes/new.md <<'EOF'\nwritten through the shell\nEOF" });
-    await sleep(2600);
+    const w = await agent.call('bash', { session_id: sid, command: "cat > home/notes/new.md <<'EOF'\nwritten through the shell\nEOF", description: 'Write a new note' });
+    expect(w.text).toContain('Saved to the drive: create home/notes/new.md');
     expect(await content(d, 'home/notes/new.md')).toBe('written through the shell\n');
-    const help = await agent.call('bash', { session_id: sid, command: 'drive help' });
-    expect(help.text).toMatch(/^\[drive\] Saved to the drive: create home\/notes\/new\.md/);
   }, 60_000);
 });

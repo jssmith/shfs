@@ -48,6 +48,20 @@ function pkgCard(p) {
     p.summary_claimed ? $('div', {}, 'Agent says: ', $('span', { class: 'q' }, '“' + p.summary_claimed + '”')) : '',
     $('div', { class: 'm' }, 'Drive observed: ' + (p.summary_observed || '')), opsList(p.operations));
 }
+function turnCard(t) {
+  const n = t.packages.length;
+  const head = $('div', {}, $('b', {}, 'Turn'), ' ', $('span', { class: 'm' }, (t.packages[n - 1] || {}).created_at + ' · ' + n + (n === 1 ? ' save' : ' saves')),
+    t.undone ? $('span', { class: 'm' }, ' (undone)') : t.turn_id ? $('button', { onclick: async () => { showTurnUndo(await api('/api/app/undo-turn', { turn_id: t.turn_id })); } }, 'Undo turn') : '');
+  return $('div', { class: 'card' }, head, ...t.packages.map(pkgCard));
+}
+function showTurnUndo(r) {
+  const box = document.getElementById('msg'); box.replaceChildren();
+  if (r.conflicts && r.conflicts.length) {
+    box.append($('p', {}, 'Undo of the turn: these changed since, so they were left as they are (undo their saves one by one to choose):'));
+    for (const c of r.conflicts) box.append($('div', {}, $('code', {}, c.path), ' ', c.reason));
+  }
+  load();
+}
 async function load() {
   const s = await api('/api/app/sessions');
   const box = document.getElementById('sessions'); box.replaceChildren();
@@ -64,7 +78,7 @@ async function load() {
       $('div', { class: 'm' }, 'Observed by the drive: ' + reads.length + ' reads, ' + writes.length + ' writes, ' + runs.length + ' commands, ' + x.merges.length + ' merges'),
       $('details', {}, $('summary', {}, 'What it read and ran'),
         $('ul', {}, ...x.activity.slice().reverse().map(e => $('li', {}, $('span', { class: 'm' }, e.ts.slice(11, 19) + ' '), e.op + ' ', $('code', {}, e.detail ? (e.detail.path || e.detail.command || e.detail.query || '') : ''), e.op === 'run' && e.detail ? ' → exit ' + e.detail.exit : '')))),
-      ...x.merges.map(pkgCard)));
+      ...x.turns.map(turnCard)));
   }
   const it = await api('/api/app/items');
   const pk = document.getElementById('packages'); pk.replaceChildren(...it.packages.map(pkgCard));

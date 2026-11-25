@@ -1,17 +1,16 @@
 // The shell-first surfaces. v2: start_session, bash, read, write, edit, with
 // the argument names and conventions of coding-agent harnesses (Claude
-// Code's Bash, Read, Write, Edit). v3: start_session and bash only. Changes
-// under /drive merge automatically (merge/auto.ts); the rest of the drive is
+// Code's Bash, Read, Write, Edit). v3 (the default): start_session and bash
+// only. Changes under /drive merge at the end of the call that made them, and
+// the result says how it went (merge/auto.ts); the rest of the drive is
 // the `drive` command inside the shell (sessions/drive-command.ts). The skill
 // is `drive help` and the resource skill://agent-drive/SKILL.md.
 // docs/mcp-tools.md quotes every string here.
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { diffWithIgnored } from '../merge/merge.js';
 import { isToolCache } from '../merge/ignore.js';
-import { outcomeText, type AutoMerge } from '../merge/auto.js';
+import { outcomeData, outcomeText, CONFLICT_NEXT_STEP, type AutoMerge, type MergeOutcome } from '../merge/auto.js';
 import { hiddenCountsText } from '../sessions/drive-command.js';
-import type { Sessions } from '../sessions/manager.js';
 import { callerFrom, plural, RESULT_SCHEMA, type Extra, type Kit } from './common.js';
 import { PURPOSE_EXAMPLES } from './classic.js';
 import { PARTIAL_VIEW, SHELL_SKILL } from './skill.js';
@@ -22,10 +21,10 @@ export const LINE_CAP = 2000;
 export const BASH_TIMEOUT_MS = 120_000;
 export const BASH_TIMEOUT_MAX_MS = 600_000;
 
-const SAVES = 'Changes under /drive save to the drive automatically about 2 s after your last change; the next result says whether the save worked.';
+const SAVES = 'Changes under /drive are saved to the drive when the call that makes them ends, and the result says whether the save worked.';
 
 export const SHELL_WORDING = {
-  start_session: `Open a session in the person's drive: a Linux shell with their files at /drive. Call it once per conversation and keep the session_id it returns for every later call, including later requests in the same conversation. Changes under /drive save to the drive automatically. Examples of a purpose: ${PURPOSE_EXAMPLES.join(', ')}.`,
+  start_session: `Open a session in the person's drive: a Linux shell with their files at /drive. Call it once per conversation and keep the session_id it returns for every later call, including later requests in the same conversation. Changes under /drive are saved to the drive automatically. Examples of a purpose: ${PURPOSE_EXAMPLES.join(', ')}.`,
   purpose: `What you are going to do, in a sentence, e.g. ${PURPOSE_EXAMPLES.join(' or ')}`,
   session_id: 'The session_id returned by start_session; the same one for the whole conversation',
   bash: (v3: boolean) =>
@@ -39,10 +38,10 @@ export const SHELL_WORDING = {
   read_path: 'The file to read, e.g. /drive/household/notes/plan.md',
   offset: 'The line number to start reading from (1 is the first line). Only for files too long to read at once',
   limit: `The number of lines to read (default ${READ_LIMIT})`,
-  write: 'Write a file in the session, replacing it if it exists; folders are created as needed. Under /drive the file saves to the drive automatically about 2 s after your last change; under /work it stays scratch. Prefer edit for changing part of an existing file.',
+  write: 'Write a file in the session, replacing it if it exists; folders are created as needed. Under /drive the file is saved to the drive before this call returns; under /work it stays scratch. Prefer edit for changing part of an existing file.',
   write_path: 'The file to write, e.g. /drive/household/notes/summary.md',
   content: 'The complete content of the file',
-  edit: 'Replace exact text in a file in the session. old_string must appear in the file exactly once (include enough surrounding text to make it unique), unless replace_all is true. Keep the file\'s indentation exactly. Under /drive the change saves to the drive automatically. Read the file first.',
+  edit: 'Replace exact text in a file in the session. old_string must appear in the file exactly once (include enough surrounding text to make it unique), unless replace_all is true. Keep the file\'s indentation exactly. Under /drive the change is saved to the drive before this call returns. Read the file first.',
   edit_path: 'The file to edit, e.g. /drive/household/notes/plan.md',
   old_string: 'The exact text to replace',
   new_string: 'The text to replace it with (must differ from old_string)',
@@ -68,14 +67,6 @@ export function numberLines(text: string, offset = 1, limit = READ_LIMIT): { out
   return { out, total, first, last: first + slice.length - 1 };
 }
 
-/** What a changing call tells the agent about its changes under /drive. */
-async function changedNote(sessions: Sessions, dir_id: string): Promise<{ note: string; changes: { kind: string; path: string }[] } | null> {
-  const { changes } = await sessions.lock.run(dir_id, () => diffWithIgnored(sessions, dir_id));
-  if (!changes.length) return null;
-  const list = changes.slice(0, 20).map((c) => (c.from_path ? `${c.kind} ${c.from_path} → ${c.path}` : `${c.kind} ${c.path}`)).join(', ') + (changes.length > 20 ? `, and ${changes.length - 20} more` : '');
-  return { note: `Unsaved changes under /drive: ${list}. They save to the drive automatically in about 2 s.`, changes: changes.map((c) => ({ kind: c.kind, path: c.path })) };
-}
-
 export function registerShell(kit: Kit, surface: 'v2' | 'v3'): void {
   const { server, ctx, ok, fail, withSession, record, clientInfo } = kit;
   const { sessions } = ctx;
@@ -85,17 +76,7 @@ export function registerShell(kit: Kit, surface: 'v2' | 'v3'): void {
   const sid = z.string().optional().describe(SHELL_WORDING.session_id);
   const W = SHELL_WORDING;
 
-  /** Outcomes of automatic merges since the last call go at the top of this result. */
-  function withReports(dir_id: string, res: CallToolResult): CallToolResult {
-    const reports = auto.takeReports(dir_id);
-    if (!reports.length) return res;
-    const head = reports.map((o) => `[drive] ${outcomeText(o)}`).join('\n');
-    const content = [{ type: 'text' as const, text: `${head}\n\n${(res.content[0] as { text?: string } | undefined)?.text ?? ''}` }, ...res.content.slice(1)];
-    const saves = reports.map((o) => ({ at: o.at, ok: o.result.ok, pkg_id: o.result.pkg_id ?? null, changes: o.result.changes, conflicts: o.result.conflicts }));
-    return { ...res, content, structuredContent: { ...(res.structuredContent ?? {}), automatic_saves: saves } };
-  }
-
-  /** A session tool on this surface: typed errors with shell-specific next steps, merge reports on every result. */
+  /** A session tool on this surface: typed errors with shell-specific next steps. */
   function tool<A extends { session_id?: string }>(name: string, fn: (dir_id: string, args: A) => Promise<CallToolResult>) {
     return withSession<A>(name, async (row, args) => {
       let res: CallToolResult;
@@ -106,7 +87,7 @@ export function registerShell(kit: Kit, surface: 'v2' | 'v3'): void {
         if (reason && SHELL_NEXT_STEP[reason]) res = fail(reason, (e as Error).message.slice(reason.length + 2), {}, SHELL_NEXT_STEP[reason]);
         else throw e;
       }
-      return withReports(row.dir_id, res);
+      return res;
     });
   }
 
@@ -126,7 +107,7 @@ export function registerShell(kit: Kit, surface: 'v2' | 'v3'): void {
           'Keep this session_id for this whole conversation, including later requests. Pass it to every other tool; it is a secret and nothing shows it again.',
           `/drive: ${plural(s.files, 'file')}. Top level: ${top}.`,
           `Topics matching your purpose: ${s.topics.join(', ') || 'none yet'}.`,
-          'Changes you make under /drive save to the drive automatically, about 2 s after your last change. /work is scratch and is never saved.',
+          'Changes you make under /drive are saved to the drive when the call that makes them ends; each result says whether the save worked. /work is scratch and is never saved.',
           `${PARTIAL_VIEW} Hidden from sessions: ${hiddenCountsText(s.hidden)}.`,
           'In the shell: drive help (how to work here), drive search <words>, drive status, drive save "message".',
         ].join('\n'),
@@ -150,32 +131,26 @@ export function registerShell(kit: Kit, surface: 'v2' | 'v3'): void {
       ...out,
     },
     tool('bash', async (dir_id, { command, timeout, description }: { session_id?: string; command: string; timeout?: number; description?: string }) => {
-      auto.begin(dir_id);
-      let note: string | undefined;
-      let changed: Awaited<ReturnType<typeof changedNote>> = null;
+      const before = await sessions.driveStamp(dir_id);
+      let r;
       try {
-        const before = await sessions.driveStamp(dir_id);
-        let r;
-        try {
-          r = await sessions.run(dir_id, command, (timeout ?? BASH_TIMEOUT_MS) / 1000, { shell: 'bash' });
-        } catch (e) {
-          console.error('sandbox error:', e);
-          return fail('sandbox_unavailable', 'the sandbox could not start');
-        }
-        if ((await sessions.driveStamp(dir_id)) !== before) changed = await changedNote(sessions, dir_id);
-        if (changed) note = (description?.trim() || command.replace(/\s+/g, ' ').slice(0, 200)).slice(0, 300);
-        const parts = [`exit code: ${r.exitCode}${r.timedOut ? ' (timed out)' : ''}`];
-        if (r.stdout) parts.push(`stdout:\n${r.stdout}`);
-        if (r.stderr) parts.push(`stderr:\n${r.stderr}`);
-        if (r.truncated) parts.push(`(output cut at 64 KB; full output in ${r.fullOutput})`);
-        if (changed) parts.push(changed.note);
-        return ok(parts.join('\n'), {
-          exit_code: r.exitCode, timed_out: r.timedOut, truncated: r.truncated, ...(r.fullOutput ? { full_output: r.fullOutput } : {}),
-          unsaved_changes: changed?.changes ?? [],
-        });
-      } finally {
-        auto.end(dir_id, note);
+        r = await sessions.run(dir_id, command, (timeout ?? BASH_TIMEOUT_MS) / 1000, { shell: 'bash' });
+      } catch (e) {
+        console.error('sandbox error:', e);
+        return fail('sandbox_unavailable', 'the sandbox could not start');
       }
+      // Option A: a command that changed /drive is saved before its result returns.
+      let saved: MergeOutcome | null = null;
+      if ((await sessions.driveStamp(dir_id)) !== before) saved = await auto.afterChange(dir_id, (description?.trim() || command.replace(/\s+/g, ' ').slice(0, 200)).slice(0, 300));
+      const parts = [`exit code: ${r.exitCode}${r.timedOut ? ' (timed out)' : ''}`];
+      if (r.stdout) parts.push(`stdout:\n${r.stdout}`);
+      if (r.stderr) parts.push(`stderr:\n${r.stderr}`);
+      if (r.truncated) parts.push(`(output cut at 64 KB; full output in ${r.fullOutput})`);
+      if (saved) parts.push(outcomeText(saved));
+      return ok(parts.join('\n'), {
+        exit_code: r.exitCode, timed_out: r.timedOut, truncated: r.truncated, ...(r.fullOutput ? { full_output: r.fullOutput } : {}),
+        save: saved ? outcomeData(saved) : null,
+      });
     }),
   );
 
@@ -210,12 +185,17 @@ export function registerShell(kit: Kit, surface: 'v2' | 'v3'): void {
     }),
   );
 
-  /** For write and edit: under /drive (and not a tool cache), the change waits for the automatic merge. */
-  async function afterChange(dir_id: string, where: 'drive' | 'work', rel: string, what: string): Promise<string> {
-    if (where === 'work') return '/work is scratch and is never saved to the drive.';
-    if (isToolCache(rel)) return 'This path is a tool cache; it is not saved to the drive.';
-    auto.end(dir_id, what);
-    return 'It saves to the drive automatically in about 2 s.';
+  /**
+   * For write and edit: under /drive (and not a tool cache) the change is
+   * saved now. A conflict makes the call fail: the file in /drive is then the
+   * drive's version, and the agent's is under /work/conflicts/.
+   */
+  async function saveAfter(dir_id: string, where: 'drive' | 'work', rel: string, what: string, done: string, extra: Record<string, unknown>): Promise<CallToolResult> {
+    if (where === 'work') return ok(`${done} /work is scratch and is never saved to the drive.`, extra);
+    if (isToolCache(rel)) return ok(`${done} This path is a tool cache; it is not saved to the drive.`, extra);
+    const o = await auto.afterChange(dir_id, what);
+    if (o && !o.result.ok) return fail('merge_conflict', `${done.replace(/\.$/, '')} in this session, but ${outcomeText(o).replace(/^merge_conflict: /, '').replace(` ${CONFLICT_NEXT_STEP}`, '')}`, { ...extra, save: outcomeData(o) }, CONFLICT_NEXT_STEP);
+    return ok(`${done} ${o ? outcomeText(o) : 'Nothing to save: the file is as it was in the drive.'}`, { ...extra, save: o ? outcomeData(o) : null });
   }
 
   server.registerTool(
@@ -226,16 +206,8 @@ export function registerShell(kit: Kit, surface: 'v2' | 'v3'): void {
       ...out,
     },
     tool('write', async (dir_id, { file_path, content }: { session_id?: string; file_path: string; content: string }) => {
-      auto.begin(dir_id);
-      let ended = false;
-      try {
-        const r = await sessions.writeAny(dir_id, file_path, content);
-        const tail = await afterChange(dir_id, r.where, r.rel, `write ${r.shown}`);
-        ended = r.where === 'drive' && !isToolCache(r.rel);
-        return ok(`Wrote ${r.bytes} bytes to ${r.shown}. ${tail}`, { path: r.shown, bytes: r.bytes });
-      } finally {
-        if (!ended) auto.end(dir_id);
-      }
+      const r = await sessions.writeAny(dir_id, file_path, content);
+      return saveAfter(dir_id, r.where, r.rel, `write ${r.shown}`, `Wrote ${r.bytes} bytes to ${r.shown}.`, { path: r.shown, bytes: r.bytes });
     }),
   );
 
@@ -253,20 +225,14 @@ export function registerShell(kit: Kit, surface: 'v2' | 'v3'): void {
       ...out,
     },
     tool('edit', async (dir_id, a: { session_id?: string; file_path: string; old_string: string; new_string: string; replace_all?: boolean }) => {
-      auto.begin(dir_id);
-      let ended = false;
-      try {
-        const r = await sessions.editFile(dir_id, a.file_path, a.old_string, a.new_string, !!a.replace_all);
-        const tail = await afterChange(dir_id, r.where, r.rel, `edit ${r.shown}`);
-        ended = r.where === 'drive' && !isToolCache(r.rel);
-        // A few numbered lines around the (first) change, as the file is now.
-        const line = r.text.slice(0, r.at).split('\n').length;
-        const span = a.new_string.split('\n').length;
-        const snip = numberLines(r.text, Math.max(1, line - 3), span + 6).out;
-        return ok(`Edited ${r.shown}: replaced ${plural(r.count, 'occurrence')}. ${tail}\n${snip}`, { path: r.shown, replaced: r.count });
-      } finally {
-        if (!ended) auto.end(dir_id);
-      }
+      const r = await sessions.editFile(dir_id, a.file_path, a.old_string, a.new_string, !!a.replace_all);
+      // A few numbered lines around the (first) change, as the file is now.
+      const line = r.text.slice(0, r.at).split('\n').length;
+      const span = a.new_string.split('\n').length;
+      const snip = numberLines(r.text, Math.max(1, line - 3), span + 6).out;
+      const res = await saveAfter(dir_id, r.where, r.rel, `edit ${r.shown}`, `Edited ${r.shown}: replaced ${plural(r.count, 'occurrence')}.`, { path: r.shown, replaced: r.count });
+      if (!res.isError) (res.content[0] as { text: string }).text += `\n${snip}`;
+      return res;
     }),
   );
 
