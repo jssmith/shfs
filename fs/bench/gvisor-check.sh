@@ -3,18 +3,19 @@
 # sandbox with it at /drive (--file-access-mounts=shared, --network=none), and repeats the key
 # checks from inside. Cleans up the sandbox and the mount on exit, also after failures.
 # Usage: [FS_FLAGS="--entry-timeout-ms 60000 --attr-timeout-ms 60000"] gvisor-check.sh [rootfs]
-# (rootfs default /tmp/a2-gv/rootfs, see make-rootfs.sh; FS_FLAGS are extra daemon flags)
+# (rootfs default /tmp/${p}-gv/rootfs, see make-rootfs.sh; FS_FLAGS are extra daemon flags)
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-bin=$here/../target/release/agent-drive-fs
-rootfs=${1:-/tmp/a2-gv/rootfs}
-data=/tmp/a2-data/check
-id=a2-check
-sbx=a2-check-sbx
+bin=${BIN:-$here/../target/release/agent-drive-fs}
+p=${FS_PREFIX:-a2}  # name prefix for mounts, sandboxes, processes and /tmp data
+rootfs=${1:-/tmp/${p}-gv/rootfs}
+data=/tmp/${p}-data/check
+id=${p}-check
+sbx=${p}-check-sbx
 mnt=$data/sessions/$id/mnt
-work=/tmp/a2-gv/check-work
-bundle=/tmp/a2-gv/check-bundle
-runsc=(runsc --root /tmp/a2-runsc --network=none --file-access-mounts=shared)
+work=/tmp/${p}-gv/check-work
+bundle=/tmp/${p}-gv/check-bundle
+runsc=(runsc --root /tmp/${p}-runsc --network=none --file-access-mounts=shared)
 pass=0
 fail=0
 
@@ -23,6 +24,7 @@ cleanup() {
   "${runsc[@]}" delete -force "$sbx" >/dev/null 2>&1
   [ -n "${daemon:-}" ] && kill -INT "$daemon" 2>/dev/null && wait "$daemon" 2>/dev/null
   mountpoint -q "$mnt" && fusermount3 -u "$mnt"
+  umount /tmp/${p}-runsc/null-netns 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -36,16 +38,16 @@ check() { # description, expected, actual
 ex() { "${runsc[@]}" exec "$sbx" "$@" 2>&1; }
 
 rm -rf "$data" "$work" "$bundle"
-mkdir -p "$work" "$bundle" /tmp/a2-runsc
+mkdir -p "$work" "$bundle" /tmp/${p}-runsc
 "$bin" stub --data "$data" --dir-id "$id" --synthetic >/dev/null
-"$bin" mount --data "$data" --dir-id "$id" --name a2-fsd-check ${FS_FLAGS:-} >/tmp/a2-gv/check-daemon.log 2>&1 &
+"$bin" mount --data "$data" --dir-id "$id" --name ${p}-fsd-check ${FS_FLAGS:-} >/tmp/${p}-gv/check-daemon.log 2>&1 &
 daemon=$!
 for _ in $(seq 50); do mountpoint -q "$mnt" && break; sleep 0.1; done
-mountpoint -q "$mnt" || { echo "mount failed"; cat /tmp/a2-gv/check-daemon.log; exit 1; }
+mountpoint -q "$mnt" || { echo "mount failed"; cat /tmp/${p}-gv/check-daemon.log; exit 1; }
 
 python3 "$here/bundle.py" "$bundle" "$rootfs" "/drive=$mnt" "/work=$work"
-"${runsc[@]}" run -bundle "$bundle" -detach "$sbx" </dev/null >/tmp/a2-gv/check-sandbox.log 2>&1 \
-  || { echo "sandbox failed"; cat /tmp/a2-gv/check-sandbox.log; exit 1; }
+"${runsc[@]}" run -bundle "$bundle" -detach "$sbx" </dev/null >/tmp/${p}-gv/check-sandbox.log 2>&1 \
+  || { echo "sandbox failed"; cat /tmp/${p}-gv/check-sandbox.log; exit 1; }
 
 upper=$data/sessions/$id/upper
 check "listing of /drive" "_by notes projects" "$(ex ls /drive | xargs)"

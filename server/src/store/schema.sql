@@ -93,11 +93,15 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS session_view (
   dir_id    TEXT NOT NULL,
   path      TEXT NOT NULL,       -- path under /drive, no leading slash
-  kind      TEXT NOT NULL CHECK (kind IN ('file', 'symlink')),
+  kind      TEXT NOT NULL CHECK (kind IN ('file', 'symlink', 'dir')),  -- 'dir': a directory
+                                 -- that exists even with nothing visible in it
   item_id   TEXT,                -- for kind = 'file'
   version   INTEGER,             -- for kind = 'file'
   target    TEXT,                -- for kind = 'symlink', relative target
   writable  INTEGER NOT NULL DEFAULT 1,
+  mode      INTEGER,             -- permission bits, e.g. 493 (0o755); NULL: 0o644 for a file,
+                                 -- 0o755 for a dir; writable = 0 clears a file's write
+                                 -- bits; ignored for symlinks
   PRIMARY KEY (dir_id, path)
 );
 CREATE TABLE IF NOT EXISTS session_view_epoch (

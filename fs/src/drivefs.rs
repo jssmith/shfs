@@ -1,7 +1,9 @@
 //! The session's `/drive`: `session_view` ∪ `upper/` − `whiteouts` (docs/contracts.md §2).
 //!
 //! The file system is path based. Inode numbers are handed out per path on first lookup and
-//! follow renames. Every lookup, getattr, open and listing first checks the session's epoch and
+//! follow renames; each inode counts the lookups the kernel was given and is dropped when the
+//! kernel forgets them, so the table holds only what the kernel holds (plus a bounded number
+//! handed out by listings). Every lookup, getattr, open and listing first checks the session's epoch and
 //! reloads the view when it changed, so a trashed or ringed item is gone on the next operation.
 //! The kernel is told not to cache entries or attributes (timeouts default to zero) for the
 //! same reason.
@@ -9,14 +11,13 @@
 //! One implementation of `fuse_backend_rs::api::filesystem::FileSystem` serves both `/dev/fuse`
 //! (gVisor) and virtio-fs (microVMs); see `tests/virtio.rs`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions as StdOpen};
 use std::io::{self, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::Duration;
@@ -29,9 +30,12 @@ use fuse_backend_rs::api::filesystem::{
 use rusqlite::Connection;
 
 use crate::store::{self, ActivityLog, OpenRecord};
-use crate::view::{ChildKind, Lower, View, join, parent_of};
+use crate::upper::{Stat, Upper, open_trusted};
+use crate::view::{ChildKind, DEFAULT_DIR_MODE, Lower, View, join, parent_of};
 
 pub const ROOT_INO: u64 = 1;
+/// The temporary name used for copy-up in each directory of `upper/`; never listed.
+const COPYUP: &str = ".a2-copyup";
 const XATTR_ITEM_ID: &[u8] = b"user.drive.item_id";
 
 fn err(code: i32) -> io::Error {
@@ -81,7 +85,7 @@ pub enum Inval {
 
 /// What a path currently is in the merged view.
 enum Node {
-    Upper(fs::Metadata),
+    Upper(Stat),
     Lower(Lower),
 }
 
@@ -98,12 +102,40 @@ struct DirItem {
     type_: u32,
 }
 
+/// One inode the kernel may hold.
+struct Inode {
+    /// `None` once the path is gone (unlinked, or replaced by a rename) while the kernel still
+    /// holds the inode.
+    path: Option<String>,
+    /// The kernel's lookup count: replies that handed this inode out (lookup, create, mkdir,
+    /// symlink, mknod) minus what `forget` returned. At zero the inode is dropped.
+    refs: u64,
+}
+
+/// How many inodes handed out only in listings (never looked up, so the kernel holds no
+/// count and will never forget them) are kept, so that a later lookup of the same name gets
+/// the inode number the listing showed. Older ones are dropped.
+const LISTED_ONLY_CAP: usize = 16384;
+
+/// Sizes of the daemon's tables, for tests and the soak.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Stats {
+    pub inodes: usize,
+    pub paths: usize,
+    pub handles: usize,
+    pub dir_handles: usize,
+    pub whiteouts: usize,
+    pub listed_only: usize,
+}
+
 struct State {
     view: Arc<View>,
     whiteouts: HashSet<String>,
     whiteout_file: File,
-    inodes: HashMap<u64, Option<String>>,
+    inodes: HashMap<u64, Inode>,
     by_path: HashMap<String, u64>,
+    /// Inodes created by listings with no lookup count yet, oldest first.
+    listed_only: VecDeque<u64>,
     next_ino: u64,
     handles: HashMap<u64, Arc<Handle>>,
     /// Directory handle to (listing, whether a readdir has served it yet).
@@ -113,7 +145,7 @@ struct State {
 
 pub struct DriveFs {
     cfg: Config,
-    upper: PathBuf,
+    upper: Upper,
     db: Mutex<(Connection, store::ChangeProbe)>,
     st: Mutex<State>,
     activity: ActivityLog,
@@ -131,10 +163,6 @@ fn file_type_bits(kind: ChildKind) -> u32 {
     }
 }
 
-fn cpath(p: &Path) -> io::Result<CString> {
-    CString::new(p.as_os_str().as_bytes()).map_err(|_| err(libc::EINVAL))
-}
-
 fn name_str(name: &CStr) -> io::Result<&str> {
     let s = name.to_str().map_err(|_| err(libc::EINVAL))?;
     if s.is_empty() || s == "." || s == ".." || s.contains('/') {
@@ -143,13 +171,20 @@ fn name_str(name: &CStr) -> io::Result<&str> {
     Ok(s)
 }
 
-fn open_upper(path: &Path, flags: i32, mode: u32) -> io::Result<File> {
-    let c = cpath(path)?;
-    let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, mode) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
+/// Reads the whiteouts file and opens it for appending. A torn last line (a crash during an
+/// append, before that delete was acknowledged) is dropped from the file.
+fn open_whiteouts(path: &Path) -> io::Result<(HashSet<String>, File)> {
+    let f = StdOpen::new().read(true).append(true).create(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    let mut s = String::new();
+    io::Read::read_to_string(&mut &f, &mut s)?;
+    if !s.is_empty() && !s.ends_with('\n') {
+        let keep = s.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        log::warn!("whiteouts: dropping a torn last line {:?}", &s[keep..]);
+        f.set_len(keep as u64)?;
+        f.sync_data()?;
+        s.truncate(keep);
     }
-    Ok(unsafe { File::from_raw_fd(fd) })
+    Ok((s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect(), f))
 }
 
 fn access_mode(flags: u32) -> &'static str {
@@ -168,20 +203,14 @@ fn wants_write(flags: u32) -> bool {
 impl DriveFs {
     pub fn new(cfg: Config) -> anyhow::Result<DriveFs> {
         let sess = store::session_dir(&cfg.data, &cfg.dir_id);
-        let upper = sess.join("upper");
-        fs::create_dir_all(&upper)?;
-        let wpath = sess.join("whiteouts");
-        let whiteouts: HashSet<String> = match fs::read_to_string(&wpath) {
-            Ok(s) => s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect(),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => HashSet::new(),
-            Err(e) => return Err(e.into()),
-        };
-        let whiteout_file = StdOpen::new().create(true).append(true).open(&wpath)?;
+        fs::create_dir_all(sess.join("upper"))?;
+        let upper = Upper::open(&sess.join("upper"))?;
+        let (whiteouts, whiteout_file) = open_whiteouts(&sess.join("whiteouts"))?;
         let mut db = store::open(&cfg.data)?;
         let (ep, rows) = store::load_view(&mut db, &cfg.dir_id)?;
         let view = Arc::new(View::build(ep, rows));
         let mut inodes = HashMap::new();
-        inodes.insert(ROOT_INO, Some(String::new()));
+        inodes.insert(ROOT_INO, Inode { path: Some(String::new()), refs: 1 });
         let mut by_path = HashMap::new();
         by_path.insert(String::new(), ROOT_INO);
         let activity = ActivityLog::start(&cfg.data, &cfg.dir_id)?;
@@ -194,6 +223,7 @@ impl DriveFs {
                 whiteout_file,
                 inodes,
                 by_path,
+                listed_only: VecDeque::new(),
                 next_ino: ROOT_INO + 1,
                 handles: HashMap::new(),
                 dir_handles: HashMap::new(),
@@ -216,7 +246,19 @@ impl DriveFs {
     }
 
     pub fn upper_dir(&self) -> &Path {
-        &self.upper
+        self.upper.path()
+    }
+
+    pub fn stats(&self) -> Stats {
+        let st = lock(&self.st);
+        Stats {
+            inodes: st.inodes.len(),
+            paths: st.by_path.len(),
+            handles: st.handles.len(),
+            dir_handles: st.dir_handles.len(),
+            whiteouts: st.whiteouts.len(),
+            listed_only: st.listed_only.len(),
+        }
     }
 
     /// Waits until every open recorded so far is in `activity`.
@@ -284,10 +326,6 @@ impl DriveFs {
 
     // ---- path model ------------------------------------------------------------------------
 
-    fn up(&self, path: &str) -> PathBuf {
-        if path.is_empty() { self.upper.clone() } else { self.upper.join(path) }
-    }
-
     fn whited(st: &State, path: &str) -> bool {
         if st.whiteouts.is_empty() {
             return false;
@@ -310,29 +348,93 @@ impl DriveFs {
         st.view.get(path)
     }
 
+    /// What `path` is in the merged view. Something in `upper/` that is not a directory
+    /// shadows everything below its path: ENOTDIR (a file) and ELOOP (a symlink, never
+    /// followed on the host) mean the path does not exist.
     fn resolve(&self, st: &State, path: &str) -> Option<Node> {
-        if let Ok(m) = fs::symlink_metadata(self.up(path)) {
-            return Some(Node::Upper(m));
+        match self.upper.stat(path) {
+            Ok(m) => Some(Node::Upper(m)),
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Self::lower(st, path).map(Node::Lower),
+            Err(_) => None,
         }
-        Self::lower(st, path).map(Node::Lower)
     }
 
     fn path_of(st: &State, ino: u64) -> io::Result<String> {
         match st.inodes.get(&ino) {
-            Some(Some(p)) => Ok(p.clone()),
+            Some(Inode { path: Some(p), .. }) => Ok(p.clone()),
             _ => Err(err(libc::ENOENT)),
         }
     }
 
+    /// The inode number for `path`, allocated (with no lookup count) if it has none.
     fn ino_for(st: &mut State, path: &str) -> u64 {
         if let Some(i) = st.by_path.get(path) {
             return *i;
         }
         let i = st.next_ino;
         st.next_ino += 1;
-        st.inodes.insert(i, Some(path.to_string()));
+        st.inodes.insert(i, Inode { path: Some(path.to_string()), refs: 0 });
         st.by_path.insert(path.to_string(), i);
         i
+    }
+
+    /// The inode for `path`, counted as handed out to the kernel.
+    fn ino_counted(st: &mut State, path: &str) -> u64 {
+        let i = Self::ino_for(st, path);
+        if let Some(n) = st.inodes.get_mut(&i) {
+            n.refs += 1;
+        }
+        i
+    }
+
+    /// An inode for a listing: the kernel holds no count for it, so it is kept only while it
+    /// is among the last LISTED_ONLY_CAP of its kind.
+    fn ino_listed(st: &mut State, path: &str) -> u64 {
+        if let Some(i) = st.by_path.get(path) {
+            return *i;
+        }
+        let i = Self::ino_for(st, path);
+        st.listed_only.push_back(i);
+        while st.listed_only.len() > LISTED_ONLY_CAP {
+            let old = st.listed_only.pop_front().unwrap();
+            if st.inodes.get(&old).is_some_and(|n| n.refs == 0) {
+                Self::drop_inode(st, old);
+            }
+        }
+        i
+    }
+
+    fn drop_inode(st: &mut State, ino: u64) {
+        if ino == ROOT_INO {
+            return;
+        }
+        if let Some(Inode { path: Some(p), .. }) = st.inodes.remove(&ino) {
+            if st.by_path.get(&p) == Some(&ino) {
+                st.by_path.remove(&p);
+            }
+        }
+    }
+
+    fn forget_one(st: &mut State, ino: u64, count: u64) {
+        if ino == ROOT_INO {
+            return;
+        }
+        let Some(n) = st.inodes.get_mut(&ino) else { return };
+        n.refs = n.refs.saturating_sub(count);
+        if n.refs == 0 {
+            Self::drop_inode(st, ino);
+        }
+    }
+
+    /// The path of `ino` is gone; the inode lives on (path-less) until the kernel forgets it.
+    fn unpath(st: &mut State, ino: u64) {
+        match st.inodes.get_mut(&ino) {
+            Some(n) if n.refs == 0 => {
+                st.inodes.remove(&ino);
+            }
+            Some(n) => n.path = None,
+            None => {}
+        }
     }
 
     fn under(p: &str, dir: &str) -> bool {
@@ -342,13 +444,13 @@ impl DriveFs {
     /// Forgets the inode of `path` and of everything under it.
     fn detach(st: &mut State, path: &str) {
         if let Some(i) = st.by_path.remove(path) {
-            st.inodes.insert(i, None);
+            Self::unpath(st, i);
         }
         let below: Vec<String> =
             st.by_path.keys().filter(|p| Self::under(p, path)).cloned().collect();
         for p in below {
             if let Some(i) = st.by_path.remove(&p) {
-                st.inodes.insert(i, None);
+                Self::unpath(st, i);
             }
         }
     }
@@ -369,36 +471,56 @@ impl DriveFs {
             }
         }
         for (p, i) in moves {
-            st.inodes.insert(i, Some(p.clone()));
+            if let Some(n) = st.inodes.get_mut(&i) {
+                n.path = Some(p.clone());
+            }
             st.by_path.insert(p, i);
         }
     }
 
-    fn add_whiteout(st: &mut State, path: &str) -> io::Result<()> {
-        if st.whiteouts.insert(path.to_string()) {
-            st.whiteout_file.write_all(format!("{path}\n").as_bytes())?;
+    /// Appends whiteouts and makes them durable before the delete or rename is acknowledged.
+    /// Callers first make the `upper/` side of the change durable (see `durable_*`), so that
+    /// after a crash a whiteout never stands without it.
+    fn add_whiteouts(st: &mut State, paths: &[&str]) -> io::Result<()> {
+        let mut buf = String::new();
+        for p in paths {
+            if !st.whiteouts.contains(*p) {
+                buf.push_str(p);
+                buf.push('\n');
+            }
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
+        // One write(2) with O_APPEND: a crash leaves whole lines or a torn last line, which
+        // `open_whiteouts` drops.
+        st.whiteout_file.write_all(buf.as_bytes())?;
+        st.whiteout_file.sync_data()?;
+        for p in paths {
+            st.whiteouts.insert(p.to_string());
         }
         Ok(())
     }
 
     // ---- attributes ------------------------------------------------------------------------
 
-    fn attr_upper(&self, ino: u64, m: &fs::Metadata) -> stat64 {
+    fn attr_upper(&self, ino: u64, m: &Stat) -> stat64 {
+        let m = &m.0;
         let mut s: stat64 = unsafe { std::mem::zeroed() };
         s.st_ino = ino;
-        s.st_mode = m.mode();
-        s.st_nlink = m.nlink();
-        s.st_uid = m.uid();
-        s.st_gid = m.gid();
-        s.st_size = m.size() as i64;
-        s.st_blksize = m.blksize() as i64;
-        s.st_blocks = m.blocks() as i64;
-        s.st_atime = m.atime();
-        s.st_atime_nsec = m.atime_nsec();
-        s.st_mtime = m.mtime();
-        s.st_mtime_nsec = m.mtime_nsec();
-        s.st_ctime = m.ctime();
-        s.st_ctime_nsec = m.ctime_nsec();
+        s.st_mode = m.st_mode;
+        s.st_nlink = m.st_nlink as _;
+        s.st_uid = m.st_uid;
+        s.st_gid = m.st_gid;
+        s.st_size = m.st_size;
+        s.st_blksize = m.st_blksize;
+        s.st_blocks = m.st_blocks;
+        s.st_atime = m.st_atime;
+        s.st_atime_nsec = m.st_atime_nsec;
+        s.st_mtime = m.st_mtime;
+        s.st_mtime_nsec = m.st_mtime_nsec;
+        s.st_ctime = m.st_ctime;
+        s.st_ctime_nsec = m.st_ctime_nsec;
         s
     }
 
@@ -409,11 +531,9 @@ impl DriveFs {
         s.st_gid = self.gid;
         s.st_blksize = 4096;
         let (mode, nlink, size, t) = match l {
-            Lower::File { size, mtime, writable, .. } => {
-                (libc::S_IFREG | if *writable { 0o644 } else { 0o444 }, 1, *size, *mtime)
-            }
+            Lower::File { size, mtime, mode, .. } => (libc::S_IFREG | *mode, 1, *size, *mtime),
             Lower::Symlink { target } => (libc::S_IFLNK | 0o777, 1, target.len() as u64, self.mount_time),
-            Lower::Dir => (libc::S_IFDIR | 0o755, 2, 4096, self.mount_time),
+            Lower::Dir { mode } => (libc::S_IFDIR | *mode, 2, 4096, self.mount_time),
         };
         s.st_mode = mode;
         s.st_nlink = nlink;
@@ -443,63 +563,69 @@ impl DriveFs {
         }
     }
 
-    fn entry_for(&self, st: &mut State, path: &str) -> io::Result<Entry> {
+    /// The entry for `path`. `counted`: the reply hands the inode to the kernel (lookup,
+    /// create, mkdir, symlink), which raises its lookup count; getattr and setattr do not.
+    fn entry_for(&self, st: &mut State, path: &str, counted: bool) -> io::Result<Entry> {
         let n = self.resolve(st, path).ok_or_else(|| err(libc::ENOENT))?;
-        let ino = Self::ino_for(st, path);
+        let ino = if counted { Self::ino_counted(st, path) } else { Self::ino_for(st, path) };
         Ok(self.entry(ino, self.attr_of(ino, &n)))
     }
 
     // ---- copy-up ---------------------------------------------------------------------------
 
-    fn ensure_upper_dir(&self, dir: &str) -> io::Result<()> {
-        fs::create_dir_all(self.up(dir))
+    /// Makes `dir` exist in `upper/`; directories created on the way get the store's mode.
+    fn ensure_upper_dir(&self, st: &State, dir: &str) -> io::Result<()> {
+        self.upper.mkdir_all(dir, &|p| match Self::lower(st, p) {
+            Some(Lower::Dir { mode }) => mode,
+            _ => DEFAULT_DIR_MODE,
+        })
     }
 
     /// Makes `path` exist in `upper/`, copying the item's content unless `content` is false.
-    fn copy_up(&self, path: &str, l: &Lower, content: bool) -> io::Result<()> {
-        self.ensure_upper_dir(parent_of(path))?;
-        let dst = self.up(path);
+    fn copy_up(&self, st: &State, path: &str, l: &Lower, content: bool) -> io::Result<()> {
+        let dir = parent_of(path);
+        self.ensure_upper_dir(st, dir)?;
         match l {
-            Lower::File { blob, mtime, writable, .. } => {
+            Lower::File { blob, mtime, mode, .. } => {
                 // Callers hold the state lock, so one temporary name per directory is enough.
-                let tmp = self.up(parent_of(path)).join(".a2-copyup");
+                // Whatever is at that name (even a symlink) is replaced, never followed.
+                let tmp = join(dir, COPYUP);
+                let _ = self.upper.unlink(&tmp);
+                let mut f = self.upper.open_file(&tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)?;
                 if content {
-                    fs::copy(store::blob_path(&self.cfg.data, blob), &tmp)?;
-                } else {
-                    File::create(&tmp)?;
+                    io::copy(&mut open_trusted(&store::blob_path(&self.cfg.data, blob))?, &mut f)?;
                 }
-                let f = StdOpen::new().write(true).open(&tmp)?;
-                f.set_permissions(fs::Permissions::from_mode(if *writable { 0o644 } else { 0o444 }))?;
+                f.set_permissions(fs::Permissions::from_mode(*mode))?;
                 if content {
                     let t = std::time::UNIX_EPOCH + Duration::from_secs((*mtime).max(0) as u64);
                     let _ = f.set_modified(t);
                 }
                 drop(f);
-                fs::rename(&tmp, &dst)?;
+                self.upper.rename(&tmp, path)?;
             }
-            Lower::Symlink { target } => std::os::unix::fs::symlink(target, &dst)?,
-            Lower::Dir => fs::create_dir_all(&dst)?,
+            Lower::Symlink { target } => self.upper.symlink(target.as_bytes(), path)?,
+            Lower::Dir { .. } => self.ensure_upper_dir(st, path)?,
         }
         Ok(())
     }
 
     /// Copies a whole lower directory into `upper/`, for a directory rename.
     fn copy_up_tree(&self, st: &State, dir: &str) -> io::Result<()> {
-        self.ensure_upper_dir(dir)?;
+        self.ensure_upper_dir(st, dir)?;
         let view = st.view.clone();
         let mut subdirs: Vec<&String> =
             view.dirs.keys().filter(|d| Self::under(d, dir)).collect();
         subdirs.sort();
         for d in subdirs {
             if Self::lower(st, d).is_some() {
-                fs::create_dir_all(self.up(d))?;
+                self.ensure_upper_dir(st, d)?;
             }
         }
         for (p, l) in view.descendants(dir) {
-            if Self::lower(st, p).is_none() || fs::symlink_metadata(self.up(p)).is_ok() {
+            if Self::lower(st, p).is_none() || self.upper.exists(p) {
                 continue;
             }
-            self.copy_up(p, l, true)?;
+            self.copy_up(st, p, l, true)?;
         }
         Ok(())
     }
@@ -508,9 +634,13 @@ impl DriveFs {
 
     fn list(&self, st: &mut State, dir: &str) -> io::Result<Vec<DirItem>> {
         let mut names: BTreeMap<String, ChildKind> = BTreeMap::new();
-        let mut found = false;
-        if let Some(Lower::Dir) = Self::lower(st, dir) {
-            found = true;
+        let in_upper = match self.resolve(st, dir) {
+            Some(Node::Upper(m)) if m.is_dir() => true,
+            Some(Node::Lower(Lower::Dir { .. })) => false,
+            Some(_) => return Err(err(libc::ENOTDIR)),
+            None => return Err(err(libc::ENOENT)),
+        };
+        if let Some(Lower::Dir { .. }) = Self::lower(st, dir) {
             let view = st.view.clone();
             if let Some(children) = view.dirs.get(dir) {
                 for (name, kind) in children {
@@ -520,36 +650,28 @@ impl DriveFs {
                 }
             }
         }
-        match fs::read_dir(self.up(dir)) {
-            Ok(rd) => {
-                found = true;
-                for e in rd.flatten() {
-                    let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
-                    if name == ".a2-copyup" {
-                        continue;
-                    }
-                    let kind = match e.file_type() {
-                        Ok(t) if t.is_dir() => ChildKind::Dir,
-                        Ok(t) if t.is_symlink() => ChildKind::Symlink,
-                        _ => ChildKind::File,
-                    };
-                    names.insert(name, kind);
+        if in_upper {
+            for e in self.upper.read_dir(dir)? {
+                let Ok(name) = String::from_utf8(e.name) else { continue };
+                if name == COPYUP {
+                    continue;
                 }
+                let kind = match e.d_type {
+                    libc::DT_DIR => ChildKind::Dir,
+                    libc::DT_LNK => ChildKind::Symlink,
+                    _ => ChildKind::File,
+                };
+                names.insert(name, kind);
             }
-            Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => return Err(err(libc::ENOTDIR)),
-            Err(_) => {}
         }
-        if !found {
-            return Err(err(libc::ENOENT));
-        }
-        let self_ino = Self::ino_for(st, dir);
-        let parent_ino = Self::ino_for(st, parent_of(dir));
+        let self_ino = Self::ino_listed(st, dir);
+        let parent_ino = Self::ino_listed(st, parent_of(dir));
         let mut out = vec![
             DirItem { name: b".".to_vec(), ino: self_ino, type_: libc::DT_DIR as u32 },
             DirItem { name: b"..".to_vec(), ino: parent_ino, type_: libc::DT_DIR as u32 },
         ];
         for (name, kind) in names {
-            let ino = Self::ino_for(st, &join(dir, &name));
+            let ino = Self::ino_listed(st, &join(dir, &name));
             out.push(DirItem { name: name.into_bytes(), ino, type_: file_type_bits(kind) });
         }
         Ok(out)
@@ -588,10 +710,10 @@ impl DriveFs {
                 if m.is_dir() {
                     return Err(err(libc::EISDIR));
                 }
-                let file = open_upper(&self.up(path), flags as i32 & keep, 0)?;
+                let file = self.upper.open_file(path, flags as i32 & keep, 0)?;
                 Handle { file, path: path.to_string(), lower_item: None }
             }
-            Node::Lower(Lower::Dir) => return Err(err(libc::EISDIR)),
+            Node::Lower(Lower::Dir { .. }) => return Err(err(libc::EISDIR)),
             Node::Lower(Lower::Symlink { .. }) => return Err(err(libc::ELOOP)),
             Node::Lower(ref l @ Lower::File { ref blob, writable, .. }) => {
                 if wants_write(flags) {
@@ -599,11 +721,11 @@ impl DriveFs {
                         return Err(err(libc::EACCES));
                     }
                     let trunc = flags as i32 & libc::O_TRUNC != 0;
-                    self.copy_up(path, l, !trunc)?;
-                    let file = open_upper(&self.up(path), flags as i32 & keep, 0)?;
+                    self.copy_up(st, path, l, !trunc)?;
+                    let file = self.upper.open_file(path, flags as i32 & keep, 0)?;
                     Handle { file, path: path.to_string(), lower_item: None }
                 } else {
-                    let file = File::open(store::blob_path(&self.cfg.data, blob))?;
+                    let file = open_trusted(&store::blob_path(&self.cfg.data, blob))?;
                     Handle { file, path: path.to_string(), lower_item: lower_item.clone() }
                 }
             }
@@ -617,23 +739,19 @@ impl DriveFs {
     }
 
     fn setattr_path(&self, path: &str, attr: &stat64, fh: Option<u64>, valid: SetattrValid) -> io::Result<()> {
-        let p = self.up(path);
-        let c = cpath(&p)?;
         if valid.contains(SetattrValid::MODE) {
-            fs::set_permissions(&p, fs::Permissions::from_mode(attr.st_mode & 0o7777))?;
+            self.upper.chmod(path, attr.st_mode & 0o7777)?;
         }
         if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
             let uid = if valid.contains(SetattrValid::UID) { attr.st_uid } else { u32::MAX };
             let gid = if valid.contains(SetattrValid::GID) { attr.st_gid } else { u32::MAX };
-            if unsafe { libc::lchown(c.as_ptr(), uid, gid) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            self.upper.chown(path, uid, gid)?;
         }
         if valid.contains(SetattrValid::SIZE) {
             let h = fh.and_then(|f| lock(&self.st).handles.get(&f).cloned());
             match h {
                 Some(h) if h.lower_item.is_none() => h.file.set_len(attr.st_size as u64)?,
-                _ => StdOpen::new().write(true).open(&p)?.set_len(attr.st_size as u64)?,
+                _ => self.upper.truncate(path, attr.st_size as u64)?,
             }
         }
         if valid.intersects(SetattrValid::ATIME | SetattrValid::MTIME) {
@@ -645,9 +763,7 @@ impl DriveFs {
                 ts(valid.contains(SetattrValid::ATIME), valid.contains(SetattrValid::ATIME_NOW), attr.st_atime, attr.st_atime_nsec),
                 ts(valid.contains(SetattrValid::MTIME), valid.contains(SetattrValid::MTIME_NOW), attr.st_mtime, attr.st_mtime_nsec),
             ];
-            if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            self.upper.utimens(path, &times)?;
         }
         Ok(())
     }
@@ -673,7 +789,7 @@ impl FileSystem for DriveFs {
         let name = name_str(name)?;
         let mut st = lock(&self.st);
         let path = join(&Self::path_of(&st, parent)?, name);
-        match self.entry_for(&mut st, &path) {
+        match self.entry_for(&mut st, &path, true) {
             // With kernel caching on, let the kernel cache the miss too; view changes
             // invalidate added paths as well as removed ones.
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) && !self.cfg.entry_timeout.is_zero() => {
@@ -684,11 +800,22 @@ impl FileSystem for DriveFs {
         }
     }
 
+    fn forget(&self, _ctx: &Context, ino: u64, count: u64) {
+        Self::forget_one(&mut lock(&self.st), ino, count);
+    }
+
+    fn batch_forget(&self, _ctx: &Context, requests: Vec<(u64, u64)>) {
+        let mut st = lock(&self.st);
+        for (ino, count) in requests {
+            Self::forget_one(&mut st, ino, count);
+        }
+    }
+
     fn getattr(&self, _ctx: &Context, ino: u64, _h: Option<u64>) -> io::Result<(stat64, Duration)> {
         self.fresh()?;
         let mut st = lock(&self.st);
         let path = Self::path_of(&st, ino)?;
-        let e = self.entry_for(&mut st, &path)?;
+        let e = self.entry_for(&mut st, &path, false)?;
         Ok((e.attr, self.cfg.attr_timeout))
     }
 
@@ -704,14 +831,14 @@ impl FileSystem for DriveFs {
                         return Err(err(libc::EACCES));
                     }
                     let content = !(valid.contains(SetattrValid::SIZE) && attr.st_size == 0);
-                    self.copy_up(&path, &l, content)?;
+                    self.copy_up(&st, &path, &l, content)?;
                 }
             }
             path
         };
         self.setattr_path(&path, &attr, fh, valid)?;
         let mut st = lock(&self.st);
-        let e = self.entry_for(&mut st, &path)?;
+        let e = self.entry_for(&mut st, &path, false)?;
         Ok((e.attr, self.cfg.attr_timeout))
     }
 
@@ -720,7 +847,7 @@ impl FileSystem for DriveFs {
         let st = lock(&self.st);
         let path = Self::path_of(&st, ino)?;
         match self.resolve(&st, &path).ok_or_else(|| err(libc::ENOENT))? {
-            Node::Upper(_) => Ok(fs::read_link(self.up(&path))?.as_os_str().as_bytes().to_vec()),
+            Node::Upper(_) => self.upper.readlink(&path),
             Node::Lower(Lower::Symlink { target }) => Ok(target.into_bytes()),
             Node::Lower(_) => Err(err(libc::EINVAL)),
         }
@@ -735,9 +862,9 @@ impl FileSystem for DriveFs {
         if self.resolve(&st, &path).is_some() {
             return Err(err(libc::EEXIST));
         }
-        self.ensure_upper_dir(&dir)?;
-        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(linkname.to_bytes()), self.up(&path))?;
-        self.entry_for(&mut st, &path)
+        self.ensure_upper_dir(&st, &dir)?;
+        self.upper.symlink(linkname.to_bytes(), &path)?;
+        self.entry_for(&mut st, &path, true)
     }
 
     fn mknod(&self, ctx: &Context, parent: u64, name: &CStr, mode: u32, _rdev: u32, umask: u32) -> io::Result<Entry> {
@@ -761,10 +888,10 @@ impl FileSystem for DriveFs {
         if self.resolve(&st, &path).is_some() {
             return Err(err(libc::EEXIST));
         }
-        self.ensure_upper_dir(&dir)?;
-        fs::create_dir(self.up(&path))?;
-        fs::set_permissions(self.up(&path), fs::Permissions::from_mode(mode & !umask & 0o7777))?;
-        self.entry_for(&mut st, &path)
+        self.ensure_upper_dir(&st, &dir)?;
+        self.upper.mkdir(&path, 0o700)?;
+        self.upper.chmod(&path, mode & !umask & 0o7777)?;
+        self.entry_for(&mut st, &path, true)
     }
 
     fn unlink(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<()> {
@@ -772,14 +899,21 @@ impl FileSystem for DriveFs {
         let name = name_str(name)?;
         let mut st = lock(&self.st);
         let path = join(&Self::path_of(&st, parent)?, name);
-        match self.resolve(&st, &path).ok_or_else(|| err(libc::ENOENT))? {
+        let had_upper = match self.resolve(&st, &path).ok_or_else(|| err(libc::ENOENT))? {
             Node::Upper(m) if m.is_dir() => return Err(err(libc::EISDIR)),
-            Node::Lower(Lower::Dir) => return Err(err(libc::EISDIR)),
-            Node::Upper(_) => fs::remove_file(self.up(&path))?,
-            Node::Lower(_) => {}
-        }
+            Node::Lower(Lower::Dir { .. }) => return Err(err(libc::EISDIR)),
+            Node::Upper(_) => {
+                self.upper.unlink(&path)?;
+                true
+            }
+            Node::Lower(_) => false,
+        };
         if Self::lower(&st, &path).is_some() {
-            Self::add_whiteout(&mut st, &path)?;
+            if had_upper {
+                // Else a crash could bring the session's copy back as a replacement.
+                self.upper.sync_dir(parent_of(&path))?;
+            }
+            Self::add_whiteouts(&mut st, &[&path])?;
         }
         Self::detach(&mut st, &path);
         Ok(())
@@ -792,17 +926,20 @@ impl FileSystem for DriveFs {
         let path = join(&Self::path_of(&st, parent)?, name);
         let upper_dir = match self.resolve(&st, &path).ok_or_else(|| err(libc::ENOENT))? {
             Node::Upper(m) if m.is_dir() => true,
-            Node::Lower(Lower::Dir) => false,
+            Node::Lower(Lower::Dir { .. }) => false,
             _ => return Err(err(libc::ENOTDIR)),
         };
         if !self.is_empty_dir(&mut st, &path)? {
             return Err(err(libc::ENOTEMPTY));
         }
         if upper_dir {
-            fs::remove_dir(self.up(&path))?;
+            self.upper.rmdir(&path)?;
         }
         if Self::lower(&st, &path).is_some() {
-            Self::add_whiteout(&mut st, &path)?;
+            if upper_dir {
+                self.upper.sync_dir(parent_of(&path))?;
+            }
+            Self::add_whiteouts(&mut st, &[&path])?;
         }
         Self::detach(&mut st, &path);
         Ok(())
@@ -825,14 +962,14 @@ impl FileSystem for DriveFs {
             return Err(err(libc::EINVAL));
         }
         let src = self.resolve(&st, &old).ok_or_else(|| err(libc::ENOENT))?;
-        let src_dir = matches!(&src, Node::Upper(m) if m.is_dir()) || matches!(src, Node::Lower(Lower::Dir));
+        let src_dir = matches!(&src, Node::Upper(m) if m.is_dir()) || matches!(src, Node::Lower(Lower::Dir { .. }));
         let dst = self.resolve(&st, &new);
         let mut dst_lower_dir = false;
         if let Some(d) = &dst {
             if flags & libc::RENAME_NOREPLACE != 0 {
                 return Err(err(libc::EEXIST));
             }
-            let dst_dir = matches!(d, Node::Upper(m) if m.is_dir()) || matches!(d, Node::Lower(Lower::Dir));
+            let dst_dir = matches!(d, Node::Upper(m) if m.is_dir()) || matches!(d, Node::Lower(Lower::Dir { .. }));
             match (src_dir, dst_dir) {
                 (false, true) => return Err(err(libc::EISDIR)),
                 (true, false) => return Err(err(libc::ENOTDIR)),
@@ -847,25 +984,54 @@ impl FileSystem for DriveFs {
         }
         // Bring the source fully into upper/, then move it there.
         match &src {
-            Node::Lower(Lower::Dir) => self.copy_up_tree(&st, &old)?,
+            Node::Lower(Lower::Dir { .. }) => self.copy_up_tree(&st, &old)?,
             Node::Upper(m) if m.is_dir() => self.copy_up_tree(&st, &old)?,
-            Node::Lower(l) => self.copy_up(&old, l, true)?,
+            Node::Lower(l) => self.copy_up(&st, &old, l, true)?,
             Node::Upper(_) => {}
         }
-        self.ensure_upper_dir(&newparent)?;
+        self.ensure_upper_dir(&st, &newparent)?;
         if dst_lower_dir {
             // The target is an empty merged directory with nothing of its own in upper/.
-            let _ = fs::remove_dir(self.up(&new));
-            Self::add_whiteout(&mut st, &new)?;
+            let _ = self.upper.rmdir(&new);
         }
-        fs::rename(self.up(&old), self.up(&new))?;
+        self.upper.rename(&old, &new)?;
+        let mut wo: Vec<&str> = Vec::new();
+        if dst_lower_dir {
+            wo.push(new.as_str());
+        }
         if Self::lower(&st, &old).is_some() {
-            Self::add_whiteout(&mut st, &old)?;
+            wo.push(old.as_str());
+        }
+        if !wo.is_empty() {
+            // The whiteout hides the store's copy at the old path, so the moved copy in upper/
+            // must be on disk first: its content, its new name, and the old name's removal.
+            if src_dir {
+                self.upper.syncfs()?;
+            } else {
+                match self.upper.open_file(&new, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+                    Ok(f) => f.sync_all()?,
+                    // A symlink: its name is synced with the directory.
+                    Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {}
+                    Err(e) => return Err(e),
+                }
+                self.upper.sync_dir(&newparent)?;
+                if parent_of(&old) != newparent {
+                    self.upper.sync_dir(parent_of(&old))?;
+                }
+            }
+            Self::add_whiteouts(&mut st, &wo)?;
         }
         Self::move_inodes(&mut st, &old, &new, src_dir);
         Ok(())
     }
 
+    /// Hard links are not supported: always EPERM, before anything is touched. EPERM is what
+    /// link(2) returns on a file system that has no hard links (it is what the kernel returns
+    /// itself when a file system has no `link` operation), and tools that use links fall back
+    /// on it: Git renames its object files instead, `cp -l` and `ln` report the error.
+    /// Supporting them would mean two inodes sharing content in a path-based file system, with
+    /// the kernel's cached size and times of one going stale when the other is written, and
+    /// nothing in the store to keep the link in.
     fn link(&self, _ctx: &Context, _ino: u64, _np: u64, _nn: &CStr) -> io::Result<Entry> {
         Err(err(libc::EPERM))
     }
@@ -889,23 +1055,23 @@ impl FileSystem for DriveFs {
                 return Err(err(libc::EEXIST));
             }
             let fh = self.open_path(&mut st, &path, args.flags)?;
-            let e = self.entry_for(&mut st, &path)?;
+            let e = self.entry_for(&mut st, &path, true)?;
             return Ok((e, Some(fh), OpenOptions::empty(), None));
         }
         match self.resolve(&st, &dir) {
             Some(Node::Upper(m)) if m.is_dir() => {}
-            Some(Node::Lower(Lower::Dir)) => self.ensure_upper_dir(&dir)?,
+            Some(Node::Lower(Lower::Dir { .. })) => self.ensure_upper_dir(&st, &dir)?,
             _ => return Err(err(libc::ENOENT)),
         }
         let keep = libc::O_ACCMODE | libc::O_APPEND | libc::O_TRUNC;
-        let file = open_upper(
-            &self.up(&path),
+        let file = self.upper.open_file(
+            &path,
             (args.flags as i32 & keep) | libc::O_CREAT | libc::O_EXCL,
             args.mode & !args.umask & 0o7777,
         )?;
         self.record_open(&path, None, args.flags);
         let fh = Self::new_handle(&mut st, Handle { file, path: path.clone(), lower_item: None });
-        let e = self.entry_for(&mut st, &path)?;
+        let e = self.entry_for(&mut st, &path, true)?;
         Ok((e, Some(fh), OpenOptions::empty(), None))
     }
 
@@ -961,12 +1127,7 @@ impl FileSystem for DriveFs {
     }
 
     fn statfs(&self, _ctx: &Context, _ino: u64) -> io::Result<statvfs64> {
-        let c = cpath(&self.upper)?;
-        let mut s: statvfs64 = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs64(c.as_ptr(), &mut s) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(s)
+        self.upper.statvfs()
     }
 
     fn getxattr(&self, _ctx: &Context, ino: u64, name: &CStr, size: u32) -> io::Result<GetxattrReply> {
@@ -1057,8 +1218,14 @@ impl FileSystem for DriveFs {
         Ok(())
     }
 
-    fn fsyncdir(&self, _ctx: &Context, _ino: u64, _datasync: bool, _fh: u64) -> io::Result<()> {
-        Ok(())
+    fn fsyncdir(&self, _ctx: &Context, ino: u64, _datasync: bool, _fh: u64) -> io::Result<()> {
+        let st = lock(&self.st);
+        let path = Self::path_of(&st, ino)?;
+        match self.upper.sync_dir(&path) {
+            // A directory only in the store has nothing of its own to sync.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            r => r,
+        }
     }
 
     fn access(&self, _ctx: &Context, ino: u64, _mask: u32) -> io::Result<()> {
@@ -1066,5 +1233,26 @@ impl FileSystem for DriveFs {
         let st = lock(&self.st);
         let path = Self::path_of(&st, ino)?;
         self.resolve(&st, &path).map(|_| ()).ok_or_else(|| err(libc::ENOENT))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn torn_whiteout_line_is_dropped() {
+        let t = tempfile::Builder::new().prefix("a8-wo-").tempdir().unwrap();
+        let p = t.path().join("whiteouts");
+        fs::write(&p, b"notes/a\nnotes/b\nnotes/to").unwrap();
+        let (set, mut f) = open_whiteouts(&p).unwrap();
+        assert_eq!(set, HashSet::from(["notes/a".to_string(), "notes/b".to_string()]));
+        assert_eq!(fs::read(&p).unwrap(), b"notes/a\nnotes/b\n");
+        f.write_all(b"notes/c\n").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"notes/a\nnotes/b\nnotes/c\n");
+        // No newline at all: nothing survives.
+        fs::write(&p, b"half").unwrap();
+        assert!(open_whiteouts(&p).unwrap().0.is_empty());
+        assert_eq!(fs::read(&p).unwrap(), b"");
     }
 }
