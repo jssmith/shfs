@@ -5,7 +5,8 @@
 import { mkdirSync, promises as fsp } from 'node:fs';
 import path from 'node:path';
 import { all, get, run, tx } from '../store/db.js';
-import type { Drive, ViewEntry } from '../store/drive.js';
+import type { Drive } from '../store/drive.js';
+import { searchSession, hiddenCountsOf, type SearchResult } from './search.js';
 import { cleanDrivePath, safeHash, safeRead, safeRemove, safeWrite, walkFiles } from '../util/fsafe.js';
 import { newId, newSessionId, now, secretHash, SESSION_ID_RE } from '../util/ids.js';
 import { KeyedMutex } from '../util/mutex.js';
@@ -251,28 +252,15 @@ export class Sessions {
     });
   }
 
-  search(dir_id: string, query: string): { results: { path: string; snippet: string; note?: string }[]; hidden: Record<string, number> } {
-    const db = this.drive.db;
-    const view = new Map(all<{ item_id: string; path: string }>(db, 'SELECT item_id, path FROM session_view WHERE dir_id = ?', dir_id).map((r) => [r.item_id, r.path]));
-    const results: { path: string; snippet: string; note?: string }[] = [];
-    const hidden: Record<string, number> = {};
-    for (const hit of this.drive.searchRaw(query)) {
-      const vp = view.get(hit.item_id);
-      if (vp) {
-        results.push({ path: `/drive/${vp}`, snippet: hit.snippet });
-        continue;
-      }
-      const reach: ViewEntry | null = this.drive.reachable(hit.item_id);
-      if (reach) {
-        results.push({ path: `/drive/${reach.path}`, snippet: hit.snippet, note: 'new since this session began; it appears in /drive after your next checkpoint' });
-        continue;
-      }
-      const it = this.drive.item(hit.item_id);
-      if (!it || it.state !== 'live') continue;
-      for (const ring of this.drive.hidingRings(hit.item_id)) hidden[ring] = (hidden[ring] ?? 0) + 1;
-    }
-    this.drive.activity({ dir_id, actor: 'agent', op: 'search', bytes: results.reduce((n, r) => n + r.snippet.length, 0), detail: { query: query.slice(0, 500), results: results.length, hidden } });
-    return { results: results.slice(0, 50), hidden };
+  /** Search what this session can see; hidden items match on metadata only (sessions/search.ts). */
+  search(dir_id: string, query: string): SearchResult {
+    const r = searchSession(this.drive, dir_id, query);
+    this.drive.activity({
+      dir_id, actor: 'agent', op: 'search',
+      bytes: r.results.slice(0, 50).reduce((n, x) => n + x.snippet.length, 0),
+      detail: { query: query.slice(0, 500), results: r.results.length, hidden: hiddenCountsOf(r.hidden) },
+    });
+    return r;
   }
 
   async destroySandbox(dir_id: string): Promise<void> {

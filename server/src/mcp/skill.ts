@@ -1,4 +1,22 @@
+// Server instructions (sent on initialize) and the skill text, per surface.
+// docs/mcp-tools.md quotes these; change it in the same commit.
+import type { Surface } from '../context.js';
+
 export const SERVER_INSTRUCTIONS = `Agent Drive holds a person's files. Start with start_session(purpose), keep the session_id it returns for the whole conversation, and pass it to every other tool. Call get_skill(session_id) to learn how to work here.`;
+
+export const SERVER_INSTRUCTIONS_V1 = `${SERVER_INSTRUCTIONS} One session per conversation, not per request: reuse the session_id for follow-up requests.`;
+
+export const PARTIAL_VIEW = "This session's view may not include everything the person has: some files are hidden from sessions, and a search reports hidden matches only as approximate counts by label, kind or month.";
+
+export const SERVER_INSTRUCTIONS_SHELL = (tools: string) =>
+  `Agent Drive holds a person's files, with a Linux shell attached. Start with start_session(purpose) once per conversation, keep the session_id it returns, and pass it to ${tools}; reuse it for follow-up requests. ` +
+  `/drive is the person's files; changes you make there are saved to the drive automatically. Run "drive help" in the shell for how to work here. ${PARTIAL_VIEW}`;
+
+export function instructionsFor(surface: Surface): string {
+  if (surface === 'v0') return SERVER_INSTRUCTIONS;
+  if (surface === 'v1') return SERVER_INSTRUCTIONS_V1;
+  return SERVER_INSTRUCTIONS_SHELL(surface === 'v2' ? 'bash, read, write and edit' : 'bash');
+}
 
 export const SKILL = `# Working in Agent Drive
 
