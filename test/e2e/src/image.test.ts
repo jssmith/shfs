@@ -9,7 +9,7 @@ import { createContext, type Context } from '../../../server/src/context.js';
 import { ingestUpload } from '../../../server/src/ingest/upload.js';
 import { mergeSession } from '../../../server/src/merge/merge.js';
 import { loadImageSettings } from '../../../server/src/sessions/image.js';
-import { RUNSC } from './harness.js';
+import { RUNSC, PREFIX } from './harness.js';
 
 const ROOTFS = process.env.AGENT_DRIVE_TEST_IMAGE_ROOTFS;
 
@@ -18,12 +18,12 @@ describe.skipIf(!(RUNSC && ROOTFS))('sandbox image settings (needs AGENT_DRIVE_R
   let dir: string;
   beforeAll(() => {
     dir = mkdtempSync(path.join(os.tmpdir(), 'a4-img-'));
-    ctx = createContext({ dataDir: dir, port: 0, publicUrl: 'http://127.0.0.1', runsc: RUNSC!, runscRoot: path.join('/run', 'a4-img'), rootfs: ROOTFS!, sandboxPrefix: 'a4-img-' });
+    ctx = createContext({ dataDir: dir, port: 0, publicUrl: 'http://127.0.0.1', runsc: RUNSC!, runscRoot: path.join('/run', `${PREFIX}-img`), rootfs: ROOTFS!, sandboxPrefix: `${PREFIX}-img-`, surface: 'v0' });
   });
   afterAll(async () => {
     await ctx.close();
     rmSync(dir, { recursive: true, force: true });
-    rmSync('/run/a4-img', { recursive: true, force: true });
+    rmSync(`/run/${PREFIX}-img`, { recursive: true, force: true });
   });
 
   test('env, user and writable mounts', async () => {

@@ -4,7 +4,7 @@ import { startHttp, type HttpServer } from '../http.js';
 import { tempContext } from '../testing.js';
 import { setOwnerPassword } from './owner.js';
 
-const PORT = 9421;
+const PORT = 9421 + Number(process.env.AGENT_DRIVE_TEST_PORT_OFFSET ?? 0);
 const BASE = `http://127.0.0.1:${PORT}`;
 let ctx: ReturnType<typeof tempContext>;
 let http: HttpServer;

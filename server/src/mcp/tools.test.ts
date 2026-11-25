@@ -9,7 +9,7 @@ import { startHttp, type HttpServer } from '../http.js';
 import { tempContext, upload, settle } from '../testing.js';
 import { all } from '../store/db.js';
 
-const PORT = 9423;
+const PORT = 9423 + Number(process.env.AGENT_DRIVE_TEST_PORT_OFFSET ?? 0);
 let ctx: ReturnType<typeof tempContext>;
 let http: HttpServer;
 let client: Client;
