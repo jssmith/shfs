@@ -1,7 +1,8 @@
 // End-to-end harness: a drive on a test port with a temporary data
 // directory, a device key, an owner password, and an MCP client that signs
 // in through the drive's OAuth flow programmatically (no browser).
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -52,6 +53,10 @@ export async function startDrive(port: number): Promise<Drive> {
       await http.close();
       await ctx.close();
       rmSync(dataDir, { recursive: true, force: true });
+      // runsc keeps a bind-mounted empty network namespace in its state root; release it.
+      const netns = path.join(ctx.config.runscRoot, 'null-netns');
+      if (existsSync(netns)) spawnSync('umount', [netns]);
+      rmSync(ctx.config.runscRoot, { recursive: true, force: true });
     },
   };
 }

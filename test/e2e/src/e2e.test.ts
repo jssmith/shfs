@@ -2,7 +2,7 @@
 // OAuth, work in a session (read, write, a shell command in gVisor),
 // checkpoint, check the merged drive, undo, check again.
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { put } from '../../../cli/src/index.js';
@@ -10,8 +10,10 @@ import { connectAgent, startDrive, RUNSC, ROOTFS, type Agent, type Drive } from 
 
 const haveSandbox = !!(RUNSC && ROOTFS);
 
+const made: string[] = [];
 function folder(files: Record<string, string>): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'a4-folder-'));
+  made.push(dir);
   const root = path.join(dir, 'projects');
   for (const [p, c] of Object.entries(files)) {
     mkdirSync(path.dirname(path.join(root, p)), { recursive: true });
@@ -34,6 +36,7 @@ describe.skipIf(!haveSandbox)('thin drive end to end (needs AGENT_DRIVE_RUNSC an
   afterAll(async () => {
     await agent?.close();
     await d?.close();
+    for (const m of made) rmSync(m, { recursive: true, force: true });
   });
 
   test('upload, session, checkpoint, undo', async () => {
