@@ -66,7 +66,7 @@ blobs_after=$(cd "$data/blobs" && find . -type f -printf '%p %s %T@ %m\n' | sort
   echo "workload: $(cat "$work/soak.out" | tr -d '\n' | head -c 2000)"
   echo "final fsck and status lines: $fsck"
   echo "blob store unchanged: $([ "$blobs_before" == "$blobs_after" ] && echo yes || echo NO)"
-  echo "failures: $(grep -c '^[0-9][0-9]:' "$work/failures.log" 2>/dev/null || echo 0)"
+  echo "failures: $(cat "$work/failures.log" 2>/dev/null | grep -c '^[0-9][0-9]:')"
   grep '^[0-9][0-9]:' "$work/failures.log" 2>/dev/null | cut -c1-300 | head -20
   echo "daemon alive: $(kill -0 "$daemon" 2>/dev/null && echo yes || echo NO)"
   echo "symlinks in upper/: $(find "$data/sessions/$id/upper" -type l | wc -l)"
