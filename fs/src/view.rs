@@ -119,6 +119,24 @@ impl View {
         self.entries.get(path).cloned()
     }
 
+    /// Paths that differ between two views: removed, added, or changed (another item, version,
+    /// target or kind).
+    pub fn changed_paths(&self, new: &View) -> Vec<String> {
+        let mut out = Vec::new();
+        for p in self.entries.keys().chain(self.dirs.keys()) {
+            if self.get(p) != new.get(p) {
+                out.push(p.clone());
+            }
+        }
+        for p in new.entries.keys().chain(new.dirs.keys()) {
+            if self.get(p).is_none() {
+                out.push(p.clone());
+            }
+        }
+        out.retain(|p| !p.is_empty());
+        out
+    }
+
     /// Every file and symlink at or under `dir`.
     pub fn descendants<'a>(&'a self, dir: &'a str) -> impl Iterator<Item = (&'a String, &'a Lower)> {
         let prefix = format!("{dir}/");

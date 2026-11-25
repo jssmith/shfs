@@ -8,7 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use agent_drive_fs::daemon::Mount;
+use agent_drive_fs::daemon::{self, Mount, Options};
 use agent_drive_fs::drivefs::{Config, DriveFs};
 use agent_drive_fs::store;
 use agent_drive_fs::stub::StubStore;
@@ -17,14 +17,18 @@ use rusqlite::params;
 const DIR: &str = "a2-test";
 
 struct Env {
-    _tmp: tempfile::TempDir,
+    // Fields drop in order: unmount before the temporary directory goes.
+    mount: Option<Mount>,
+    cached: bool,
     data: PathBuf,
     mnt: PathBuf,
-    mount: Option<Mount>,
+    _tmp: tempfile::TempDir,
 }
 
 impl Env {
-    fn new() -> Env {
+    /// `cached`: kernel caching on (long timeouts) with invalidation on view changes;
+    /// otherwise zero timeouts, so every operation reaches the daemon.
+    fn new(cached: bool) -> Env {
         let tmp = tempfile::Builder::new().prefix("a2-fs-test-").tempdir().unwrap();
         let data = tmp.path().join("data");
         let mut s = StubStore::create(&data, DIR).unwrap();
@@ -39,7 +43,7 @@ impl Env {
             )
             .unwrap();
         drop(s);
-        let mut e = Env { mnt: store::session_dir(&data, DIR).join("mnt"), data, _tmp: tmp, mount: None };
+        let mut e = Env { cached, mnt: store::session_dir(&data, DIR).join("mnt"), data, _tmp: tmp, mount: None };
         e.remount();
         e
     }
@@ -48,8 +52,14 @@ impl Env {
         if let Some(m) = self.mount.take() {
             m.stop();
         }
-        let fs = DriveFs::new(Config::new(&self.data, DIR)).unwrap();
-        self.mount = Some(Mount::start(fs, &self.mnt, 2).unwrap());
+        let mut cfg = Config::new(&self.data, DIR);
+        if self.cached {
+            cfg.entry_timeout = std::time::Duration::from_secs(60);
+            cfg.attr_timeout = std::time::Duration::from_secs(60);
+        }
+        let fs = DriveFs::new(cfg).unwrap();
+        let opts = Options { threads: 2, ..Default::default() };
+        self.mount = Some(Mount::start(fs, &self.mnt, opts).unwrap());
     }
 
     fn p(&self, rel: &str) -> PathBuf {
@@ -80,15 +90,26 @@ impl Env {
     fn conn(&self) -> rusqlite::Connection {
         store::open(&self.data).unwrap()
     }
+
+    /// What the server does after changing session_view: bump the epoch, then tell the daemon.
+    fn bump(&self) {
+        store::bump_epoch(&self.conn(), DIR).unwrap();
+        assert!(daemon::request_refresh(&self.data, DIR).unwrap().is_some());
+    }
+
+    fn hide(&self, path: &str) {
+        self.conn()
+            .execute("DELETE FROM session_view WHERE dir_id = ?1 AND path = ?2", params![DIR, path])
+            .unwrap();
+        self.bump();
+    }
 }
 
 fn errno<T: std::fmt::Debug>(r: std::io::Result<T>) -> i32 {
     r.expect_err("expected an error").raw_os_error().unwrap_or(-1)
 }
 
-#[test]
-fn listing_shows_view_only() {
-    let e = Env::new();
+fn listing_shows_view_only(e: Env) {
     assert_eq!(e.ls(""), ["_by", "code", "notes", "projects"]);
     assert_eq!(e.ls("notes"), ["readme.md", "todo.txt"]);
     // The ringed item is in the store but not in session_view.
@@ -99,9 +120,7 @@ fn listing_shows_view_only() {
     assert!(fs::metadata(e.p("projects/acme")).unwrap().is_dir());
 }
 
-#[test]
-fn reads_come_from_blobs() {
-    let e = Env::new();
+fn reads_come_from_blobs(e: Env) {
     assert_eq!(fs::read_to_string(e.p("notes/todo.txt")).unwrap(), "buy milk\nwrite spike\n");
     let mut f = fs::File::open(e.p("notes/readme.md")).unwrap();
     f.seek(SeekFrom::Start(2)).unwrap();
@@ -112,9 +131,7 @@ fn reads_come_from_blobs() {
     assert!(!e.upper("notes/todo.txt").exists());
 }
 
-#[test]
-fn symlinks_from_view() {
-    let e = Env::new();
+fn symlinks_from_view(e: Env) {
     let l = e.p("_by/project/acme/plan.md");
     assert!(fs::symlink_metadata(&l).unwrap().file_type().is_symlink());
     assert_eq!(fs::read_link(&l).unwrap(), Path::new("../../../projects/acme/plan.md"));
@@ -127,9 +144,7 @@ fn symlinks_from_view() {
     );
 }
 
-#[test]
-fn session_symlinks() {
-    let e = Env::new();
+fn session_symlinks(e: Env) {
     std::os::unix::fs::symlink("../notes/todo.txt", e.p("projects/todo-link")).unwrap();
     assert_eq!(fs::read_link(e.p("projects/todo-link")).unwrap(), Path::new("../notes/todo.txt"));
     assert_eq!(fs::read_to_string(e.p("projects/todo-link")).unwrap(), "buy milk\nwrite spike\n");
@@ -138,9 +153,7 @@ fn session_symlinks() {
     assert!(!e.ls("projects").contains(&"todo-link".to_string()));
 }
 
-#[test]
-fn write_copies_up() {
-    let e = Env::new();
+fn write_copies_up(e: Env) {
     let before = fs::read(e.p("notes/todo.txt")).unwrap();
     fs::OpenOptions::new().append(true).open(e.p("notes/todo.txt")).unwrap().write_all(b"third\n").unwrap();
     assert_eq!(fs::read_to_string(e.p("notes/todo.txt")).unwrap(), "buy milk\nwrite spike\nthird\n");
@@ -159,9 +172,7 @@ fn write_copies_up() {
     assert_eq!(e.ls("notes"), ["readme.md", "todo.txt"]);
 }
 
-#[test]
-fn truncate_and_setattr() {
-    let e = Env::new();
+fn truncate_and_setattr(e: Env) {
     fs::write(e.p("notes/readme.md"), b"new\n").unwrap(); // O_TRUNC
     assert_eq!(fs::read_to_string(e.p("notes/readme.md")).unwrap(), "new\n");
     let f = fs::OpenOptions::new().write(true).open(e.p("projects/acme/budget.csv")).unwrap();
@@ -174,16 +185,12 @@ fn truncate_and_setattr() {
     assert_eq!(fs::read_to_string(e.p("projects/acme/plan.md")).unwrap(), "Plan for Acme Robotics (synthetic).\n");
 }
 
-#[test]
-fn read_only_items_refuse_writes() {
-    let e = Env::new();
+fn read_only_items_refuse_writes(e: Env) {
     assert_eq!(fs::read_to_string(e.p("code/README")).unwrap(), "readme\n");
     assert_eq!(errno(fs::OpenOptions::new().write(true).open(e.p("code/README"))), libc::EACCES);
 }
 
-#[test]
-fn create_and_mkdir() {
-    let e = Env::new();
+fn create_and_mkdir(e: Env) {
     fs::write(e.p("notes/new.txt"), b"fresh\n").unwrap();
     fs::create_dir(e.p("notes/sub")).unwrap();
     fs::write(e.p("notes/sub/deep.txt"), b"deep\n").unwrap();
@@ -200,9 +207,7 @@ fn create_and_mkdir() {
     assert!(e.whiteouts().is_empty());
 }
 
-#[test]
-fn unlink_adds_whiteouts() {
-    let e = Env::new();
+fn unlink_adds_whiteouts(e: Env) {
     fs::remove_file(e.p("notes/todo.txt")).unwrap();
     assert_eq!(e.ls("notes"), ["readme.md"]);
     assert_eq!(errno(fs::metadata(e.p("notes/todo.txt"))), libc::ENOENT);
@@ -217,9 +222,7 @@ fn unlink_adds_whiteouts() {
     assert_eq!(e.ls("notes"), ["readme.md", "todo.txt"]);
 }
 
-#[test]
-fn rmdir_and_recreate() {
-    let e = Env::new();
+fn rmdir_and_recreate(e: Env) {
     assert_eq!(errno(fs::remove_dir(e.p("projects/acme"))), libc::ENOTEMPTY);
     fs::remove_dir_all(e.p("projects")).unwrap();
     assert_eq!(e.ls(""), ["_by", "code", "notes"]);
@@ -228,9 +231,7 @@ fn rmdir_and_recreate() {
     assert!(e.ls("projects").is_empty(), "a re-created directory starts empty");
 }
 
-#[test]
-fn rename_file() {
-    let e = Env::new();
+fn rename_file(e: Env) {
     fs::rename(e.p("notes/todo.txt"), e.p("projects/todo.txt")).unwrap();
     assert_eq!(e.ls("notes"), ["readme.md"]);
     assert_eq!(fs::read_to_string(e.p("projects/todo.txt")).unwrap(), "buy milk\nwrite spike\n");
@@ -244,10 +245,8 @@ fn rename_file() {
     assert_eq!(errno(fs::rename(e.p("b.txt"), e.p("notes"))), libc::EISDIR);
 }
 
-#[test]
-fn rename_over_existing_file() {
+fn rename_over_existing_file(e: Env) {
     // The save-to-temp-then-rename pattern editors use.
-    let e = Env::new();
     let mut f = fs::File::create(e.p("notes/.todo.txt.swp")).unwrap();
     f.write_all(b"edited\n").unwrap();
     f.sync_all().unwrap();
@@ -269,9 +268,7 @@ fn rename_over_existing_file() {
     assert!(e.whiteouts().contains("notes/readme.md"));
 }
 
-#[test]
-fn rename_directory() {
-    let e = Env::new();
+fn rename_directory(e: Env) {
     fs::write(e.p("code/src/extra.rs"), b"// extra\n").unwrap();
     fs::rename(e.p("code/src"), e.p("code/source")).unwrap();
     assert_eq!(e.ls("code"), ["README", "source"]);
@@ -284,9 +281,7 @@ fn rename_directory() {
     assert_eq!(e.ls("notes/source"), ["extra.rs", "lib.rs", "main.rs"]);
 }
 
-#[test]
-fn opens_are_recorded() {
-    let e = Env::new();
+fn opens_are_recorded(e: Env) {
     let conn = e.conn();
     let count = || -> i64 {
         e.mount.as_ref().unwrap().fs.flush_activity();
@@ -317,9 +312,7 @@ fn opens_are_recorded() {
     assert_eq!(d["mode"], "w");
 }
 
-#[test]
-fn hide_on_epoch_is_immediate() {
-    let e = Env::new();
+fn hide_on_epoch_is_immediate(e: Env) {
     let path = e.p("projects/acme/plan.md");
     assert!(fs::metadata(&path).is_ok());
     assert_eq!(e.ls("projects/acme"), ["budget.csv", "plan.md"]);
@@ -329,7 +322,7 @@ fn hide_on_epoch_is_immediate() {
 
     // The server trashes the item: removes its view row and bumps the epoch.
     let conn = e.conn();
-    store::hide_path(&conn, DIR, "projects/acme/plan.md").unwrap();
+    e.hide("projects/acme/plan.md");
 
     // Very next lookup and listing.
     assert_eq!(errno(fs::metadata(&path)), libc::ENOENT);
@@ -344,7 +337,7 @@ fn hide_on_epoch_is_immediate() {
 
     // A ring label hides a whole directory the same way.
     conn.execute("DELETE FROM session_view WHERE dir_id = ?1 AND path LIKE 'code/%'", params![DIR]).unwrap();
-    store::bump_epoch(&conn, DIR).unwrap();
+    e.bump();
     assert_eq!(e.ls(""), ["_by", "notes", "projects"]);
     assert_eq!(errno(fs::read(e.p("code/src/main.rs"))), libc::ENOENT);
 
@@ -355,25 +348,21 @@ fn hide_on_epoch_is_immediate() {
         params![DIR],
     )
     .unwrap();
-    store::bump_epoch(&conn, DIR).unwrap();
+    e.bump();
     assert_eq!(fs::read_to_string(&path).unwrap(), "Plan for Acme Robotics (synthetic).\n");
 }
 
-#[test]
-fn hide_without_epoch_bump_is_not_seen() {
+fn hide_without_epoch_bump_is_not_seen(e: Env) {
     // Documents the contract: the epoch is the signal; the daemon does not poll rows.
-    let e = Env::new();
     let conn = e.conn();
     assert!(fs::metadata(e.p("notes/todo.txt")).is_ok());
     conn.execute("DELETE FROM session_view WHERE dir_id = ?1 AND path = 'notes/todo.txt'", params![DIR]).unwrap();
     assert!(fs::metadata(e.p("notes/todo.txt")).is_ok());
-    store::bump_epoch(&conn, DIR).unwrap();
+    e.bump();
     assert_eq!(errno(fs::metadata(e.p("notes/todo.txt"))), libc::ENOENT);
 }
 
-#[test]
-fn item_id_xattr() {
-    let e = Env::new();
+fn item_id_xattr(e: Env) {
     let c = CString::new(e.p("notes/todo.txt").as_os_str().as_bytes()).unwrap();
     let name = CString::new("user.drive.item_id").unwrap();
     let mut buf = [0u8; 64];
@@ -382,9 +371,7 @@ fn item_id_xattr() {
     assert!(std::str::from_utf8(&buf[..n as usize]).unwrap().starts_with("itm_"));
 }
 
-#[test]
-fn state_survives_remount() {
-    let mut e = Env::new();
+fn state_survives_remount(mut e: Env) {
     fs::remove_file(e.p("notes/readme.md")).unwrap();
     fs::write(e.p("notes/todo.txt"), b"changed\n").unwrap();
     e.remount();
@@ -392,9 +379,7 @@ fn state_survives_remount() {
     assert_eq!(fs::read_to_string(e.p("notes/todo.txt")).unwrap(), "changed\n");
 }
 
-#[test]
-fn many_small_files() {
-    let e = Env::new();
+fn many_small_files(e: Env) {
     fs::create_dir(e.p("many")).unwrap();
     for i in 0..500 {
         fs::write(e.p(&format!("many/f{i:04}.txt")), format!("{i}\n")).unwrap();
@@ -403,3 +388,62 @@ fn many_small_files() {
     assert_eq!(names.len(), 500);
     assert_eq!(fs::read_to_string(e.p("many/f0123.txt")).unwrap(), "123\n");
 }
+
+fn unannounced_change_is_picked_up(e: Env) {
+    // The server bumps the epoch but does not call the control socket: the per-operation check
+    // (zero timeouts) or the poll (kernel caching) applies it.
+    assert!(fs::metadata(e.p("notes/todo.txt")).is_ok());
+    let conn = e.conn();
+    conn.execute("DELETE FROM session_view WHERE dir_id = ?1 AND path = 'notes/todo.txt'", params![DIR]).unwrap();
+    store::bump_epoch(&conn, DIR).unwrap();
+    if e.cached {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(errno(fs::metadata(e.p("notes/todo.txt"))), libc::ENOENT);
+    assert_eq!(e.ls("notes"), ["readme.md"]);
+}
+
+fn added_item_appears(e: Env) {
+    // A miss the kernel cached (negative entry) must not hide an item added later.
+    assert_eq!(errno(fs::metadata(e.p("notes/later.txt"))), libc::ENOENT);
+    let conn = e.conn();
+    conn.execute(
+        "INSERT INTO session_view (dir_id, path, kind, item_id, version)
+         SELECT ?1, 'notes/later.txt', 'file', item_id, 1 FROM items WHERE path = 'notes/todo.txt'",
+        params![DIR],
+    )
+    .unwrap();
+    e.bump();
+    assert_eq!(fs::read_to_string(e.p("notes/later.txt")).unwrap(), "buy milk\nwrite spike\n");
+}
+
+macro_rules! both_modes {
+    ($($name:ident),* $(,)?) => {
+        mod zero_timeouts { $( #[test] fn $name() { super::$name(super::Env::new(false)) } )* }
+        mod kernel_cache { $( #[test] fn $name() { super::$name(super::Env::new(true)) } )* }
+    };
+}
+
+both_modes!(
+    listing_shows_view_only,
+    reads_come_from_blobs,
+    symlinks_from_view,
+    session_symlinks,
+    write_copies_up,
+    truncate_and_setattr,
+    read_only_items_refuse_writes,
+    create_and_mkdir,
+    unlink_adds_whiteouts,
+    rmdir_and_recreate,
+    rename_file,
+    rename_over_existing_file,
+    rename_directory,
+    opens_are_recorded,
+    hide_on_epoch_is_immediate,
+    hide_without_epoch_bump_is_not_seen,
+    item_id_xattr,
+    state_survives_remount,
+    many_small_files,
+    unannounced_change_is_picked_up,
+    added_item_appears,
+);

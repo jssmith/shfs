@@ -18,7 +18,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::Duration;
 
 use fuse_backend_rs::abi::fuse_abi::{CreateIn, stat64, statvfs64};
@@ -53,6 +53,8 @@ pub struct Config {
     pub dir_id: String,
     pub entry_timeout: Duration,
     pub attr_timeout: Duration,
+    /// Measurement only: never check the epoch (breaks the freshness contract).
+    pub skip_epoch_check: bool,
 }
 
 impl Config {
@@ -62,8 +64,16 @@ impl Config {
             dir_id: dir_id.to_string(),
             entry_timeout: Duration::ZERO,
             attr_timeout: Duration::ZERO,
+            skip_epoch_check: false,
         }
     }
+}
+
+/// A kernel cache entry made stale by a view change.
+#[derive(Debug)]
+pub enum Inval {
+    Entry { parent: u64, name: CString },
+    Inode { ino: u64 },
 }
 
 /// What a path currently is in the merged view.
@@ -104,6 +114,7 @@ pub struct DriveFs {
     db: Mutex<Connection>,
     st: Mutex<State>,
     activity: ActivityLog,
+    inval_sink: Mutex<Option<mpsc::Sender<Vec<Inval>>>>,
     uid: u32,
     gid: u32,
     mount_time: i64,
@@ -186,6 +197,7 @@ impl DriveFs {
                 next_fh: 1,
             }),
             activity,
+            inval_sink: Mutex::new(None),
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
             mount_time: std::time::SystemTime::now()
@@ -194,6 +206,10 @@ impl DriveFs {
                 .unwrap_or(0),
             cfg,
         })
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
     }
 
     pub fn upper_dir(&self) -> &Path {
@@ -207,18 +223,55 @@ impl DriveFs {
 
     // ---- freshness -------------------------------------------------------------------------
 
-    /// Checks the epoch and reloads the view if it changed. Called before every lookup,
-    /// getattr, open, read of an item's blob, and listing. Lock order: db, then state.
-    fn fresh(&self) -> io::Result<()> {
+    /// Where kernel invalidations found inside a request handler are sent; the handler must not
+    /// send them itself (the kernel may hold a directory lock while it waits for the handler).
+    pub fn set_inval_sink(&self, tx: mpsc::Sender<Vec<Inval>>) {
+        *lock(&self.inval_sink) = Some(tx);
+    }
+
+    /// Checks the epoch and reloads the view if it changed. Returns the kernel cache entries
+    /// that the change makes stale (only those the kernel can have: paths it has an inode for).
+    /// Lock order: db, then state.
+    pub fn refresh(&self) -> io::Result<(i64, Vec<Inval>)> {
         let mut db = lock(&self.db);
         let ep = store::epoch(&db, &self.cfg.dir_id).map_err(dberr)?;
-        if ep == lock(&self.st).view.epoch {
-            return Ok(());
+        let old = lock(&self.st).view.clone();
+        if ep == old.epoch {
+            return Ok((ep, Vec::new()));
         }
         let (ep, rows) = store::load_view(&mut db, &self.cfg.dir_id).map_err(dberr)?;
         let view = Arc::new(View::build(ep, rows));
         log::debug!("view reloaded at epoch {ep}: {} entries", view.entries.len());
-        lock(&self.st).view = view;
+        let mut st = lock(&self.st);
+        st.view = view.clone();
+        drop(db);
+        let mut out = Vec::new();
+        for p in old.changed_paths(&view) {
+            if let Some(&parent) = st.by_path.get(parent_of(&p)) {
+                let name = p.rsplit('/').next().unwrap_or(&p);
+                if let Ok(c) = CString::new(name) {
+                    out.push(Inval::Entry { parent, name: c });
+                }
+            }
+            if let Some(&ino) = st.by_path.get(&p) {
+                out.push(Inval::Inode { ino });
+            }
+        }
+        Ok((ep, out))
+    }
+
+    /// The per-operation epoch check, called before every lookup, getattr, open, read of an
+    /// item's blob, and listing.
+    fn fresh(&self) -> io::Result<()> {
+        if self.cfg.skip_epoch_check {
+            return Ok(());
+        }
+        let (_, invals) = self.refresh()?;
+        if !invals.is_empty() {
+            if let Some(tx) = lock(&self.inval_sink).as_ref() {
+                let _ = tx.send(invals);
+            }
+        }
         Ok(())
     }
 
@@ -611,7 +664,15 @@ impl FileSystem for DriveFs {
         let name = name_str(name)?;
         let mut st = lock(&self.st);
         let path = join(&Self::path_of(&st, parent)?, name);
-        self.entry_for(&mut st, &path)
+        match self.entry_for(&mut st, &path) {
+            // With kernel caching on, let the kernel cache the miss too; view changes
+            // invalidate added paths as well as removed ones.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) && !self.cfg.entry_timeout.is_zero() => {
+                Ok(Entry { inode: 0, generation: 0, attr: unsafe { std::mem::zeroed() }, attr_flags: 0,
+                           attr_timeout: self.cfg.attr_timeout, entry_timeout: self.cfg.entry_timeout })
+            }
+            r => r,
+        }
     }
 
     fn getattr(&self, _ctx: &Context, ino: u64, _h: Option<u64>) -> io::Result<(stat64, Duration)> {

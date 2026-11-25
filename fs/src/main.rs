@@ -2,9 +2,10 @@
 //!
 //! ```text
 //! agent-drive-fs mount --data D --dir-id S [--mountpoint M] [--threads N]
-//!                      [--entry-timeout-ms N] [--attr-timeout-ms N] [--name NAME]
+//!                      [--entry-timeout-ms N] [--attr-timeout-ms N] [--poll-ms N] [--name NAME]
 //! agent-drive-fs stub --data D --dir-id S [--synthetic] [--tree PATH --prefix P]...
-//! agent-drive-fs hide --data D --dir-id S --path P      (delete a view row, bump the epoch)
+//! agent-drive-fs hide --data D --dir-id S --path P      (delete a view row, bump the epoch,
+//!                                                        and ask the daemon to apply it)
 //! agent-drive-fs bump --data D --dir-id S
 //! agent-drive-fs materialize --data D --dir-id S --out DIR
 //! agent-drive-fs opens --data D --dir-id S              (count of activity rows op='open')
@@ -13,7 +14,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent_drive_fs::{daemon::Mount, drivefs, store, stub};
+use agent_drive_fs::{daemon, daemon::Mount, drivefs, store, stub};
 use anyhow::{Context, bail};
 
 struct Args {
@@ -81,9 +82,13 @@ fn main() -> anyhow::Result<()> {
             let mut cfg = drivefs::Config::new(&data, &dir_id);
             cfg.entry_timeout = a.ms("entry-timeout-ms")?;
             cfg.attr_timeout = a.ms("attr-timeout-ms")?;
-            let threads = a.get("threads").unwrap_or("4").parse()?;
+            cfg.skip_epoch_check = std::env::var_os("A2_FS_SKIP_EPOCH_CHECK").is_some();
+            let opts = daemon::Options {
+                threads: a.get("threads").unwrap_or("1").parse()?,
+                poll: Duration::from_millis(a.get("poll-ms").unwrap_or("50").parse()?),
+            };
             let mut signals = signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM])?;
-            let m = Mount::start(drivefs::DriveFs::new(cfg)?, &mnt, threads)?;
+            let m = Mount::start(drivefs::DriveFs::new(cfg)?, &mnt, opts)?;
             println!("mounted {}", mnt.display());
             let _ = signals.forever().next();
             m.stop();
@@ -104,11 +109,13 @@ fn main() -> anyhow::Result<()> {
         "hide" => {
             let conn = store::open(&data)?;
             let n = store::hide_path(&conn, &dir_id, a.req("path")?)?;
-            println!("removed {n} view row(s); epoch {}", store::epoch(&conn, &dir_id)?);
+            let applied = daemon::request_refresh(&data, &dir_id)?;
+            println!("removed {n} view row(s); epoch {}; daemon applied {applied:?}", store::epoch(&conn, &dir_id)?);
         }
         "bump" => {
             let conn = store::open(&data)?;
             println!("epoch {}", store::bump_epoch(&conn, &dir_id)?);
+            daemon::request_refresh(&data, &dir_id)?;
         }
         "materialize" => {
             let n = stub::materialize(&data, &dir_id, std::path::Path::new(a.req("out")?))?;
