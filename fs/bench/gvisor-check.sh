@@ -24,7 +24,7 @@ cleanup() {
   "${runsc[@]}" delete -force "$sbx" >/dev/null 2>&1
   [ -n "${daemon:-}" ] && kill -INT "$daemon" 2>/dev/null && wait "$daemon" 2>/dev/null
   mountpoint -q "$mnt" && fusermount3 -u "$mnt"
-  mountpoint -q /tmp/${p}-runsc/null-netns && umount /tmp/${p}-runsc/null-netns
+  umount /tmp/${p}-runsc/null-netns 2>/dev/null
 }
 trap cleanup EXIT
 

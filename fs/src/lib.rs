@@ -5,4 +5,5 @@ pub mod drivefs;
 pub mod store;
 pub mod stub;
 pub mod time;
+pub mod upper;
 pub mod view;

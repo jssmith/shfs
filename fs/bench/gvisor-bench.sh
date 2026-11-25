@@ -24,7 +24,7 @@ cleanup() {
   done
   for p in "${daemons[@]}"; do kill -INT "$p" 2>/dev/null; wait "$p" 2>/dev/null; done
   for m in "${mnts[@]}"; do mountpoint -q "$m" && fusermount3 -u "$m"; done
-  mountpoint -q /tmp/${p}-runsc/null-netns && umount /tmp/${p}-runsc/null-netns
+  umount /tmp/${p}-runsc/null-netns 2>/dev/null
 }
 trap cleanup EXIT
 

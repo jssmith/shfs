@@ -14,7 +14,7 @@ use agent_drive_fs::store;
 use agent_drive_fs::stub::StubStore;
 use rusqlite::params;
 
-const DIR: &str = "a2-test";
+const DIR: &str = "a8-test";
 
 struct Env {
     // Fields drop in order: unmount before the temporary directory goes.
@@ -29,7 +29,7 @@ impl Env {
     /// `cached`: kernel caching on (long timeouts) with invalidation on view changes;
     /// otherwise zero timeouts, so every operation reaches the daemon.
     fn new(cached: bool) -> Env {
-        let tmp = tempfile::Builder::new().prefix("a2-fs-test-").tempdir().unwrap();
+        let tmp = tempfile::Builder::new().prefix("a8-fs-test-").tempdir().unwrap();
         let data = tmp.path().join("data");
         let mut s = StubStore::create(&data, DIR).unwrap();
         s.add_synthetic().unwrap();
