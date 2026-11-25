@@ -162,11 +162,17 @@ aws cloudformation describe-stacks --stack-name agent-drive-dev --region us-east
   --query 'Stacks[0].Outputs'
 ```
 
-First boot runs `deploy/aws/setup.sh` (about 10 to 15 minutes; log at
+First boot runs `deploy/aws/setup.sh` (about 5 to 10 minutes, measured at 2 to 6 minutes in a container; log at
 `/var/log/agent-drive-setup.log`). Nested virtualization (gVisor's KVM
 platform) needs a C8i, M8i or R8i instance in a region that offers it; if the
 stack fails on `CpuOptions`, deploy with `NestedVirtualization=disabled` and
 gVisor uses systrap.
+
+The user data clones `RepoUrl` over HTTPS without credentials, so the
+repository must be public at that point. While it is private, deploy with
+`RunSetup=false`, then over Session Manager copy the checkout to
+`/opt/agent-drive` (or clone it with a read-only deploy key) and run
+`sudo /opt/agent-drive/deploy/aws/setup.sh`.
 
 Then the tunnel: [`deploy/cloudflare/README.md`](../cloudflare/README.md).
 

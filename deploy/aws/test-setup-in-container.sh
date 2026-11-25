@@ -2,8 +2,8 @@
 # Run setup.sh in a fresh Ubuntu 24.04 container, as close to a new VM as a
 # container gets: a loop device stands in for the EBS data volume, the host's
 # Docker daemon builds the sandbox image, and there is no systemd (units are
-# written, not enabled). Leaves the container stopped for inspection unless
-# KEEP=0; removes it and the loop device otherwise.
+# written, not enabled). Removes the container and the loop device at the end;
+# the log stays in $OUT.
 #
 #   deploy/aws/test-setup-in-container.sh            # log in $OUT/setup.log
 # Environment: NAME (a3-setup-test), OUT (/tmp/a3-data/setup-test), SKIP_STEPS

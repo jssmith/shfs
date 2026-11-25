@@ -169,10 +169,11 @@ Resources:
             AGENT_DRIVE_DATA=/srv/agent-drive/data
             AGENT_DRIVE_PUBLIC_URL=${PublicUrl}
             EOF
+            [ "${RunSetup}" = "true" ] || exit 0
             apt-get update -q && apt-get install -y -q git
             if [ ! -d /opt/agent-drive/.git ]; then git clone ${RepoUrl} /opt/agent-drive; fi
             git -C /opt/agent-drive fetch -q origin ${RepoRef} && git -C /opt/agent-drive checkout -q FETCH_HEAD
-            if [ "${RunSetup}" = "true" ]; then /opt/agent-drive/deploy/aws/setup.sh; fi
+            /opt/agent-drive/deploy/aws/setup.sh
           - { DataVolume: !Ref DataVolume }
 
   # --- The data volume, separate from the instance so the VM can be rebuilt
