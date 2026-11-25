@@ -19,6 +19,7 @@ Everything lives under `$AGENT_DRIVE_DATA` (default `./data`, never inside the c
 ## 2. The session file system (server ↔ `fs/`)
 
 - The server writes `session_view` rows for a session: every path the session may see, as a file (item and version) or a symlink (relative target). Ringed, unchecked and trashed items are never in it. After any change it increments `session_view_epoch.epoch`.
+- `mode` on a row gives its permission bits (at least the executable bit must survive a round trip); NULL means 0644 for a file. `writable = 0` clears the write bits. The daemon serves the mode and keeps it on copy-up; the server reads the mode of files in `upper/` when it merges them.
 - The daemon serves `sessions/<dir_id>/mnt/` as follows:
   - lookups and listings: the union of `session_view` and `upper/`, minus `whiteouts`;
   - reads: from `upper/` if the path is there, else the blob of the item version;

@@ -98,6 +98,8 @@ CREATE TABLE IF NOT EXISTS session_view (
   version   INTEGER,             -- for kind = 'file'
   target    TEXT,                -- for kind = 'symlink', relative target
   writable  INTEGER NOT NULL DEFAULT 1,
+  mode      INTEGER,             -- permission bits, e.g. 493 (0o755); NULL: 0o644 for a file;
+                                 -- writable = 0 clears the write bits; ignored for symlinks
   PRIMARY KEY (dir_id, path)
 );
 CREATE TABLE IF NOT EXISTS session_view_epoch (
