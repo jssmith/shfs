@@ -127,3 +127,34 @@ describe.skipIf(!haveSandbox)('v2 in gVisor (needs AGENT_DRIVE_RUNSC and AGENT_D
     expect((await agent.call('bash', { session_id: b, command: 'drive status | head -1' })).text).toContain('Purpose: session B');
   }, 60_000);
 });
+
+describe.skipIf(!haveSandbox)('v3 in gVisor (needs AGENT_DRIVE_RUNSC and AGENT_DRIVE_ROOTFS)', () => {
+  let d: Drive;
+  let agent: Agent;
+  let tmp: string;
+  beforeAll(async () => {
+    d = await startDrive(9417, { surface: 'v3' });
+    tmp = mkdtempSync(path.join(os.tmpdir(), 'a4-shell3-'));
+    await seed(d, tmp, { 'notes/plan.md': 'one\ntwo\nthree\n' });
+    agent = await connectAgent(d.url, 'shell3-agent');
+  });
+  afterAll(async () => {
+    await agent?.close();
+    await d?.close();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('only start_session and bash; files are read and written through the shell and merge automatically', async () => {
+    const tools = (await agent.client.listTools()).tools.map((t) => t.name).sort();
+    expect(tools).toEqual(['bash', 'start_session']);
+    expect((await agent.call('read', { session_id: 'x', file_path: 'y' })).isError).toBe(true);
+    const sid = String((await agent.call('start_session', { purpose: 'number the plan' })).structured.session_id);
+    const cat = await agent.call('bash', { session_id: sid, command: 'cat -n home/notes/plan.md' });
+    expect(cat.text).toContain('     2\ttwo');
+    await agent.call('bash', { session_id: sid, command: "cat > home/notes/new.md <<'EOF'\nwritten through the shell\nEOF" });
+    await sleep(2600);
+    expect(await content(d, 'home/notes/new.md')).toBe('written through the shell\n');
+    const help = await agent.call('bash', { session_id: sid, command: 'drive help' });
+    expect(help.text).toMatch(/^\[drive\] Saved to the drive: create home\/notes\/new\.md/);
+  }, 60_000);
+});

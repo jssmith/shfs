@@ -97,6 +97,15 @@ Every result of a session tool begins with `[drive] …` lines when automatic me
 
 The skill is the MCP resource `skill://agent-drive/SKILL.md` (`text/markdown`, with `name`/`description` front matter, the MCP Skills extension convention) and `drive help`; the text is `SHELL_SKILL` in `skill.ts`.
 
+## v3: shell first, minimal
+
+Like v2, with only `start_session` and `bash`; reading, writing and editing happen in the shell. Same `start_session`, automatic merge, `drive` command, partial-view note and skill resource. What differs:
+
+| Where | v3 text |
+| --- | --- |
+| Server instructions | v2's, with "pass it to bash" in place of "pass it to bash, read, write and edit" |
+| `bash` description | v2's, plus, before "The drive command does the rest": "Read files with cat -n or sed -n '10,40p' file, write them with cat > file <<'EOF', and edit them with sed -i or python3." |
+
 ## Automatic merge (v2, v3)
 
 After a call that changed files under /drive (`bash`, `write`, `edit`), the session's changes merge into the drive as one package, all or nothing, through the same merge as `checkpoint` (`server/src/merge/auto.ts`):
