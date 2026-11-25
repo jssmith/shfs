@@ -6,3 +6,5 @@ data/
 .env
 .env.*
 coverage/
+
+fs/target/
