@@ -17,7 +17,7 @@ use std::fs::{self, File, OpenOptions as StdOpen};
 use std::io::{self, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::Duration;
@@ -171,6 +171,22 @@ fn name_str(name: &CStr) -> io::Result<&str> {
     Ok(s)
 }
 
+/// Reads the whiteouts file and opens it for appending. A torn last line (a crash during an
+/// append, before that delete was acknowledged) is dropped from the file.
+fn open_whiteouts(path: &Path) -> io::Result<(HashSet<String>, File)> {
+    let f = StdOpen::new().read(true).append(true).create(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    let mut s = String::new();
+    io::Read::read_to_string(&mut &f, &mut s)?;
+    if !s.is_empty() && !s.ends_with('\n') {
+        let keep = s.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        log::warn!("whiteouts: dropping a torn last line {:?}", &s[keep..]);
+        f.set_len(keep as u64)?;
+        f.sync_data()?;
+        s.truncate(keep);
+    }
+    Ok((s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect(), f))
+}
+
 fn access_mode(flags: u32) -> &'static str {
     match flags as i32 & libc::O_ACCMODE {
         libc::O_WRONLY => "w",
@@ -189,13 +205,7 @@ impl DriveFs {
         let sess = store::session_dir(&cfg.data, &cfg.dir_id);
         fs::create_dir_all(sess.join("upper"))?;
         let upper = Upper::open(&sess.join("upper"))?;
-        let wpath = sess.join("whiteouts");
-        let whiteouts: HashSet<String> = match fs::read_to_string(&wpath) {
-            Ok(s) => s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect(),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => HashSet::new(),
-            Err(e) => return Err(e.into()),
-        };
-        let whiteout_file = StdOpen::new().create(true).append(true).open(&wpath)?;
+        let (whiteouts, whiteout_file) = open_whiteouts(&sess.join("whiteouts"))?;
         let mut db = store::open(&cfg.data)?;
         let (ep, rows) = store::load_view(&mut db, &cfg.dir_id)?;
         let view = Arc::new(View::build(ep, rows));
@@ -468,9 +478,26 @@ impl DriveFs {
         }
     }
 
-    fn add_whiteout(st: &mut State, path: &str) -> io::Result<()> {
-        if st.whiteouts.insert(path.to_string()) {
-            st.whiteout_file.write_all(format!("{path}\n").as_bytes())?;
+    /// Appends whiteouts and makes them durable before the delete or rename is acknowledged.
+    /// Callers first make the `upper/` side of the change durable (see `durable_*`), so that
+    /// after a crash a whiteout never stands without it.
+    fn add_whiteouts(st: &mut State, paths: &[&str]) -> io::Result<()> {
+        let mut buf = String::new();
+        for p in paths {
+            if !st.whiteouts.contains(*p) {
+                buf.push_str(p);
+                buf.push('\n');
+            }
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
+        // One write(2) with O_APPEND: a crash leaves whole lines or a torn last line, which
+        // `open_whiteouts` drops.
+        st.whiteout_file.write_all(buf.as_bytes())?;
+        st.whiteout_file.sync_data()?;
+        for p in paths {
+            st.whiteouts.insert(p.to_string());
         }
         Ok(())
     }
@@ -870,14 +897,21 @@ impl FileSystem for DriveFs {
         let name = name_str(name)?;
         let mut st = lock(&self.st);
         let path = join(&Self::path_of(&st, parent)?, name);
-        match self.resolve(&st, &path).ok_or_else(|| err(libc::ENOENT))? {
+        let had_upper = match self.resolve(&st, &path).ok_or_else(|| err(libc::ENOENT))? {
             Node::Upper(m) if m.is_dir() => return Err(err(libc::EISDIR)),
             Node::Lower(Lower::Dir) => return Err(err(libc::EISDIR)),
-            Node::Upper(_) => self.upper.unlink(&path)?,
-            Node::Lower(_) => {}
-        }
+            Node::Upper(_) => {
+                self.upper.unlink(&path)?;
+                true
+            }
+            Node::Lower(_) => false,
+        };
         if Self::lower(&st, &path).is_some() {
-            Self::add_whiteout(&mut st, &path)?;
+            if had_upper {
+                // Else a crash could bring the session's copy back as a replacement.
+                self.upper.sync_dir(parent_of(&path))?;
+            }
+            Self::add_whiteouts(&mut st, &[&path])?;
         }
         Self::detach(&mut st, &path);
         Ok(())
@@ -900,7 +934,10 @@ impl FileSystem for DriveFs {
             self.upper.rmdir(&path)?;
         }
         if Self::lower(&st, &path).is_some() {
-            Self::add_whiteout(&mut st, &path)?;
+            if upper_dir {
+                self.upper.sync_dir(parent_of(&path))?;
+            }
+            Self::add_whiteouts(&mut st, &[&path])?;
         }
         Self::detach(&mut st, &path);
         Ok(())
@@ -954,11 +991,33 @@ impl FileSystem for DriveFs {
         if dst_lower_dir {
             // The target is an empty merged directory with nothing of its own in upper/.
             let _ = self.upper.rmdir(&new);
-            Self::add_whiteout(&mut st, &new)?;
         }
         self.upper.rename(&old, &new)?;
+        let mut wo: Vec<&str> = Vec::new();
+        if dst_lower_dir {
+            wo.push(new.as_str());
+        }
         if Self::lower(&st, &old).is_some() {
-            Self::add_whiteout(&mut st, &old)?;
+            wo.push(old.as_str());
+        }
+        if !wo.is_empty() {
+            // The whiteout hides the store's copy at the old path, so the moved copy in upper/
+            // must be on disk first: its content, its new name, and the old name's removal.
+            if src_dir {
+                self.upper.syncfs()?;
+            } else {
+                match self.upper.open_file(&new, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+                    Ok(f) => f.sync_all()?,
+                    // A symlink: its name is synced with the directory.
+                    Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {}
+                    Err(e) => return Err(e),
+                }
+                self.upper.sync_dir(&newparent)?;
+                if parent_of(&old) != newparent {
+                    self.upper.sync_dir(parent_of(&old))?;
+                }
+            }
+            Self::add_whiteouts(&mut st, &wo)?;
         }
         Self::move_inodes(&mut st, &old, &new, src_dir);
         Ok(())
@@ -1150,8 +1209,14 @@ impl FileSystem for DriveFs {
         Ok(())
     }
 
-    fn fsyncdir(&self, _ctx: &Context, _ino: u64, _datasync: bool, _fh: u64) -> io::Result<()> {
-        Ok(())
+    fn fsyncdir(&self, _ctx: &Context, ino: u64, _datasync: bool, _fh: u64) -> io::Result<()> {
+        let st = lock(&self.st);
+        let path = Self::path_of(&st, ino)?;
+        match self.upper.sync_dir(&path) {
+            // A directory only in the store has nothing of its own to sync.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+            r => r,
+        }
     }
 
     fn access(&self, _ctx: &Context, ino: u64, _mask: u32) -> io::Result<()> {
@@ -1159,5 +1224,26 @@ impl FileSystem for DriveFs {
         let st = lock(&self.st);
         let path = Self::path_of(&st, ino)?;
         self.resolve(&st, &path).map(|_| ()).ok_or_else(|| err(libc::ENOENT))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn torn_whiteout_line_is_dropped() {
+        let t = tempfile::Builder::new().prefix("a8-wo-").tempdir().unwrap();
+        let p = t.path().join("whiteouts");
+        fs::write(&p, b"notes/a\nnotes/b\nnotes/to").unwrap();
+        let (set, mut f) = open_whiteouts(&p).unwrap();
+        assert_eq!(set, HashSet::from(["notes/a".to_string(), "notes/b".to_string()]));
+        assert_eq!(fs::read(&p).unwrap(), b"notes/a\nnotes/b\n");
+        f.write_all(b"notes/c\n").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"notes/a\nnotes/b\nnotes/c\n");
+        // No newline at all: nothing survives.
+        fs::write(&p, b"half").unwrap();
+        assert!(open_whiteouts(&p).unwrap().0.is_empty());
+        assert_eq!(fs::read(&p).unwrap(), b"");
     }
 }

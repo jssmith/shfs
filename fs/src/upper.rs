@@ -319,6 +319,14 @@ impl Upper {
         self.open_file(path, libc::O_RDONLY | libc::O_DIRECTORY, 0)?.sync_all()
     }
 
+    /// `syncfs(2)` on the file system holding `upper/`.
+    pub fn syncfs(&self) -> io::Result<()> {
+        if unsafe { libc::syncfs(self.fd()) } < 0 {
+            return Err(last());
+        }
+        Ok(())
+    }
+
     pub fn statvfs(&self) -> io::Result<libc::statvfs64> {
         let mut s: libc::statvfs64 = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstatvfs64(self.fd(), &mut s) } < 0 {
