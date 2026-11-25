@@ -33,7 +33,7 @@ Every tool except `start_session` takes `session_id`, described to the model as 
 
 ## Errors
 
-Every error carries a machine-readable reason first: `needs_session`, `merge_conflict` (with paths and reasons), `not_found`, `finished`, `paused`, `invalid_path`, `sandbox_unavailable`, `internal_error`. A hidden or ringed item reads exactly like a missing one; only counts reveal that hidden items exist, as `in_ring: ring:finance (n items)`.
+Every error carries a machine-readable reason first: `needs_session`, `merge_conflict` (with paths and reasons), `not_found`, `finished`, `paused`, `invalid_path`, `sandbox_unavailable`, `internal_error`. A hidden or ringed item reads exactly like a missing one, in merges too (a change onto a hidden item's path goes ahead and the hidden item is moved aside, shown to the person only); only counts reveal that hidden items exist, as `in_ring: ring:finance (n items)`.
 
 ## Not yet in the thin drive
 

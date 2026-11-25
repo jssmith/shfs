@@ -66,6 +66,20 @@ export async function diffWithIgnored(s: Sessions, dir_id: string): Promise<{ ch
   return { changes, ignored };
 }
 
+/** `dir/name (2).ext`, the first such path no live item and no reserved path uses. */
+function freeSibling(drive: Sessions['drive'], p: string, reserved: Set<string>): string {
+  const slash = p.lastIndexOf('/');
+  const dir = slash >= 0 ? p.slice(0, slash + 1) : '';
+  const name = p.slice(slash + 1);
+  const dot = name.lastIndexOf('.');
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : '';
+  for (let n = 2; ; n++) {
+    const cand = `${dir}${stem} (${n})${ext}`;
+    if (!reserved.has(cand) && !drive.liveItemAt(cand)) return cand;
+  }
+}
+
 export interface MergeResult {
   ok: boolean;
   pkg_id?: string;
@@ -104,10 +118,24 @@ export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoin
       conflicts.push({ path: basePath, reason: 'changed in the drive since this session last checkpointed' });
     } else if (c.kind === 'move' || c.kind === 'archive') freed.add(basePath);
   }
+  // A create or move onto a path held by an item the agent can see is a
+  // conflict it can understand. Onto a path held by a hidden item (ringed,
+  // held or unchecked), any refusal would tell the agent that something it
+  // cannot see is there. So the agent's change goes ahead and the hidden item
+  // is moved aside to a free sibling path, in the same package: the agent
+  // learns nothing, and the person sees the move in the app (and can undo it).
+  const aside: Op[] = [];
+  const reserved = new Set(changes.filter((c) => c.kind === 'create' || c.kind === 'move').map((c) => c.path));
   for (const c of changes) {
     if (c.kind !== 'create' && c.kind !== 'move') continue;
     const at = drive.liveItemAt(c.path);
-    if (at && !freed.has(c.path)) conflicts.push({ path: c.path, reason: 'path_taken: another item is at this path in the drive' });
+    if (!at || freed.has(c.path)) continue;
+    if (drive.reachable(at.item_id)) conflicts.push({ path: c.path, reason: 'path_taken: another item is at this path in the drive' });
+    else {
+      const to = freeSibling(drive, c.path, reserved);
+      reserved.add(to);
+      aside.push({ op: 'move', item_id: at.item_id, from_path: c.path, path: to });
+    }
   }
   if (conflicts.length) return { ok: false, changes: report, conflicts, withheld: [], ignored };
 
@@ -117,6 +145,7 @@ export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoin
   const versions: NewVersion[] = [];
   const labels: [string, string, 'session'][] = [];
   const withheld: { path: string; rings: string[] }[] = [];
+  ops.push(...aside);
   for (const c of changes) {
     if (c.kind === 'create' || c.kind === 'update') {
       const got = await safeRead(d.upper, c.path);
@@ -139,7 +168,7 @@ export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoin
     }
   }
   const counts = changes.reduce<Record<string, number>>((m, c) => ((m[c.kind] = (m[c.kind] ?? 0) + 1), m), {});
-  const observed = Object.entries(counts).map(([k, n]) => `${k} ${n}`).join(', ');
+  const observed = Object.entries(counts).map(([k, n]) => `${k} ${n}`).join(', ') + (aside.length ? `; moved aside ${aside.length} hidden item(s) at paths the session wrote` : '');
   let applied: { pkg_id: string; state_id: string };
   try {
     applied = tx(drive.db, () => {
@@ -148,7 +177,13 @@ export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoin
       return r;
     });
   } catch (e) {
-    if (e instanceof PreconditionError) return { ok: false, changes: report, conflicts: e.conflicts.map((c) => ({ path: c.path, reason: c.reason })), withheld: [], ignored };
+    // The drive changed between the checks above and the transaction (an
+    // upload, another merge). The reason stays generic: the item in the way
+    // may be one this session cannot see.
+    if (e instanceof PreconditionError) {
+      const paths = [...new Set(changes.map((c) => c.path))].filter((p) => e.conflicts.some((x) => x.path === p || x.path === '')).slice(0, 20);
+      return { ok: false, changes: report, conflicts: (paths.length ? paths : ['/']).map((p) => ({ path: p, reason: 'the drive changed while merging; call checkpoint again' })), withheld: [], ignored };
+    }
     throw e;
   }
   await s.materialise(dir_id);
