@@ -106,16 +106,19 @@ export class DriveOAuthProvider implements OAuthServerProvider {
   }
 
   async exchangeAuthorizationCode(client: OAuthClientInformationFull, code: string, _verifier?: string, redirectUri?: string, resource?: URL): Promise<OAuthTokens> {
+    // A code used twice: revoke what it issued (OAuth 2.1 §4.1.3). Outside the
+    // transaction below, which rolls back when it throws.
+    const used = get<{ grant_id: string; used: number }>(this.db, 'SELECT grant_id, used FROM oauth_codes WHERE code_hash = ?', secretHash(code));
+    if (used?.used) {
+      run(this.db, 'UPDATE oauth_tokens SET revoked = 1 WHERE grant_id = ?', used.grant_id);
+      throw new InvalidGrantError('authorization code already used');
+    }
     return tx(this.db, () => {
       const r = get<{ client_id: string; grant_id: string; redirect_uri: string; resource: string | null; scopes: string; expires_at: number; used: number }>(
         this.db, 'SELECT * FROM oauth_codes WHERE code_hash = ?', secretHash(code),
       );
       if (!r || r.client_id !== client.client_id) throw new InvalidGrantError('unknown authorization code');
-      if (r.used) {
-        // A code used twice: revoke what it issued (OAuth 2.1 §4.1.3).
-        run(this.db, 'UPDATE oauth_tokens SET revoked = 1 WHERE grant_id = ?', r.grant_id);
-        throw new InvalidGrantError('authorization code already used');
-      }
+      if (r.used) throw new InvalidGrantError('authorization code already used');
       if (r.expires_at < nowS()) throw new InvalidGrantError('authorization code expired');
       if (redirectUri !== undefined && redirectUri !== r.redirect_uri) throw new InvalidGrantError('redirect_uri does not match');
       this.checkResource(resource);
@@ -134,17 +137,19 @@ export class DriveOAuthProvider implements OAuthServerProvider {
   }
 
   async exchangeRefreshToken(client: OAuthClientInformationFull, refreshToken: string, scopes?: string[], resource?: URL): Promise<OAuthTokens> {
+    const old = get<{ grant_id: string; kind: string; replaced_at: number | null }>(this.db, 'SELECT grant_id, kind, replaced_at FROM oauth_tokens WHERE token_hash = ?', secretHash(refreshToken));
+    if (old?.kind === 'refresh' && old.replaced_at !== null && old.replaced_at + REFRESH_GRACE_S < nowS()) {
+      // Reuse of a rotated refresh token: treat the grant as compromised.
+      run(this.db, 'UPDATE oauth_tokens SET revoked = 1 WHERE grant_id = ?', old.grant_id);
+      throw new InvalidGrantError('refresh token already used');
+    }
     return tx(this.db, () => {
       const r = get<{ grant_id: string; client_id: string; scopes: string; expires_at: number; replaced_at: number | null; revoked: number; kind: string }>(
         this.db, 'SELECT * FROM oauth_tokens WHERE token_hash = ?', secretHash(refreshToken),
       );
       if (!r || r.kind !== 'refresh' || r.client_id !== client.client_id || r.revoked) throw new InvalidGrantError('invalid refresh token');
       if (r.expires_at < nowS()) throw new InvalidGrantError('refresh token expired');
-      if (r.replaced_at !== null && r.replaced_at + REFRESH_GRACE_S < nowS()) {
-        // Reuse of a rotated refresh token: treat the grant as compromised.
-        run(this.db, 'UPDATE oauth_tokens SET revoked = 1 WHERE grant_id = ?', r.grant_id);
-        throw new InvalidGrantError('refresh token already used');
-      }
+      if (r.replaced_at !== null && r.replaced_at + REFRESH_GRACE_S < nowS()) throw new InvalidGrantError('refresh token already used');
       const g = get<{ revoked_at: string | null }>(this.db, 'SELECT revoked_at FROM oauth_grants WHERE grant_id = ?', r.grant_id);
       if (!g || g.revoked_at) throw new InvalidGrantError('connection revoked');
       this.checkResource(resource);

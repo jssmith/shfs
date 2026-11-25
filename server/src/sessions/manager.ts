@@ -177,7 +177,12 @@ export class Sessions {
       top[t] = (top[t] ?? 0) + 1;
     }
     const purpose = this.byDir(dir_id)?.purpose.toLowerCase() ?? '';
-    const topics = all<{ path: string }>(this.drive.db, "SELECT path FROM labels WHERE path LIKE 'topic:%'")
+    // Only topics carried by items this session can see: a topic name on a ringed item says something about it.
+    const topics = all<{ path: string }>(
+      this.drive.db,
+      "SELECT DISTINCT l.path FROM labels l JOIN item_labels il ON il.label_id = l.label_id JOIN session_view v ON v.item_id = il.item_id AND v.dir_id = ? WHERE l.path LIKE 'topic:%'",
+      dir_id,
+    )
       .map((r) => r.path)
       .filter((p) => p.split(':').slice(1).some((seg) => seg.split('-').some((w) => w.length > 2 && purpose.includes(w))));
     return { files: view.length, top, hidden: this.drive.hiddenCounts(), topics };
