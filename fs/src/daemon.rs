@@ -7,6 +7,9 @@
 //!   entry, so the next operation in the sandbox sees the change;
 //! - a poll of the epoch every `poll` interval, for changes nobody announced;
 //! - the per-operation epoch check, for requests that reach the daemon anyway.
+//!
+//! The control socket also answers `stats` with `ok {json}`: the sizes of the daemon's tables
+//! (inodes, paths, open handles, whiteouts), for monitoring.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
@@ -166,6 +169,17 @@ impl Mount {
                                 Ok(ep) => format!("ok {ep}\n"),
                                 Err(e) => format!("error {e}\n"),
                             },
+                            "stats" => {
+                                let s = fs.stats();
+                                format!(
+                                    "ok {}\n",
+                                    serde_json::json!({
+                                        "inodes": s.inodes, "paths": s.paths, "handles": s.handles,
+                                        "dir_handles": s.dir_handles, "whiteouts": s.whiteouts,
+                                        "listed_only": s.listed_only,
+                                    })
+                                )
+                            }
                             other => format!("error unknown command {other:?}\n"),
                         };
                         if w.write_all(reply.as_bytes()).is_err() {
