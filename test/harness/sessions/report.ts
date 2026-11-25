@@ -56,7 +56,9 @@ function perRun(t: Traj) {
   return {
     run: r.id, client: r.client, variant: r.variant, conv: r.conversation,
     sessions: new Set(ts.flatMap((x) => x.dirs)).size,
-    later_reusing: `${later.filter((x) => x.reused).length}/${later.length}`,
+    // Of the later turns that used the drive at all, how many used a session opened in an earlier turn.
+    later_reusing: `${later.filter((x) => x.reused).length}/${later.filter((x) => x.calls > 0).length}`,
+    later_new_sessions: later.reduce((a, x) => a + x.started, 0),
     done: `${ts.filter((x) => x.done_ok).length}/${ts.length}`,
     merged: `${ts.filter((x) => x.merged_ok).length}/${ts.length}`,
     merges: t.extra.drive.merges_landed.length,
@@ -91,7 +93,8 @@ const agg = [...groups].map(([k, rs]) => {
   return {
     variant, conv, client, runs: rs.length,
     'drive sessions per conversation': rs.map((r) => r.sessions).join(', '),
-    'later turns reusing a session': frac(rs.map((r) => r.later_reusing)),
+    'later drive turns reusing a session': frac(rs.map((r) => r.later_reusing)),
+    'new sessions after turn 1': rs.map((r) => r.later_new_sessions).join(', '),
     'turns done': frac(rs.map((r) => r.done)),
     'turns merged': frac(rs.map((r) => r.merged)),
     'merges landed': rs.map((r) => r.merges).join(', '),

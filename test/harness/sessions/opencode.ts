@@ -36,7 +36,7 @@ export function opencodeClient(o: OpencodeOptions) {
   mkdirSync(join(o.home, 'project'), { recursive: true });
   mkdirSync(o.cacheDir, { recursive: true });
   const modelCfg: Record<string, unknown> = { name: 'Kimi K3', tool_call: true };
-  if (o.contextLimit) modelCfg.limit = { context: o.contextLimit, output: 16_000 };
+  if (o.contextLimit) modelCfg.limit = { context: o.contextLimit, output: Math.min(16_000, Math.floor(o.contextLimit / 4)) };
   const config = {
     $schema: 'https://opencode.ai/config.json',
     model: `fireworks/${o.model}`,

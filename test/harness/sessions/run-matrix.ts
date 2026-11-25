@@ -35,6 +35,7 @@ const { values } = parseArgs({
     variants: { type: 'string', default: 'v0' },
     conversations: { type: 'string', default: 'C3,C10' },
     repeat: { type: 'string', default: '1' },
+    'first-rep': { type: 'string', default: '1' },
     parallel: { type: 'string', default: '3' },
     out: { type: 'string', default: `/tmp/a6-runs/m-${Date.now()}` },
     'server-root': { type: 'string', default: repo },
@@ -60,7 +61,7 @@ execFileSync(join(repo, 'test/harness/corpus/make-sessions-corpus.sh'), [corpus]
 
 interface Job { id: string; client: 'opencode' | 'openwebui'; variant: string; conversation: string; rep: number }
 const jobs: Job[] = [];
-for (let rep = 1; rep <= Number(values.repeat); rep++)
+for (let rep = Number(values['first-rep']); rep < Number(values['first-rep']) + Number(values.repeat); rep++)
   for (const conversation of values.conversations!.split(','))
     for (const variant of values.variants!.split(','))
       for (const client of values.clients!.split(',') as Job['client'][])

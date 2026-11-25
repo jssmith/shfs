@@ -169,7 +169,7 @@ export const C10: Conversation = {
       prompt: 'In unitconv, make km_to_miles round its result to 3 decimal places, and keep the tests passing.',
       check(c) {
         const t = pytest(c.now);
-        return { 'km_to_miles rounds to 3 places': pyEval(c.now, 'u.km_to_miles(1), u.km_to_miles(10)') === '(0.621, 6.214)', 'tests pass': t.failed === 0 && t.passed >= 3 };
+        return { 'km_to_miles rounds to 3 places': pyEval(c.now, 'u.km_to_miles(1), u.km_to_miles(10)') === '0.621 6.214', 'tests pass': t.failed === 0 && t.passed >= 3 };
       },
     },
     {
