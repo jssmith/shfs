@@ -84,6 +84,35 @@ export async function loginWithBrowser(authorizationUrl: string, opts: LoginOpti
   }
 }
 
+/**
+ * Sign in on behalf of another client (OpenCode, Open WebUI): open its
+ * authorization URL, fill the sign-in page, and let the browser follow the
+ * redirect to that client's own callback, which must load. Returns the
+ * callback URL the client received.
+ */
+export async function completeInBrowser(authorizationUrl: string, creds: Credentials, o: { timeoutMs?: number; screenshot?: string } = {}): Promise<URL> {
+  const pw = loadPlaywright();
+  if (!pw) throw new Error('Playwright not found');
+  const timeoutMs = o.timeoutMs ?? 30_000;
+  const authOrigin = new URL(authorizationUrl).origin;
+  const browser = await pw.chromium.launch();
+  try {
+    const page = await browser.newPage();
+    await page.goto(authorizationUrl, { timeout: timeoutMs });
+    if (new URL(page.url()).origin === authOrigin) {
+      const userField = page.locator(USER_SEL).first();
+      if (await userField.count()) await userField.fill(creds.user);
+      await page.locator(PASS_SEL).first().fill(creds.password);
+      await page.locator(SUBMIT_SEL).first().click();
+      await page.waitForURL((u: URL) => u.origin !== authOrigin, { timeout: timeoutMs, waitUntil: 'load' });
+    }
+    if (o.screenshot) await page.screenshot({ path: o.screenshot });
+    return new URL(page.url());
+  } finally {
+    await browser.close();
+  }
+}
+
 function attr(tag: string, name: string): string | undefined {
   const m = tag.match(new RegExp(`\\s${name}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i'));
   const v = m ? (m[2] ?? m[3] ?? m[4]) : undefined;

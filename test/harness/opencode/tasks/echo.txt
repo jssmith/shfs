@@ -1,0 +1,1 @@
+Call the drive_echo tool with the text 'opencode-e2e-42' and then reply with exactly what it returned.
