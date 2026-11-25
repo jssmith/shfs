@@ -11,9 +11,10 @@
 // Options: --server-root DIR (a checkout with server/dist and cli/dist built;
 // default this one), --settle SECONDS (wait after each turn before looking, for
 // variants that merge in the background; default 3), --oc-context N (lower
-// OpenCode's context limit to force compaction), --label TEXT (added to run ids).
+// OpenCode's context limit to force compaction), --label TEXT (added to run ids),
+// --keep-owui (leave the Open WebUI containers running for the next matrix).
 // Writes <out>/<run>/run.json per run and <out>/matrix.json; report.ts reads them.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, readdirSync, readFileSync, statSync, existsSync, appendFileSync } from 'node:fs';
 import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -41,6 +42,7 @@ const { values } = parseArgs({
     label: { type: 'string', default: '' },
     model: { type: 'string', default: 'accounts/fireworks/models/kimi-k3' },
     'turn-timeout': { type: 'string', default: '600' },
+    'keep-owui': { type: 'boolean', default: false },
   },
 });
 const out = values.out!;
@@ -93,18 +95,20 @@ const leaks = (texts: string[]) => {
 };
 
 // --- one run -----------------------------------------------------------------------
+// Open WebUI containers are started for every slot before any run begins, and
+// asynchronously: a synchronous start would block the runner's event loop, and
+// with it the other slots' clients, for the minute or two a container takes.
 const owuiStarted = new Set<number>();
-function ensureOwui(slot: number): string {
-  const port = 9660 + slot;
-  if (!owuiStarted.has(slot)) {
-    execFileSync(join(repo, 'test/harness/openwebui/start.sh'), [], {
-      env: { ...process.env, OWUI_NAME: `a6-owui-${slot}`, OWUI_PORT: String(port), OWUI_DATA: `/tmp/a6-data/owui-${slot}`, OWUI_CA_FILE: process.env.SSL_CERT_FILE ?? '/root/.ccr/ca-bundle.crt' },
-      stdio: 'ignore', timeout: 600_000,
+function startOwui(slot: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const p = spawn(join(repo, 'test/harness/openwebui/start.sh'), [], {
+      env: { ...process.env, OWUI_NAME: `a6-owui-${slot}`, OWUI_PORT: String(9660 + slot), OWUI_DATA: `/tmp/a6-data/owui-${slot}`, OWUI_CA_FILE: process.env.SSL_CERT_FILE ?? '/root/.ccr/ca-bundle.crt' },
+      stdio: 'ignore',
     });
-    owuiStarted.add(slot);
-  }
-  return `http://localhost:${port}`;
+    p.on('close', (code) => { if (code === 0) { owuiStarted.add(slot); resolve(); } else reject(new Error(`Open WebUI slot ${slot} did not start (exit ${code})`)); });
+  });
 }
+const owuiUrl = (slot: number) => `http://localhost:${9660 + slot}`;
 
 async function runJob(job: Job, slot: number): Promise<Record<string, unknown>> {
   const runDir = join(out, job.id);
@@ -123,7 +127,7 @@ async function runJob(job: Job, slot: number): Promise<Record<string, unknown>> 
     const baseline = sharedTree(drive.dataDir);
     client = job.client === 'opencode'
       ? opencodeClient({ home: join(runDir, 'opencode'), cacheDir: OC_CACHE, mcpUrl: drive.mcpUrl, token: drive.token, model: values.model!, apiKey: 'proxy-injected', timeoutS: turnTimeout, ...(values['oc-context'] ? { contextLimit: Number(values['oc-context']) } : {}) })
-      : await openwebuiClient({ owuiUrl: ensureOwui(slot), dataDir: `/tmp/a6-data/owui-${slot}`, mcpUrl: drive.mcpUrl, token: drive.token, model: values.model!, turnTimeoutS: turnTimeout });
+      : await openwebuiClient({ owuiUrl: owuiUrl(slot), dataDir: `/tmp/a6-data/owui-${slot}`, mcpUrl: drive.mcpUrl, token: drive.token, model: values.model!, turnTimeoutS: turnTimeout });
     const stateMerged: Record<string, string> = {};
     const stateDone: Record<string, string> = {};
     let prevShared = baseline, prevSession = baseline;
@@ -196,6 +200,10 @@ const sampler = setInterval(() => load.push({ t: Date.now(), load1: loadavg()[0]
 const queue = [...jobs];
 const results: Record<string, unknown>[] = [];
 log(`${jobs.length} runs, ${parallel} at once, out ${out}`);
+if (jobs.some((j) => j.client === 'openwebui')) {
+  log('starting Open WebUI containers');
+  await Promise.all(Array.from({ length: Math.min(parallel, jobs.length) }, (_, slot) => startOwui(slot)));
+}
 const started = Date.now();
 await Promise.all(Array.from({ length: Math.min(parallel, jobs.length) }, async (_, slot) => {
   // Stagger the first runs so drive start-ups and first sandbox starts do not coincide.
@@ -206,7 +214,7 @@ await Promise.all(Array.from({ length: Math.min(parallel, jobs.length) }, async 
   }
 }));
 clearInterval(sampler);
-for (const slot of owuiStarted) execFileSync(join(repo, 'test/harness/openwebui/start.sh'), ['stop'], { env: { ...process.env, OWUI_NAME: `a6-owui-${slot}` }, stdio: 'ignore' });
+if (!values['keep-owui']) for (const slot of owuiStarted) execFileSync(join(repo, 'test/harness/openwebui/start.sh'), ['stop'], { env: { ...process.env, OWUI_NAME: `a6-owui-${slot}` }, stdio: 'ignore' });
 const l = load.map((x) => x.load1);
 writeFileSync(join(out, 'matrix.json'), JSON.stringify({
   args: values, ms: Date.now() - started, parallel,
