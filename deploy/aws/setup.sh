@@ -18,6 +18,12 @@
 #   NODE_MAJOR            22
 #   GVISOR_RELEASE        latest, or e.g. release-20261123.0
 #   OLLAMA_PULL           models to pull after install (none by default)
+#   AGENT_DRIVE_HOME      where the services run the app from: this checkout, or,
+#                         for a release (a RELEASE file at the root, unpacked by
+#                         deploy/aws/deploy-release.sh), /opt/agent-drive/current
+#
+# From a release the app is already built (no npm), and agent-drive.service is
+# enabled but not restarted: deploy-release.sh switches `current` and restarts it.
 #
 # Needs systemd for the services; without it (a container), units are written
 # but not enabled, and that is reported at the end. No secrets are read or
@@ -25,9 +31,12 @@
 set -euo pipefail
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+# shellcheck source=/dev/null
 [ -f /etc/agent-drive/setup.env ] && . /etc/agent-drive/setup.env
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+release=""; [ -f "$repo/RELEASE" ] && release=1
+if [ -n "$release" ]; then : "${AGENT_DRIVE_HOME:=/opt/agent-drive/current}"; else : "${AGENT_DRIVE_HOME:=$repo}"; fi
 : "${AGENT_DRIVE_MOUNT:=/srv/agent-drive}"
 : "${AGENT_DRIVE_DATA:=$AGENT_DRIVE_MOUNT/data}"
 : "${AGENT_DRIVE_PORT:=8787}"
@@ -129,13 +138,22 @@ s_ollama() {
 }
 
 s_app() {
-  # The server and CLI from this checkout.
-  (cd "$repo" && npm ci --no-fund --no-audit && npm run build)
+  # The server and CLI: built here from a checkout; a release comes built.
+  if [ -n "$release" ]; then
+    [ -f "$repo/server/dist/main.js" ] || { echo "release has no server/dist" >&2; exit 1; }
+  else
+    (cd "$repo" && npm ci --no-fund --no-audit && npm run build)
+  fi
+  # agent-drive is the server (serve, device add, ...); drive is the upload CLI.
   cat > /usr/local/bin/agent-drive <<EOF
 #!/bin/sh
-exec node "$repo/cli/dist/index.js" "\$@"
+exec node --disable-warning=ExperimentalWarning "$AGENT_DRIVE_HOME/server/dist/main.js" "\$@"
 EOF
-  chmod 0755 /usr/local/bin/agent-drive
+  cat > /usr/local/bin/drive <<EOF
+#!/bin/sh
+exec node "$AGENT_DRIVE_HOME/cli/dist/index.js" "\$@"
+EOF
+  chmod 0755 /usr/local/bin/agent-drive /usr/local/bin/drive
 }
 
 s_docker_daemon() {
@@ -178,7 +196,7 @@ s_units() {
   install -m 0644 "$repo/deploy/aws/systemd/ollama.service" /etc/systemd/system/ollama.service
   install -m 0644 "$repo/deploy/cloudflare/cloudflared-agent-drive.service" /etc/systemd/system/cloudflared-agent-drive.service
   install -m 0644 "$repo/deploy/cloudflare/cloudflared-quick.service" /etc/systemd/system/cloudflared-quick.service
-  sed -i "s#@AGENT_DRIVE_REPO@#$repo#g; s#@AGENT_DRIVE_DATA@#$AGENT_DRIVE_DATA#g" \
+  sed -i "s#@AGENT_DRIVE_REPO@#$AGENT_DRIVE_HOME#g; s#@AGENT_DRIVE_DATA@#$AGENT_DRIVE_DATA#g" \
     /etc/systemd/system/agent-drive.service /etc/systemd/system/ollama.service
   mkdir -p /etc/cloudflared && chmod 0700 /etc/cloudflared
   if ! has_systemd; then echo "no systemd: units written, not enabled"; skipped+=("units-enable"); return; fi
@@ -186,7 +204,8 @@ s_units() {
   systemctl enable --now ollama.service
   for m in ${OLLAMA_PULL:-}; do command ollama pull "$m"; done
   systemctl enable agent-drive.service
-  systemctl restart agent-drive.service || true
+  # A release is started by deploy-release.sh once `current` points at it.
+  [ -n "$release" ] || systemctl restart agent-drive.service || true
   # The named tunnel starts once its token is in place (deploy/cloudflare/README.md).
   systemctl enable cloudflared-agent-drive.service
   if [ -s /etc/cloudflared/agent-drive.token ]; then systemctl restart cloudflared-agent-drive.service; fi
