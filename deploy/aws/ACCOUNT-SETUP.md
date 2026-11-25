@@ -168,6 +168,27 @@ platform) needs a C8i, M8i or R8i instance in a region that offers it; if the
 stack fails on `CpuOptions`, deploy with `NestedVirtualization=disabled` and
 gVisor uses systrap.
 
+A new account's first launch in a region can fail with "Your request for
+accessing resources in this region is being validated, and you will not be
+able to launch additional resources in this region until the validation is
+complete." Nothing is wrong with the template: the check clears on its own,
+in minutes to about 4 hours. The failed create leaves the stack in
+`ROLLBACK_COMPLETE`, which cannot be updated, so delete it before deploying
+again:
+
+```sh
+aws cloudformation delete-stack --stack-name agent-drive-dev --region us-east-2
+aws cloudformation wait stack-delete-complete --stack-name agent-drive-dev --region us-east-2
+```
+
+The data volume's `DeletionPolicy: RetainExceptOnCreate` means a rolled-back
+create removes the new volume and leaves no snapshot behind. Deleting a stack
+that did come up keeps the volume (it shows up, detached, under EC2 Volumes,
+tagged `Name=agent-drive-dev-data`, and costs as before until you delete it).
+Templates before this change used `DeletionPolicy: Snapshot`, so a rolled-back
+first deploy left an empty snapshot of the never-attached volume; delete it
+under EC2 Snapshots.
+
 The user data clones `RepoUrl` over HTTPS without credentials, so the
 repository must be public at that point. While it is private, deploy with
 `RunSetup=false`, then over Session Manager copy the checkout to
