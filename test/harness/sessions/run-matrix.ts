@@ -25,6 +25,7 @@ import { CONVERSATIONS, type Tree, type CheckContext } from './conversations.ts'
 import { opencodeClient } from './opencode.ts';
 import { openwebuiClient } from './openwebui.ts';
 import type { Client, ClientTurn } from './types.ts';
+import { toAtif, validateAtif } from './atif.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, '..', '..', '..');
@@ -68,9 +69,13 @@ for (let rep = 1; rep <= Number(values.repeat); rep++)
 const log = (s: string) => { const line = `${new Date().toISOString().slice(11, 19)} ${s}`; console.error(line); appendFileSync(join(out, 'matrix.log'), `${line}\n`); };
 
 // --- views of the files ----------------------------------------------------------
+// Tool caches are left out of both views: the server does not merge them
+// (server/src/merge/ignore.ts), so they would make a session's copy differ from
+// the shared drive for no change the person made.
+const TOOL_CACHE = /(^|\/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|node_modules)(\/|$)|\.pyc$/;
 function sharedTree(dataDir: string): Tree {
   const t: Tree = new Map();
-  for (const f of store(dataDir).files().values()) if (f.path.startsWith('household/') && !f.rings.length && f.text !== null) t.set(f.path, f.text);
+  for (const f of store(dataDir).files().values()) if (f.path.startsWith('household/') && !TOOL_CACHE.test(f.path) && !f.rings.length && f.text !== null) t.set(f.path, f.text);
   return t;
 }
 /** The agent's working copy: a session's /drive as the server keeps it (data/sessions/<dir>/upper); the shared tree when that layout is absent. */
@@ -81,6 +86,7 @@ function sessionTree(dataDir: string, dirId: string | undefined, fallback: Tree)
   const walk = (d: string) => {
     for (const e of readdirSync(d, { withFileTypes: true })) {
       const p = join(d, e.name);
+      if (TOOL_CACHE.test(relative(root, p))) continue;
       if (e.isDirectory()) walk(p);
       else if (e.isFile() && statSync(p).size < 512 * 1024) t.set(relative(root, p), readFileSync(p, 'utf8'));
     }
@@ -134,7 +140,10 @@ async function runJob(job: Job, slot: number): Promise<Record<string, unknown>> 
     let lastCall = 0;
     const seenDirs: string[] = [];
     for (const [i, turn] of conv.turns.entries()) {
+      const started = new Date().toISOString();
+      const firstCall = lastCall + 1;
       const ct: ClientTurn = await client.turn(turn.prompt);
+      const ended = new Date().toISOString();
       await new Promise((r) => setTimeout(r, settleMs));
       const calls = (await debugCalls(drive)).filter((c) => c.id > lastCall);
       lastCall = calls.at(-1)?.id ?? lastCall;
@@ -146,7 +155,8 @@ async function runJob(job: Job, slot: number): Promise<Record<string, unknown>> 
       const merged = turn.check(ctx(shared, prevShared, stateMerged));
       prevShared = shared; prevSession = sess;
       const r = {
-        turn: i + 1, kind: turn.kind, prompt: turn.prompt, ms: ct.ms,
+        turn: i + 1, kind: turn.kind, prompt: turn.prompt, ms: ct.ms, started, ended,
+        call_ids: calls.length ? [calls[0]!.id, calls.at(-1)!.id] : [firstCall, firstCall - 1],
         done_ok: Object.values(done).every(Boolean), merged_ok: Object.values(merged).every(Boolean), done, merged,
         drive_calls: calls.length,
         drive_tools: calls.map((c) => c.tool),
@@ -183,13 +193,19 @@ async function runJob(job: Job, slot: number): Promise<Record<string, unknown>> 
     writeFileSync(join(runDir, 'calls.json'), JSON.stringify(calls, null, 2));
     await drive.stop();
   }
-  await client?.close();
+  let clientRecord: unknown = null;
+  try { clientRecord = await client?.close(); } catch (e) { log(`${job.id} could not save the client record: ${String(e).slice(0, 200)}`); }
+  if (clientRecord) writeFileSync(join(runDir, `${job.client}-record.json`), JSON.stringify(clientRecord, null, 2));
   const result = {
     ...job, slot, ms: Date.now() - t0, fatal, model: values.model, settle_ms: settleMs, oc_context: values['oc-context'] ?? null,
-    client_conversation: client?.conversationId ?? null,
+    client_conversation: client?.conversationId ?? null, client_version: client?.version ?? null,
     turns, packages, sessions,
   };
   writeFileSync(join(runDir, 'run.json'), JSON.stringify(result, null, 2));
+  try {
+    mkdirSync(join(out, 'trajectories'), { recursive: true });
+    writeFileSync(join(out, 'trajectories', `${job.id}.json`), JSON.stringify(toAtif(runDir), null, 2));
+  } catch (e) { log(`${job.id} ATIF conversion failed: ${String((e as Error).stack ?? e).slice(0, 300)}`); }
   return result;
 }
 
@@ -221,4 +237,8 @@ writeFileSync(join(out, 'matrix.json'), JSON.stringify({
   load1: { samples: l.length, mean: l.reduce((a, b) => a + b, 0) / Math.max(1, l.length), max: Math.max(0, ...l) },
   runs: results.map((r) => r.id),
 }, null, 2));
+mkdirSync(join(out, 'trajectories'), { recursive: true });
+const v = validateAtif(join(out, 'trajectories'));
+writeFileSync(join(out, 'trajectories', 'validation.txt'), v.output);
+log(`ATIF validation (${'ATIF-v1.8'}, Harbor models + atif package): ${v.ok ? 'all valid' : 'FAILURES, see trajectories/validation.txt'}`);
 log(`done in ${Math.round((Date.now() - started) / 1000)} s`);

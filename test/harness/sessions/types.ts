@@ -17,7 +17,10 @@ export interface ClientTurn {
 
 export interface Client {
   name: 'opencode' | 'openwebui';
+  /** The client's own version, for the trajectory's agent record. */
+  version: string;
   conversationId: string | undefined;
   turn(prompt: string): Promise<ClientTurn>;
-  close(): Promise<void>;
+  /** Ends the conversation; returns the client's own record of it to keep, if any (Open WebUI: the chat). */
+  close(): Promise<unknown>;
 }

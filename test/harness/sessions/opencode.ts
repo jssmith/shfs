@@ -4,7 +4,7 @@
 // add` instead of OAuth: OpenCode's OAuth callback listens on a fixed port
 // (19876), which parallel runs would fight over. Sign-in is not what these
 // runs measure; decision 0005 covers it.
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, readFileSync, createWriteStream, existsSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
@@ -60,9 +60,11 @@ export function opencodeClient(o: OpencodeOptions) {
   };
   let sessionId: string | undefined;
   let n = 0;
+  const version = execFileSync('opencode', ['--version'], { env, encoding: 'utf8' }).trim();
 
   return {
     name: 'opencode' as const,
+    version,
     get conversationId() { return sessionId; },
     async turn(prompt: string): Promise<ClientTurn> {
       n++;
@@ -102,7 +104,7 @@ export function opencodeClient(o: OpencodeOptions) {
         compacted: compactions(),
       };
     },
-    async close() { /* nothing runs between turns */ },
+    async close() { return null; /* OpenCode's own record stays in its home: data/opencode/opencode.db */ },
   };
 
   /** Compaction parts OpenCode stored for this session so far. */

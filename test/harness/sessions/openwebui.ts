@@ -38,6 +38,7 @@ export async function openwebuiClient(o: OwuiOptions) {
   try { token = (await api(base, '/api/v1/auths/signin', undefined, { body: admin })).token; }
   catch { token = (await api(base, '/api/v1/auths/signup', undefined, { body: { name: 'Harness Admin', ...admin } })).token; }
 
+  const version = String((await api(base, '/api/version', undefined)).version ?? 'unknown');
   const serverId = 'drive';
   const connection = {
     url: o.mcpUrl, path: '', type: 'mcp', auth_type: 'bearer', key: o.token,
@@ -53,6 +54,7 @@ export async function openwebuiClient(o: OwuiOptions) {
 
   return {
     name: 'openwebui' as const,
+    version,
     get conversationId() { return chatId; },
     async turn(prompt: string): Promise<ClientTurn> {
       const t0 = Date.now();
@@ -78,13 +80,16 @@ export async function openwebuiClient(o: OwuiOptions) {
         });
       } catch (e) { errors.push(String(e).slice(0, 300)); }
       let message: any;
+      let polls_failed = 0;
       const deadline = Date.now() + o.turnTimeoutS * 1000;
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 1000));
-        message = (await api(base, `/api/v1/chats/${chatId}`, token)).chat?.history?.messages?.[asstId];
+        // A poll can fail while Open WebUI is busy; the turn goes on, so keep polling.
+        try { message = (await api(base, `/api/v1/chats/${chatId}`, token)).chat?.history?.messages?.[asstId]; } catch { polls_failed++; continue; }
         if (message?.done) break;
       }
       if (!message?.done) errors.push('turn timed out');
+      if (polls_failed) errors.push(`harness: ${polls_failed} status polls failed (Open WebUI busy), recovered`);
       if (message?.error) errors.push(JSON.stringify(message.error).slice(0, 300));
       history[asstId] = message ?? asstMsg;
       sent.push({ role: 'assistant', content: message?.content ?? '', ...(message?.output ? { output: message.output } : {}) });
@@ -113,6 +118,6 @@ export async function openwebuiClient(o: OwuiOptions) {
         raw: { usage: u, output: out },
       } as ClientTurn & { raw: unknown };
     },
-    async close() { /* the chat stays in the container's data until the slot is reset */ },
+    async close() { return chatId ? (await api(base, `/api/v1/chats/${chatId}`, token)) : null; },
   };
 }

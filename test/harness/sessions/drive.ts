@@ -137,8 +137,8 @@ export function store(dataDir: string) {
     packages(): { pkg_id: string; kind: string; summary_claimed: string | null; operations: string; created_at: string }[] {
       return q("SELECT rowid AS n, pkg_id, kind, summary_claimed, operations, created_at FROM packages ORDER BY rowid");
     },
-    sessions(): { dir_id: string; purpose: string; status: string; created_at: string; last_call_at: string }[] {
-      return q('SELECT dir_id, purpose, status, created_at, last_call_at FROM sessions ORDER BY created_at');
+    sessions(): { dir_id: string; session_id_hash: string; purpose: string; status: string; created_at: string; last_call_at: string }[] {
+      return q('SELECT dir_id, session_id_hash, purpose, status, created_at, last_call_at FROM sessions ORDER BY created_at');
     },
   };
 }
