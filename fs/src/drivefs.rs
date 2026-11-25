@@ -55,6 +55,8 @@ pub struct Config {
     pub attr_timeout: Duration,
     /// Measurement only: never check the epoch (breaks the freshness contract).
     pub skip_epoch_check: bool,
+    /// Measurement only: always run the epoch query instead of probing for writes first.
+    pub no_change_probe: bool,
 }
 
 impl Config {
@@ -65,6 +67,7 @@ impl Config {
             entry_timeout: Duration::ZERO,
             attr_timeout: Duration::ZERO,
             skip_epoch_check: false,
+            no_change_probe: false,
         }
     }
 }
@@ -111,7 +114,7 @@ struct State {
 pub struct DriveFs {
     cfg: Config,
     upper: PathBuf,
-    db: Mutex<Connection>,
+    db: Mutex<(Connection, store::ChangeProbe)>,
     st: Mutex<State>,
     activity: ActivityLog,
     inval_sink: Mutex<Option<mpsc::Sender<Vec<Inval>>>>,
@@ -184,7 +187,7 @@ impl DriveFs {
         let activity = ActivityLog::start(&cfg.data, &cfg.dir_id)?;
         Ok(DriveFs {
             upper,
-            db: Mutex::new(db),
+            db: Mutex::new((db, store::ChangeProbe::new(&cfg.data))),
             st: Mutex::new(State {
                 view,
                 whiteouts,
@@ -233,18 +236,22 @@ impl DriveFs {
     /// that the change makes stale (only those the kernel can have: paths it has an inode for).
     /// Lock order: db, then state.
     pub fn refresh(&self) -> io::Result<(i64, Vec<Inval>)> {
-        let mut db = lock(&self.db);
-        let ep = store::epoch(&db, &self.cfg.dir_id).map_err(dberr)?;
+        let mut guard = lock(&self.db);
+        let (db, probe) = &mut *guard;
+        if !self.cfg.no_change_probe && !probe.changed() {
+            return Ok((lock(&self.st).view.epoch, Vec::new()));
+        }
+        let ep = store::epoch(db, &self.cfg.dir_id).map_err(dberr)?;
         let old = lock(&self.st).view.clone();
         if ep == old.epoch {
             return Ok((ep, Vec::new()));
         }
-        let (ep, rows) = store::load_view(&mut db, &self.cfg.dir_id).map_err(dberr)?;
+        let (ep, rows) = store::load_view(db, &self.cfg.dir_id).map_err(dberr)?;
         let view = Arc::new(View::build(ep, rows));
         log::debug!("view reloaded at epoch {ep}: {} entries", view.entries.len());
         let mut st = lock(&self.st);
         st.view = view.clone();
-        drop(db);
+        drop(guard);
         let mut out = Vec::new();
         for p in old.changed_paths(&view) {
             if let Some(&parent) = st.by_path.get(parent_of(&p)) {
@@ -655,7 +662,9 @@ impl FileSystem for DriveFs {
             | FsOptions::BIG_WRITES
             | FsOptions::ATOMIC_O_TRUNC
             | FsOptions::PARALLEL_DIROPS
-            | FsOptions::MAX_PAGES;
+            | FsOptions::MAX_PAGES
+            // The kernel otherwise asks for security.capability before every write.
+            | FsOptions::HANDLE_KILLPRIV_V2;
         Ok(capable & want)
     }
 
@@ -925,7 +934,9 @@ impl FileSystem for DriveFs {
     }
 
     fn flush(&self, _ctx: &Context, _ino: u64, _fh: u64, _lo: u64) -> io::Result<()> {
-        Ok(())
+        // Nothing to do on close. ENOSYS makes the kernel stop sending FLUSH altogether,
+        // which saves one round trip per close.
+        Err(err(libc::ENOSYS))
     }
 
     fn fsync(&self, _ctx: &Context, _ino: u64, datasync: bool, fh: u64) -> io::Result<()> {

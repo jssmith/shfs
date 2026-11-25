@@ -36,6 +36,41 @@ pub fn open(data: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// A cheap test for "has anything been committed since I last looked?", so the epoch query
+/// can be skipped on most operations. It reads the WAL-index header at the start of
+/// `drive.db-shm` (SQLite's documented WAL format: the header changes on every write
+/// transaction, and after a WAL reset its salt changes). With `pread`, not `mmap`, so a
+/// truncated file cannot fault. Without a `-shm` file (not in WAL mode) every call reports a
+/// change, so the epoch query always runs.
+pub struct ChangeProbe {
+    file: Option<std::fs::File>,
+    last: [u8; 48],
+    primed: bool,
+}
+
+impl ChangeProbe {
+    pub fn new(data: &Path) -> ChangeProbe {
+        let shm = data.join("drive.db-shm");
+        ChangeProbe { file: std::fs::File::open(shm).ok(), last: [0; 48], primed: false }
+    }
+
+    /// True if the database may have changed since the last call that returned true.
+    pub fn changed(&mut self) -> bool {
+        use std::os::unix::fs::FileExt;
+        let Some(f) = &self.file else { return true };
+        let mut buf = [0u8; 48];
+        match f.read_exact_at(&mut buf, 0) {
+            Ok(()) if self.primed && buf == self.last => false,
+            Ok(()) => {
+                self.last = buf;
+                self.primed = true;
+                true
+            }
+            Err(_) => true,
+        }
+    }
+}
+
 /// Current epoch for a session; 0 when the row is missing.
 pub fn epoch(conn: &Connection, dir_id: &str) -> rusqlite::Result<i64> {
     let mut st = conn.prepare_cached("SELECT epoch FROM session_view_epoch WHERE dir_id = ?1")?;
@@ -91,6 +126,9 @@ pub fn load_view(conn: &mut Connection, dir_id: &str) -> rusqlite::Result<(i64, 
     Ok((ep, rows))
 }
 
+/// How long opens are collected before they are written to `activity`.
+const BATCH: Duration = Duration::from_millis(20);
+
 /// One file open, for `activity`.
 #[derive(Debug, Clone)]
 pub struct OpenRecord {
@@ -121,9 +159,20 @@ impl ActivityLog {
             .name("a2-fs-activity".into())
             .spawn(move || {
                 while let Ok(first) = rx.recv() {
+                    // Collect for up to BATCH, so a burst of opens is one transaction (each
+                    // write also makes the daemon's change probe fall through to a query).
+                    let deadline = std::time::Instant::now() + BATCH;
+                    let mut flush = matches!(first, Msg::Flush(_));
                     let mut batch = vec![first];
-                    while let Ok(m) = rx.try_recv() {
-                        batch.push(m);
+                    while !flush {
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        match rx.recv_timeout(left) {
+                            Ok(m) => {
+                                flush = matches!(m, Msg::Flush(_));
+                                batch.push(m);
+                            }
+                            Err(_) => break,
+                        }
                     }
                     let mut waiters = Vec::new();
                     let res: rusqlite::Result<()> = (|| {
@@ -205,4 +254,42 @@ pub fn hide_path(conn: &Connection, dir_id: &str, path: &str) -> rusqlite::Resul
     )?;
     bump_epoch(conn, dir_id)?;
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn change_probe_sees_writes_from_another_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = crate::stub::StubStore::create(tmp.path(), "a2-p").unwrap();
+        s.add_synthetic().unwrap();
+        let reader = open(tmp.path()).unwrap();
+        assert_eq!(epoch(&reader, "a2-p").unwrap(), 1);
+        let mut probe = ChangeProbe::new(tmp.path());
+        assert!(probe.changed(), "first call primes");
+        assert!(!probe.changed());
+        assert!(!probe.changed());
+        let writer = open(tmp.path()).unwrap();
+        bump_epoch(&writer, "a2-p").unwrap();
+        assert!(probe.changed());
+        assert!(!probe.changed());
+        for _ in 0..3 {
+            writer
+                .execute(
+                    "INSERT INTO meta (key, value) VALUES ('k', 'v')
+                     ON CONFLICT (key) DO UPDATE SET value = value || 'v'",
+                    [],
+                )
+                .unwrap();
+            assert!(probe.changed());
+        }
+        // Across a checkpoint that truncates the WAL, and the reset that follows.
+        writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        probe.changed();
+        bump_epoch(&writer, "a2-p").unwrap();
+        assert!(probe.changed());
+        assert_eq!(epoch(&reader, "a2-p").unwrap(), 3);
+    }
 }

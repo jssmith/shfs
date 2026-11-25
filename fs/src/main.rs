@@ -83,6 +83,7 @@ fn main() -> anyhow::Result<()> {
             cfg.entry_timeout = a.ms("entry-timeout-ms")?;
             cfg.attr_timeout = a.ms("attr-timeout-ms")?;
             cfg.skip_epoch_check = std::env::var_os("A2_FS_SKIP_EPOCH_CHECK").is_some();
+            cfg.no_change_probe = std::env::var_os("A2_FS_NO_CHANGE_PROBE").is_some();
             let opts = daemon::Options {
                 threads: a.get("threads").unwrap_or("1").parse()?,
                 poll: Duration::from_millis(a.get("poll-ms").unwrap_or("50").parse()?),

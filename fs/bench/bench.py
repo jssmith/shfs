@@ -27,12 +27,12 @@ roots = dict(a.split("=", 1) for a in sys.argv[3:])
 env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
 
 
-def sh(args, cwd=None, extra_env=None):
+def sh(args, cwd=None, extra_env=None, ok=(0,)):
     e = dict(env, **(extra_env or {}))
     t = time.perf_counter()
     r = subprocess.run(args, cwd=cwd, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     dt = time.perf_counter() - t
-    if r.returncode not in (0, 1):
+    if r.returncode not in ok:
         raise RuntimeError(f"{args} in {cwd}: {r.returncode} {r.stderr[:400]!r}")
     return dt
 
@@ -42,7 +42,7 @@ def git_status(root):
 
 
 def rg(root):
-    return sh(["rg", "-c", "def ", f"{root}/repos/sympy"])
+    return sh(["rg", "-c", "def ", f"{root}/repos/sympy"], ok=(0, 1))
 
 
 def find(root):

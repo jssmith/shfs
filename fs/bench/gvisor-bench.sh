@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Benchmarks: the session file system daemon against a plain bind mount of the same files,
 # inside gVisor and on the host. Builds fresh stores from the source trees each time.
+# Daemons: drive = kernel caching (60 s timeouts) with invalidation, the default proposed;
+#          drive_zero = zero timeouts, every operation reaches the daemon.
 # Usage: gvisor-bench.sh [runs]   (default 7)
 # Needs: target/release/agent-drive-fs, /tmp/a2-gv/rootfs (make-rootfs.sh),
 #        /tmp/a2-src/{sympy,mpmath} (Git checkouts).
@@ -45,20 +47,20 @@ plain() { # name -> a materialised copy, as the thin drive mounts today
 
 rm -rf "$out"; mkdir -p "$out" /tmp/a2-runsc
 cp "$here/bench.py" "$out/"
-store a2-bg 0
-store a2-bgt 1000
-store a2-bh 0
+store a2-bg 60000
+store a2-bgz 0
+store a2-bh 60000
 plain s; plain e; plain h
 mg=/tmp/a2-data/a2-bg/sessions/a2-bg/mnt
-mgt=/tmp/a2-data/a2-bgt/sessions/a2-bgt/mnt
+mgz=/tmp/a2-data/a2-bgz/sessions/a2-bgz/mnt
 mh=/tmp/a2-data/a2-bh/sessions/a2-bh/mnt
 
 echo "== gVisor, --file-access-mounts=shared"
 mkdir -p "$out/b-shared"
-python3 "$here/bundle.py" "$out/b-shared" "$rootfs" "/drive=$mg" "/drive_t=$mgt" "/plain=/tmp/a2-plain-s" "/work=$out"
+python3 "$here/bundle.py" "$out/b-shared" "$rootfs" "/drive=$mg" "/drive_zero=$mgz" "/plain=/tmp/a2-plain-s" "/work=$out"
 "${runsc[@]}" --file-access-mounts=shared run -bundle "$out/b-shared" -detach a2-bench-shared </dev/null >"$out/shared.log" 2>&1 || { cat "$out/shared.log"; exit 1; }
 "${runsc[@]}" exec a2-bench-shared python3 /work/bench.py "$runs" /work/gvisor-shared.json \
-  drive=/drive drive_cached=/drive_t plain=/plain
+  drive=/drive drive_zero=/drive_zero plain=/plain
 
 echo "== gVisor, default file access (plain copy only)"
 mkdir -p "$out/b-excl"
@@ -69,7 +71,7 @@ python3 "$here/bundle.py" "$out/b-excl" "$rootfs" "/plain=/tmp/a2-plain-e" "/wor
 echo "== host, no sandbox"
 python3 "$here/bench.py" "$runs" "$out/host.json" drive=$mh plain=/tmp/a2-plain-h
 
-for id in a2-bg a2-bgt a2-bh; do
+for id in a2-bg a2-bgz a2-bh; do
   echo "$id opens recorded: $("$bin" opens --data /tmp/a2-data/$id --dir-id $id)"
 done
 echo "results in $out"
