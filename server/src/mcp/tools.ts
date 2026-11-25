@@ -62,9 +62,9 @@ export function buildMcpServer(ctx: Context): McpServer {
     const reason = res.isError ? String((res.structuredContent as { error?: string } | undefined)?.error ?? 'error') : null;
     run(
       db,
-      `INSERT INTO calls (ts, grant_id, client_id, client_name, client_version, transport_session_id, tool, dir_id, session_arg, transport_changed, gap_session_ms, gap_connection_ms, duration_ms, ok, error_reason)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      new Date(t0).toISOString(), c.grant_id, c.client_id, ci?.name ?? null, ci?.version ?? null, c.transport_id ?? null, tool, dir_id, arg, transportChanged ? 1 : 0,
+      `INSERT INTO calls (ts, grant_id, client_id, client_name, client_version, registered_name, transport_session_id, tool, dir_id, session_arg, transport_changed, gap_session_ms, gap_connection_ms, duration_ms, ok, error_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      new Date(t0).toISOString(), c.grant_id, c.client_id, ci?.name ?? null, ci?.version ?? null, c.registered_name, c.transport_id ?? null, tool, dir_id, arg, transportChanged ? 1 : 0,
       gap(prevSession), gap(prevConn), Date.now() - t0, res.isError ? 0 : 1, reason,
     );
   }

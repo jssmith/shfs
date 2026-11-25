@@ -1,5 +1,5 @@
 // MCP tools over HTTP without a sandbox: a failed finish leaves the session
-// open and a second finish works.
+// open and a second finish works; the call log carries both client names.
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -73,3 +73,11 @@ test('a failed finish says the session is still open; resume and a second finish
   expect(existsSync(path.join(work, 'conflicts/notes/plan.md'))).toBe(true);
 });
 
+test('the call log records the registered client name next to the initialize name', async () => {
+  const rows = all<{ client_name: string; registered_name: string }>(ctx.drive.db, 'SELECT client_name, registered_name FROM calls');
+  expect(rows.length).toBeGreaterThan(3);
+  for (const r of rows) {
+    expect(r.client_name).toBe('mcp');
+    expect(r.registered_name).toBe('Open WebUI');
+  }
+});

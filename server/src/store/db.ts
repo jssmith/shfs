@@ -21,6 +21,12 @@ export function openDb(dataDir: string): DB {
   db.exec('PRAGMA busy_timeout = 5000;');
   db.exec(findSql('schema.sql'));
   db.exec(findSql('server-schema.sql'));
+  // Columns added to server-private tables after a data directory was created.
+  const addColumn = (table: string, column: string, type: string) => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  };
+  addColumn('calls', 'registered_name', 'TEXT');
   db.exec('PRAGMA synchronous = NORMAL;');
   return db;
 }
