@@ -134,10 +134,12 @@ describe.skipIf(!haveSandbox).each(SURFACES)('ringed items never reach an agent 
 
     if (shell) {
       await sh(sid, 'drive status; drive help >/dev/null; drive search --all quokkasecret; cat /work/search-*.txt');
-      if (surface === 'v2') await call('write', { session_id: sid, file_path: 'home/notes/summary.md', content: 'Found one guide to statements.\n' });
-      else await sh(sid, "printf 'Found one guide to statements.\\n' > home/notes/summary.md");
-      const save = await sh(sid, 'drive save "summary of what I found"; drive status');
-      expect(save.text).toContain('summary.md');
+      const w =
+        surface === 'v2'
+          ? await call('write', { session_id: sid, file_path: 'home/notes/summary.md', content: 'Found one guide to statements.\n' })
+          : await sh(sid, "printf 'Found one guide to statements.\\n' > home/notes/summary.md");
+      expect(w.text).toContain('Saved to the drive: create home/notes/summary.md');
+      await sh(sid, 'drive save "summary of what I found"; drive status');
       await sh(sid, 'ls -laR /drive');
       await call('bash', { session_id: 'ds_aaaaaaaaaaaaaaaaaaaaaaaaaa', command: 'ls' });
     } else {

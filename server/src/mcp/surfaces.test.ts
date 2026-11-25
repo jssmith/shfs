@@ -19,8 +19,9 @@ afterEach(async () => {
   for (const e of open.splice(0)) await e.close();
 });
 
-test('AGENT_DRIVE_SURFACE picks one of four surfaces, v0 by default', () => {
-  expect(parseSurface(undefined)).toBe('v0');
+test('AGENT_DRIVE_SURFACE picks one of four surfaces, v3 by default', () => {
+  expect(parseSurface(undefined)).toBe('v3');
+  expect(parseSurface('v0')).toBe('v0');
   expect(parseSurface('v2')).toBe('v2');
   expect(() => parseSurface('v9')).toThrow(/v0, v1, v2, v3/);
 });

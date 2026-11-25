@@ -56,6 +56,10 @@ export class Sessions {
   /** Sessions with a command running (holding the lock), and work done on its behalf meanwhile. */
   private leases = new Map<string, Set<Promise<unknown>>>();
   private nested = new KeyedMutex();
+  /** No calls for this long: the sandbox is destroyed and the session is idle (context.ts sets these from config). */
+  idleAfterMs = 60 * 60 * 1000;
+  /** No calls for this long: the session is expired for good. */
+  expireAfterMs = 30 * 24 * 60 * 60 * 1000;
 
   constructor(
     readonly drive: Drive,
@@ -127,8 +131,8 @@ export class Sessions {
       );
       run(
         this.drive.db,
-        'INSERT INTO session_meta (dir_id, client_name, client_version, registered_name, first_transport_id, last_transport_id) VALUES (?, ?, ?, ?, ?, ?)',
-        dir_id, client.name ?? null, client.version ?? null, client.registered ?? null, client.transport ?? null, client.transport ?? null,
+        'INSERT INTO session_meta (dir_id, client_name, client_version, registered_name, first_transport_id, last_transport_id, current_turn, last_call_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        dir_id, client.name ?? null, client.version ?? null, client.registered ?? null, client.transport ?? null, client.transport ?? null, newId('tn'), Date.now(),
       );
       this.drive.activity({ dir_id, actor: 'agent', op: 'start_session', detail: { purpose } });
     });
@@ -148,6 +152,59 @@ export class Sessions {
     if (!row) return { arg: 'unknown' };
     if (row.connection_id !== connection_id) return { arg: 'other_connection' };
     return { row, arg: 'matched' };
+  }
+
+  /**
+   * Where a session stands, from its last call: 'active', 'idle' (its
+   * sandbox may be gone; the next call starts a new one and carries on), or
+   * 'expired' (calls are refused). Expiry is decided here, at the call, so it
+   * holds even if the sweep has not run yet.
+   */
+  lifecycle(row: SessionRow, nowMs = Date.now()): 'active' | 'idle' | 'expired' {
+    const m = get<{ lifecycle: string }>(this.drive.db, 'SELECT lifecycle FROM session_meta WHERE dir_id = ?', row.dir_id);
+    if (m?.lifecycle === 'expired') return 'expired';
+    const quiet = nowMs - Date.parse(row.last_call_at);
+    if (quiet >= this.expireAfterMs) return 'expired';
+    if (m?.lifecycle === 'idle' || quiet >= this.idleAfterMs) return 'idle';
+    return 'active';
+  }
+
+  setLifecycle(dir_id: string, state: 'active' | 'idle' | 'expired'): void {
+    if (get<{ lifecycle: string }>(this.drive.db, 'SELECT lifecycle FROM session_meta WHERE dir_id = ?', dir_id)?.lifecycle === state) return;
+    run(this.drive.db, 'UPDATE session_meta SET lifecycle = ? WHERE dir_id = ?', state, dir_id);
+    if (state !== 'active') this.drive.activity({ dir_id, actor: 'drive', op: `session_${state}` });
+  }
+
+  /**
+   * Destroy the sandboxes of sessions with no calls for idleAfterMs (marked
+   * idle; their folders stay, so the next call simply starts a new sandbox),
+   * and mark sessions with no calls for expireAfterMs expired.
+   */
+  async sweep(nowMs = Date.now()): Promise<{ idle: string[]; expired: string[] }> {
+    const out = { idle: [] as string[], expired: [] as string[] };
+    const rows = all<SessionRow & { lifecycle: string | null }>(
+      this.drive.db,
+      "SELECT s.*, m.lifecycle FROM sessions s LEFT JOIN session_meta m ON m.dir_id = s.dir_id WHERE s.status IN ('open', 'needs_resolution', 'paused') AND COALESCE(m.lifecycle, 'active') != 'expired'",
+    );
+    for (const row of rows) {
+      const quiet = nowMs - Date.parse(row.last_call_at);
+      if (quiet >= this.expireAfterMs) {
+        await this.lock.run(row.dir_id, () => this.destroySandbox(row.dir_id));
+        this.setLifecycle(row.dir_id, 'expired');
+        out.expired.push(row.dir_id);
+      } else if (quiet >= this.idleAfterMs && row.lifecycle !== 'idle') {
+        await this.lock.run(row.dir_id, async () => {
+          // A call that came in meanwhile keeps its sandbox.
+          const fresh = this.byDir(row.dir_id);
+          if (fresh && nowMs - Date.parse(fresh.last_call_at) >= this.idleAfterMs) {
+            await this.destroySandbox(row.dir_id);
+            this.setLifecycle(row.dir_id, 'idle');
+            out.idle.push(row.dir_id);
+          }
+        });
+      }
+    }
+    return out;
   }
 
   touch(dir_id: string): void {

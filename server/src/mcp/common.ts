@@ -8,6 +8,7 @@ import { get, run } from '../store/db.js';
 import type { MergeResult } from '../merge/merge.js';
 import { summariseIgnored } from '../merge/ignore.js';
 import { ToolError, type SessionRow } from '../sessions/manager.js';
+import { callStarts, callEnds } from '../sessions/turns.js';
 
 export interface Caller {
   grant_id: string;
@@ -59,6 +60,7 @@ export const NEXT_STEP: Record<string, string> = {
   needs_session: 'Call start_session(purpose) and pass the session_id it returns to every other tool.',
   finished: 'Start a new session with start_session(purpose).',
   stopped: 'Start a new session with start_session(purpose).',
+  expired: 'Start a new session with start_session(purpose); this one cannot be used again.',
   paused: 'Tell the person the session is paused and try again later.',
   not_found: 'Check the path with ls in the shell, then try again.',
   invalid_path: 'Use a path under /drive or /work without "..", such as /drive/notes/plan.md.',
@@ -136,7 +138,16 @@ export function makeKit(ctx: Context, server: McpServer, typed: boolean): Kit {
         res = typed ? fail(r, `this session is ${row.status}`) : fail(r, `this session is ${row.status}; start a new one with start_session(purpose)`);
       } else if (row.status === 'paused') {
         res = typed ? fail('paused', 'the person paused this session') : fail('paused', 'the person paused this session; try again later');
+      } else if (sessions.lifecycle(row) === 'expired') {
+        sessions.setLifecycle(row.dir_id, 'expired');
+        const days = Math.round(sessions.expireAfterMs / 86_400_000);
+        res = typed
+          ? fail('expired', `this session expired after ${days} days without calls`)
+          : fail('expired', `this session expired after ${days} days without calls; start a new one with start_session(purpose)`);
       } else {
+        // An idle session carries on: its next command starts a new sandbox on the same folders.
+        if (sessions.lifecycle(row) === 'idle') sessions.setLifecycle(row.dir_id, 'active');
+        callStarts(db, row.dir_id);
         const meta = get<{ last_transport_id: string | null }>(db, 'SELECT last_transport_id FROM session_meta WHERE dir_id = ?', row.dir_id);
         if (c.transport_id && meta?.last_transport_id !== c.transport_id) {
           transportChanged = !!meta?.last_transport_id;
@@ -154,6 +165,7 @@ export function makeKit(ctx: Context, server: McpServer, typed: boolean): Kit {
             res = fail('internal_error', 'the drive hit an internal error; nothing was changed by this call');
           }
         }
+        callEnds(db, row.dir_id);
       }
       record(c, tool, row?.dir_id ?? null, found.arg, t0, res, transportChanged);
       return res;

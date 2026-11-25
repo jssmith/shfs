@@ -19,15 +19,23 @@ export interface Config {
   runscRoot: string;
   rootfs: string;
   sandboxPrefix: string;
-  /** Which MCP surface to offer (AGENT_DRIVE_SURFACE): v0 today's, v1 reworded, v2 shell-first, v3 shell-first minimal. */
+  /** Which MCP surface to offer (AGENT_DRIVE_SURFACE, default v3): v0 checkpoint 2's, v1 reworded, v2 shell-first, v3 shell-first minimal. */
   surface: Surface;
+  /** A session with no calls for this long has its sandbox destroyed and is marked idle (AGENT_DRIVE_IDLE_AFTER_S). */
+  idleAfterMs?: number;
+  /** A session with no calls for this long is expired for good (AGENT_DRIVE_EXPIRE_AFTER_S). */
+  expireAfterMs?: number;
 }
+
+/** Defaults for session expiry: idle after 1 hour, expired after 30 days (the security design's re-approval period). */
+export const IDLE_AFTER_MS = 60 * 60 * 1000;
+export const EXPIRE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
 
 export const SURFACES = ['v0', 'v1', 'v2', 'v3'] as const;
 export type Surface = (typeof SURFACES)[number];
 
 export function parseSurface(v: string | undefined): Surface {
-  const s = (v ?? 'v0').trim() || 'v0';
+  const s = (v ?? 'v3').trim() || 'v3';
   if (!(SURFACES as readonly string[]).includes(s)) throw new Error(`AGENT_DRIVE_SURFACE must be one of ${SURFACES.join(', ')}; got "${s}"`);
   return s as Surface;
 }
@@ -44,6 +52,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     rootfs: env.AGENT_DRIVE_ROOTFS ?? path.join(dataDir, 'images', 'default', 'rootfs'),
     sandboxPrefix: env.AGENT_DRIVE_SANDBOX_PREFIX ?? 'ad-',
     surface: parseSurface(env.AGENT_DRIVE_SURFACE),
+    idleAfterMs: env.AGENT_DRIVE_IDLE_AFTER_S ? Number(env.AGENT_DRIVE_IDLE_AFTER_S) * 1000 : IDLE_AFTER_MS,
+    expireAfterMs: env.AGENT_DRIVE_EXPIRE_AFTER_S ? Number(env.AGENT_DRIVE_EXPIRE_AFTER_S) * 1000 : EXPIRE_AFTER_MS,
   };
 }
 
@@ -52,7 +62,7 @@ export interface Context {
   drive: Drive;
   sessions: Sessions;
   jobs: JobRunner;
-  /** The shell surfaces (v2, v3) only: automatic merge after changing calls. */
+  /** The shell surfaces (v2, v3) only: the merge at the end of each changing call. */
   auto?: AutoMerge;
   close(): Promise<void>;
 }
@@ -66,6 +76,11 @@ export function createContext(config: Config, sandbox?: Sandbox): Context {
       ? new RunscSandbox({ runsc: config.runsc, stateRoot: config.runscRoot, rootfs: config.rootfs, prefix: config.sandboxPrefix, image: loadImageSettings(config.rootfs) })
       : new NoExecSandbox());
   const sessions = new Sessions(drive, path.join(config.dataDir, 'sessions'), sb, config.sandboxPrefix);
+  sessions.idleAfterMs = config.idleAfterMs ?? IDLE_AFTER_MS;
+  sessions.expireAfterMs = config.expireAfterMs ?? EXPIRE_AFTER_MS;
+  // Idle and expired sessions lose their sandboxes (sessions/manager.ts, sweep).
+  const sweeper = setInterval(() => void sessions.sweep().catch((e) => console.error('session sweep failed:', e)), Math.max(1000, Math.min(60_000, sessions.idleAfterMs / 4)));
+  sweeper.unref();
   const jobs = new JobRunner(drive, (item_id) => sessions.applyVisibility(item_id));
   let auto: AutoMerge | undefined;
   if (config.surface === 'v2' || config.surface === 'v3') {
@@ -79,8 +94,7 @@ export function createContext(config: Config, sandbox?: Sandbox): Context {
     jobs,
     auto,
     async close() {
-      // Changes still waiting for their automatic merge are merged, not dropped.
-      await auto?.flushAll();
+      clearInterval(sweeper);
       jobs.stop();
       await sessions.destroyAll();
       await sb.releaseRoot?.();

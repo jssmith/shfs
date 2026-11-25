@@ -6,14 +6,14 @@ Endpoint: `/mcp`, Streamable HTTP (JSON responses enabled), OAuth 2.1 with dynam
 
 ## Four surfaces behind one switch
 
-The server offers one of four surfaces, chosen at start with `AGENT_DRIVE_SURFACE` (default `v0`), so experiments can compare them with the same drive and clients.
+The server offers one of four surfaces, chosen at start with `AGENT_DRIVE_SURFACE`. **The default is `v3`** (decided after `docs/decisions/0006-*`); v0–v2 stay selectable so experiments can compare them with the same drive and clients.
 
 | Surface | Idea | Tools |
 | --- | --- | --- |
 | `v0` | The thin drive as measured at checkpoint 2 | `start_session`, `resume_session`, `run`, `search`, `read`, `write`, `checkpoint`, `finish`, `get_skill` |
 | `v1` | v0 reworded: one session per conversation; typed results | as v0 |
 | `v2` | Shell first, automatic merge, Claude Code–style file tools | `start_session`, `bash`, `read`, `write`, `edit` |
-| `v3` | Shell first, minimal | `start_session`, `bash` |
+| `v3` (default) | Shell first, minimal | `start_session`, `bash` |
 
 In every surface, a session's search never matches the content of items it cannot read (see *Hidden matches*).
 
@@ -67,7 +67,7 @@ The same nine tools, arguments and behaviour as v0. What differs:
 
 ## v2: shell first
 
-The shell is the centre; file tools follow Claude Code's conventions (`Bash(command, timeout, description)`, `Read(file_path, offset, limit)` with `cat -n` lines, `Write(file_path, content)`, `Edit(file_path, old_string, new_string, replace_all)`). There is no `search`, `checkpoint`, `finish`, `resume_session` or `get_skill`: changes merge automatically, and the rest is the `drive` command in the shell. Sessions are never closed by the agent.
+The shell is the centre; file tools follow Claude Code's conventions (`Bash(command, timeout, description)`, `Read(file_path, offset, limit)` with `cat -n` lines, `Write(file_path, content)`, `Edit(file_path, old_string, new_string, replace_all)`). There is no `search`, `checkpoint`, `finish`, `resume_session` or `get_skill`: changes are saved at the end of the call that makes them, and the rest is the `drive` command in the shell. Sessions are never closed by the agent; the server lets them go idle and expire (*Sessions over time*).
 
 Server instructions:
 
@@ -77,23 +77,22 @@ Server instructions:
 
 | Tool | Arguments (description the model sees) | Description the model sees |
 | --- | --- | --- |
-| `start_session` | `purpose`: "What you are going to do, in a sentence, e.g. "Pull together my 2025 tax documents" or "Add a kg to pounds function to the unitconv project and test it" or "Find what I spent at Oak Street Grocer in October"" | Open a session in the person's drive: a Linux shell with their files at /drive. Call it once per conversation and keep the session_id it returns for every later call, including later requests in the same conversation. Changes under /drive save to the drive automatically. Examples of a purpose: "Pull together my 2025 tax documents", "Add a kg to pounds function to the unitconv project and test it", "Find what I spent at Oak Street Grocer in October". |
-| `bash` | `session_id`; `command`: "The command to run, e.g. "ls -R", "grep -ril invoice ." or "drive search tax 2025""; `timeout`: "Optional timeout in milliseconds (default 120000, max 600000)"; `description`: "Clear, concise description of what this command does in 5-10 words, e.g. "List the files in household". The person sees it in the drive's history." | Run a bash command in the session's Linux sandbox (no network). Each command starts in /drive, the person's files; /work is scratch space that is never saved. Changes under /drive save to the drive automatically about 2 s after your last change; the next result says whether the save worked. The drive command does the rest: drive search <words>, drive status, drive save "message", drive help. Output is capped at 64 KB (the full output is saved under /work/.drive-output/). |
+| `start_session` | `purpose`: "What you are going to do, in a sentence, e.g. "Pull together my 2025 tax documents" or "Add a kg to pounds function to the unitconv project and test it" or "Find what I spent at Oak Street Grocer in October"" | Open a session in the person's drive: a Linux shell with their files at /drive. Call it once per conversation and keep the session_id it returns for every later call, including later requests in the same conversation. Changes under /drive are saved to the drive automatically. Examples of a purpose: "Pull together my 2025 tax documents", "Add a kg to pounds function to the unitconv project and test it", "Find what I spent at Oak Street Grocer in October". |
+| `bash` | `session_id`; `command`: "The command to run, e.g. "ls -R", "grep -ril invoice ." or "drive search tax 2025""; `timeout`: "Optional timeout in milliseconds (default 120000, max 600000)"; `description`: "Clear, concise description of what this command does in 5-10 words, e.g. "List the files in household". The person sees it in the drive's history." | Run a bash command in the session's Linux sandbox (no network). Each command starts in /drive, the person's files; /work is scratch space that is never saved. Changes under /drive are saved to the drive when the call that makes them ends, and the result says whether the save worked. The drive command does the rest: drive search <words>, drive status, drive save "message", drive help. Output is capped at 64 KB (the full output is saved under /work/.drive-output/). |
 | `read` | `session_id`; `file_path`: "The file to read, e.g. /drive/household/notes/plan.md"; `offset`: "The line number to start reading from (1 is the first line). Only for files too long to read at once"; `limit`: "The number of lines to read (default 2000)" | Read a file in the session. file_path is under /drive (the person's files; relative paths are taken from /drive) or /work. Returns the lines numbered like cat -n, starting at 1: by default up to 2000 lines from the start; for longer files pass offset and limit. Lines longer than 2000 characters are cut. Your unsaved changes are included. |
-| `write` | `session_id`; `file_path`: "The file to write, e.g. /drive/household/notes/summary.md"; `content`: "The complete content of the file" | Write a file in the session, replacing it if it exists; folders are created as needed. Under /drive the file saves to the drive automatically about 2 s after your last change; under /work it stays scratch. Prefer edit for changing part of an existing file. |
-| `edit` | `session_id`; `file_path`: "The file to edit, e.g. /drive/household/notes/plan.md"; `old_string`: "The exact text to replace"; `new_string`: "The text to replace it with (must differ from old_string)"; `replace_all`: "Replace every occurrence of old_string (default false)" | Replace exact text in a file in the session. old_string must appear in the file exactly once (include enough surrounding text to make it unique), unless replace_all is true. Keep the file's indentation exactly. Under /drive the change saves to the drive automatically. Read the file first. |
+| `write` | `session_id`; `file_path`: "The file to write, e.g. /drive/household/notes/summary.md"; `content`: "The complete content of the file" | Write a file in the session, replacing it if it exists; folders are created as needed. Under /drive the file is saved to the drive before this call returns; under /work it stays scratch. Prefer edit for changing part of an existing file. |
+| `edit` | `session_id`; `file_path`: "The file to edit, e.g. /drive/household/notes/plan.md"; `old_string`: "The exact text to replace"; `new_string`: "The text to replace it with (must differ from old_string)"; `replace_all`: "Replace every occurrence of old_string (default false)" | Replace exact text in a file in the session. old_string must appear in the file exactly once (include enough surrounding text to make it unique), unless replace_all is true. Keep the file's indentation exactly. Under /drive the change is saved to the drive before this call returns. Read the file first. |
 
 What they return:
 
 | Tool | Returns |
 | --- | --- |
-| `start_session` | The session id; "Keep this session_id for this whole conversation, including later requests. Pass it to every other tool; it is a secret and nothing shows it again."; file count and top-level folders; topics; "Changes you make under /drive save to the drive automatically, about 2 s after your last change. /work is scratch and is never saved."; the partial-view note and hidden counts ("Hidden from sessions: Finance (1 item)"); "In the shell: drive help (how to work here), drive search <words>, drive status, drive save "message"." |
-| `bash` | Exit code, stdout, stderr (run with bash if the image has it, else sh; cwd /drive). If the command changed files under /drive: "Unsaved changes under /drive: update notes/plan.md. They save to the drive automatically in about 2 s." (`unsaved_changes` in structured content) |
+| `start_session` | The session id; "Keep this session_id for this whole conversation, including later requests. Pass it to every other tool; it is a secret and nothing shows it again."; file count and top-level folders; topics; "Changes you make under /drive are saved to the drive when the call that makes them ends; each result says whether the save worked. /work is scratch and is never saved."; the partial-view note and hidden counts ("Hidden from sessions: Finance (1 item)"); "In the shell: drive help (how to work here), drive search <words>, drive status, drive save "message"." |
+| `bash` | Exit code, stdout, stderr (run with bash if the image has it, else sh; cwd /drive). If the command changed files under /drive, the save's outcome at the end: "Saved to the drive: update notes/plan.md (package pk_…)." or "merge_conflict: nothing was saved to the drive. …" (`save` in structured content: `{ok, pkg_id, changes}` or `{ok: false, reason: 'merge_conflict', next_step, conflicts}`; `null` when nothing under /drive changed). The call itself stays `ok: true`: the command ran |
 | `read` | Numbered lines (`%6d\t` + line), and "(lines 1–2000 of 2500; read more with offset=2001)" when there is more. Paths outside /drive and /work: `invalid_path`. A hidden file reads exactly like a missing one (`not_found`). Binary files: a note to use bash |
-| `write` | "Wrote N bytes to /drive/x. It saves to the drive automatically in about 2 s." (or that /work is scratch) |
-| `edit` | "Edited /drive/x: replaced 1 occurrence. It saves …" and a few numbered lines around the change. `edit_no_match` (old_string absent), `edit_not_unique` ("old_string appears 2 times in …"; next step: add surrounding lines or set replace_all), `edit_no_change`, `binary_file` |
+| `write` | "Wrote N bytes to /drive/x. Saved to the drive: create x (package pk_…)." (or that /work is scratch). On a conflict the call fails with `merge_conflict`: "Wrote N bytes to /drive/x in this session, but nothing was saved to the drive. …", and /drive holds the drive's version again |
+| `edit` | "Edited /drive/x: replaced 1 occurrence. Saved to the drive: …" (conflicts as for `write`) and a few numbered lines around the change. `edit_no_match` (old_string absent), `edit_not_unique` ("old_string appears 2 times in …"; next step: add surrounding lines or set replace_all), `edit_no_change`, `binary_file` |
 
-Every result of a session tool begins with `[drive] …` lines when automatic merges finished since the previous call ("[drive] Saved to the drive: update notes/plan.md (package pk_…)." or "[drive] merge_conflict: …"), each shown once (`automatic_saves` in structured content).
 
 The skill is the MCP resource `skill://agent-drive/SKILL.md` (`text/markdown`, with `name`/`description` front matter, the MCP Skills extension convention) and `drive help`; the text is `SHELL_SKILL` in `skill.ts`.
 
@@ -106,15 +105,34 @@ Like v2, with only `start_session` and `bash`; reading, writing and editing happ
 | Server instructions | v2's, with "pass it to bash" in place of "pass it to bash, read, write and edit" |
 | `bash` description | v2's, plus, before "The drive command does the rest": "Read files with cat -n or sed -n '10,40p' file, write them with cat > file <<'EOF', and edit them with sed -i or python3." |
 
-## Automatic merge (v2, v3)
+## Automatic merge (v2, v3): option A
 
-After a call that changed files under /drive (`bash`, `write`, `edit`), the session's changes merge into the drive as one package, all or nothing, through the same merge as `checkpoint` (`server/src/merge/auto.ts`):
+Decision 0006, option A: **when a call changes files under /drive (`bash`; `write` and `edit` in v2), the session's changes merge before that call's result returns, and the result says how it went.** There is no timer and no report on a later call (`server/src/merge/auto.ts`).
 
-- **Coalescing:** the merge runs 2 s after the last changing call *ends*, and never while one runs. A burst of calls becomes one package; its summary lists what the calls said they did ("Saved automatically after: Plant basil instead; Sort the seed list", from `bash`'s `description`, else the command).
-- **What counts as a change:** `write` and `edit` under /drive; for `bash`, a fingerprint of /drive (paths, sizes, modification times) before and after, then a diff. Changes only in /work or in tool caches (the merge ignore list) schedule nothing.
-- **The cost of coalescing:** the outcome arrives after the call that caused it. It is reported at the top of the session's next tool result and in `drive status`. `drive save "message"` merges at once and reports in its own output, for when an agent wants to be sure before it answers.
-- **Conflicts:** nothing merges. The report names each path and reason, says the session's version is saved under `/work/conflicts/`, that /drive now holds the drive's current version, and what to do: redo the change on top of the file in /drive; it then saves automatically. The session stays open.
-- **Shutdown:** changes still waiting are merged before the server stops.
+- **One package per changing call**, all or nothing, through the same merge as `checkpoint`. Its summary, which the person sees, is the call's `description` (bash), else its command (cut at 200 characters), else `write /drive/x` / `edit /drive/x`.
+- **What counts as a change:** `write` and `edit` under /drive; for `bash`, a fingerprint of /drive (paths, sizes, modification times) before and after, then a diff. Changes only in /work or in tool caches (the merge ignore list, `server/src/merge/ignore.ts`) save nothing.
+- **Conflicts:** nothing merges. The same result names each path and reason, says the session's version is saved under `/work/conflicts/` and that /drive now holds the drive's current version, and ends with the next step: "Redo your change on top of the file in /drive (your version in /work/conflicts/ shows what you had); it is saved when the call that makes it ends." The session stays open.
+- **`drive save "message"`** merges at once with the message as the summary; it is now mostly for a message of the agent's own. A command that ends in `drive save` has nothing left to save at its end.
+- Packages are grouped into **turns** for the person (below), so one package per call does not clutter history.
+
+## Turns
+
+Packages one session merges close together belong to one **turn** of the conversation (`server/src/sessions/turns.ts`). A new turn starts when a session call comes **`TURN_GAP_MS` = 20 s** or more after the session's previous call ended. The turn is recorded per package in the server-private table `package_turns` (`server-schema.sql`), with every merge on every surface (checkpoints and `finish` in v0/v1 too).
+
+- `GET /api/app/sessions`: each session has `turns`, newest first, each `{turn_id, packages, undone}`; `merges` stays as before.
+- `POST /api/app/undo-turn {turn_id}`: undoes the turn's packages newest first, each with the usual per-item rules of undo (an item changed since is left as it is and reported in `conflicts`); packages already undone are skipped.
+- The app's session view shows one card per turn with one *Undo turn* button; single saves keep their own *Undo*.
+
+## Sessions over time
+
+Agents on v2/v3 never close a session, so the server does (`Sessions.sweep`, run every minute; `Sessions.lifecycle`):
+
+| After no calls for | State | What happens |
+| --- | --- | --- |
+| `IDLE_AFTER_MS` = **1 hour** (`AGENT_DRIVE_IDLE_AFTER_S`) | `idle` | The sandbox is destroyed; /drive, /work and the session's base stay in its folders. The next call with its id starts a new sandbox and carries on in the same session; the agent notices nothing |
+| `EXPIRE_AFTER_MS` = **30 days** (`AGENT_DRIVE_EXPIRE_AFTER_S`; the security design's re-approval period) | `expired` | Every call is refused: `expired: this session expired after 30 days without calls. Start a new session with start_session(purpose); this one cannot be used again.` |
+
+The state is kept in `session_meta.lifecycle` (server-private); the app shows it in place of `open`. Expiry is also checked at each call, so it holds even before a sweep has run.
 
 ## The `drive` command (v2, v3)
 
@@ -125,7 +143,7 @@ After a call that changed files under /drive (`bash`, `write`, `edit`), the sess
 | `drive search <words>` | Matches this session can see: "3 matches you can see:" or "about 1,200 matches you can see; the first 20:", each path with a snippet; then "Hidden from this session: …" (metadata only, below) |
 | `drive search --all <words>` | The same, and the full list written to `/work/search-<n>.txt` |
 | `drive status` | Purpose, start time, file count, unsaved changes, the last save (time, package, automatic or `drive save`) or "FAILED", conflicts, the partial-view note, hidden counts |
-| `drive save "message"` | Merges now with the message as the summary the person sees; exit 1 on `merge_conflict` |
+| `drive save "message"` | Merges now with the message as the summary the person sees (otherwise each changing call is saved at its end with its description or command); exit 1 on `merge_conflict` |
 | `drive help` | The skill text |
 
 **How it reaches the drive, and why that is safe.** Each session gets its own Unix socket on the host, `sessions/<dir_id>/sock/drive.sock`, started with its sandbox. The socket's directory is bind-mounted read-only at `/run/drive` into that session's sandbox only, and runsc runs with `--host-uds=open`, so the sandbox may connect to (not create) host sockets inside its own mounts. Which socket a request arrives on identifies the session: there is no token and nothing secret in the sandbox, and a request never names a session (fields other than `argv` are ignored). The host treats every request as untrusted: one JSON line `{"argv": [...]}` of at most 64 KB and 64 string arguments, at most 4 connections at a time, only the four commands above, every answer scoped to that session. Another session's socket is not in the sandbox's file system at all (`test/e2e/src/shell.test.ts` tries to connect to it by its host path). The socket belongs to the sandbox's user, mode 0600.
@@ -150,6 +168,7 @@ Default next steps (`NEXT_STEP` in `common.ts`; some calls give a more specific 
 | --- | --- |
 | `needs_session` | Call start_session(purpose) and pass the session_id it returns to every other tool. |
 | `finished`, `stopped` | Start a new session with start_session(purpose). |
+| `expired` | Start a new session with start_session(purpose); this one cannot be used again. |
 | `paused` | Tell the person the session is paused and try again later. |
 | `not_found` | Check the path with ls in the shell, then try again. (v2: "…with ls in bash…") |
 | `invalid_path` | Use a path under /drive or /work without "..", such as /drive/notes/plan.md. |

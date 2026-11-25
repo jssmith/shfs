@@ -98,8 +98,19 @@ CREATE TABLE IF NOT EXISTS session_meta (
   first_transport_id   TEXT,
   last_transport_id    TEXT,
   summary_last         TEXT,
-  run_count            INTEGER NOT NULL DEFAULT 0
+  run_count            INTEGER NOT NULL DEFAULT 0,
+  lifecycle            TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'idle' (sandbox gone, resumes on the next call) | 'expired'
+  current_turn         TEXT,     -- the turn the session's calls belong to now (sessions/turns.ts)
+  last_call_end        INTEGER   -- ms since the epoch, when the session's last call started or ended
 );
+
+-- Which turn of its session each merge package belongs to (sessions/turns.ts).
+CREATE TABLE IF NOT EXISTS package_turns (
+  pkg_id   TEXT PRIMARY KEY,
+  dir_id   TEXT NOT NULL,
+  turn_id  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS package_turns_turn ON package_turns (turn_id);
 
 -- Instrumentation: one row per MCP tool call (wave 1, uncertainty 1).
 CREATE TABLE IF NOT EXISTS calls (

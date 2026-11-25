@@ -27,6 +27,9 @@ export function openDb(dataDir: string): DB {
     if (!cols.some((c) => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
   };
   addColumn('calls', 'registered_name', 'TEXT');
+  addColumn('session_meta', 'lifecycle', "TEXT NOT NULL DEFAULT 'active'");
+  addColumn('session_meta', 'current_turn', 'TEXT');
+  addColumn('session_meta', 'last_call_end', 'INTEGER');
   db.exec('PRAGMA synchronous = NORMAL;');
   return db;
 }

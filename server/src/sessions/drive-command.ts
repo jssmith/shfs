@@ -71,7 +71,7 @@ export function driveCommands(sessions: Sessions, auto: AutoMerge): DriveCommand
       `Started: ${row.created_at}`,
       `/drive: ${s.files} file${s.files === 1 ? '' : 's'} from the drive.`,
       changes.length
-        ? `Unsaved changes: ${changes.map((c) => (c.from_path ? `${c.kind} ${c.from_path} → ${c.path}` : `${c.kind} ${c.path}`)).join(', ')}. They save automatically about ${Math.round(auto.windowMs / 1000)} s after your last change, or now with: drive save "message"`
+        ? `Unsaved changes: ${changes.map((c) => (c.from_path ? `${c.kind} ${c.from_path} → ${c.path}` : `${c.kind} ${c.path}`)).join(', ')}. They are saved when this command ends, or now with: drive save "message"`
         : 'Unsaved changes: none.',
       last
         ? last.result.ok

@@ -5,6 +5,7 @@ import { all, get } from '../store/db.js';
 import type { Op } from '../store/drive.js';
 import { COOKIE, createWebSession, endWebSession, ownerHasPassword, parseCookies, verifyOwnerPassword, verifyWebSession } from '../auth/owner.js';
 import { trashItem, undoPackage } from '../merge/undo.js';
+import { TURN_GAP_MS, turnOf, turnPackages, undoTurn } from '../sessions/turns.js';
 import { APP_HTML, loginPage } from './page.js';
 
 export function appRouter(ctx: Context): Router {
@@ -75,14 +76,30 @@ export function appRouter(ctx: Context): Router {
   r.get('/api/app/sessions', owner, (_req, res) => {
     const rows = all<{ dir_id: string; session_id_hash: string; purpose: string; status: string; created_at: string; last_call_at: string; client_name: string | null; client_version: string | null; registered_name: string | null; summary_last: string | null }>(
       db,
-      `SELECT s.dir_id, s.session_id_hash, s.purpose, s.status, s.created_at, s.last_call_at, m.client_name, m.client_version, m.registered_name, m.summary_last
+      `SELECT s.*, m.client_name, m.client_version, m.registered_name, m.summary_last
          FROM sessions s LEFT JOIN session_meta m ON m.dir_id = s.dir_id ORDER BY s.created_at DESC, s.rowid DESC LIMIT 100`,
     );
     res.json({
-      sessions: rows.map((s) => ({
+      turn_gap_ms: TURN_GAP_MS,
+      sessions: rows.map((s) => {
+        const merges = all<{ pkg_id: string; kind: string; summary_claimed: string | null; summary_observed: string | null; operations: string; created_at: string }>(
+          db, 'SELECT * FROM packages WHERE session_id_hash = ? ORDER BY rowid DESC', s.session_id_hash,
+        ).map(describePackage);
+        // Merges grouped by turn, newest turn first (sessions/turns.ts).
+        const turns: { turn_id: string | null; packages: typeof merges; undone: boolean }[] = [];
+        for (const m of merges) {
+          const t = turnOf(db, m.pkg_id);
+          const last = turns[turns.length - 1];
+          if (last && last.turn_id === t && t !== null) last.packages.push(m);
+          else turns.push({ turn_id: t, packages: [m], undone: false });
+        }
+        for (const t of turns) t.undone = t.packages.every((p) => p.undone_by);
+        // Lifecycle (idle, expired) shows in place of an open status.
+        const life = s.status === 'open' || s.status === 'needs_resolution' ? sessions.lifecycle(s as never) : 'active';
+        return {
         dir_id: s.dir_id,
         purpose: s.purpose,
-        status: s.status,
+        status: life === 'active' ? s.status : life,
         created_at: s.created_at,
         last_call_at: s.last_call_at,
         agent: { declared_name: s.client_name, declared_version: s.client_version, registered_name: s.registered_name },
@@ -90,10 +107,10 @@ export function appRouter(ctx: Context): Router {
         activity: all<{ ts: string; op: string; item_id: string | null; bytes_returned: number | null; detail: string | null }>(
           db, "SELECT ts, op, item_id, bytes_returned, detail FROM activity WHERE dir_id = ? AND op IN ('read','write','run','search','resume_session','transport_changed') ORDER BY id DESC LIMIT 100", s.dir_id,
         ).map((a) => ({ ...a, detail: a.detail ? JSON.parse(a.detail) : null })),
-        merges: all<{ pkg_id: string; kind: string; summary_claimed: string | null; summary_observed: string | null; operations: string; created_at: string }>(
-          db, 'SELECT * FROM packages WHERE session_id_hash = ? ORDER BY rowid DESC', s.session_id_hash,
-        ).map(describePackage),
-      })),
+        merges,
+        turns,
+        };
+      }),
     });
   });
 
@@ -118,6 +135,21 @@ export function appRouter(ctx: Context): Router {
     }
     const touched = new Set((JSON.parse(drive.pkg(pkg_id)!.operations) as Op[]).map((o) => o.item_id));
     const u = undoPackage(drive, pkg_id, { force: Array.isArray(force) ? force : [] });
+    for (const id of touched) await sessions.applyVisibility(id);
+    ctx.jobs.kick();
+    res.json(u);
+  });
+
+  // Undo a whole turn of a session: its packages newest first, each with the per-item conflict rules of undo.
+  r.post('/api/app/undo-turn', owner, express.json(), async (req, res) => {
+    const { turn_id } = req.body as { turn_id?: string };
+    const pkgs = typeof turn_id === 'string' ? turnPackages(db, turn_id) : [];
+    if (!pkgs.length) {
+      res.status(404).json({ error: 'no such turn' });
+      return;
+    }
+    const touched = new Set(pkgs.flatMap((p) => (JSON.parse(drive.pkg(p)!.operations) as Op[]).map((o) => o.item_id)));
+    const u = undoTurn(drive, turn_id!);
     for (const id of touched) await sessions.applyVisibility(id);
     ctx.jobs.kick();
     res.json(u);

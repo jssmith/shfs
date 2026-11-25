@@ -9,6 +9,7 @@ import type { Sessions } from '../sessions/manager.js';
 import { safeRead, safeRemove, safeWrite, walkFiles } from '../util/fsafe.js';
 import { newId } from '../util/ids.js';
 import { isToolCache } from './ignore.js';
+import { recordPackageTurn } from '../sessions/turns.js';
 
 export interface Change {
   kind: 'create' | 'update' | 'move' | 'archive';
@@ -226,6 +227,7 @@ export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoin
     applied = tx(drive.db, () => {
       const r = drive.applyPackage({ kind, ops, versions, labels, session_id_hash: row.session_id_hash, summary_claimed: summary, summary_observed: observed });
       drive.activity({ dir_id, actor: 'agent', op: kind, detail: { pkg_id: r.pkg_id, observed } });
+      recordPackageTurn(drive.db, dir_id, r.pkg_id);
       return r;
     });
   } catch (e) {
