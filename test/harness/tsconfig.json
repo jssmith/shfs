@@ -8,5 +8,5 @@
     "erasableSyntaxOnly": true,
     "types": ["node"]
   },
-  "include": ["stub", "client", "src", "opencode", "openwebui"]
+  "include": ["stub", "client", "src", "opencode", "openwebui", "sessions"]
 }
