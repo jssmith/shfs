@@ -1,53 +1,22 @@
 // The surfaces behind AGENT_DRIVE_SURFACE, over HTTP with the SDK client,
 // without a sandbox: tool lists, wording, typed results.
 import { afterEach, expect, test } from 'vitest';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { startHttp, type HttpServer } from '../http.js';
-import { tempContext, upload, settle } from '../testing.js';
+import { upload, settle } from '../testing.js';
+import { mcpEnv, type McpEnv } from './test-env.js';
 import { parseSurface, type Surface } from '../context.js';
 import { CLASSIC_WORDING } from './classic.js';
 import { SERVER_INSTRUCTIONS } from './skill.js';
 
-const BASE = 9430 + Number(process.env.AGENT_DRIVE_TEST_PORT_OFFSET ?? 0);
-let port = BASE;
-
-interface Env {
-  ctx: ReturnType<typeof tempContext>;
-  http: HttpServer;
-  client: Client;
-  call(name: string, args: Record<string, unknown>): Promise<{ text: string; isError: boolean; structured: Record<string, unknown> }>;
-}
-const open: Env[] = [];
-
-export async function surfaceEnv(surface: Surface): Promise<Env> {
-  const ctx = tempContext(undefined, surface);
-  const p = port++;
-  ctx.config.port = p;
-  ctx.config.publicUrl = `http://127.0.0.1:${p}`;
-  const http = await startHttp(ctx);
-  const conn = http.provider.directConnection('surface-test');
-  const client = new Client({ name: 'surface-test', version: '1.0.0' });
-  await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${p}/mcp`), { requestInit: { headers: { authorization: `Bearer ${conn.tokens.access_token}` } } }));
-  const env: Env = {
-    ctx,
-    http,
-    client,
-    async call(name, args) {
-      const r = (await client.callTool({ name, arguments: args })) as { content: { text?: string }[]; isError?: boolean; structuredContent?: Record<string, unknown> };
-      return { text: r.content.map((c) => c.text ?? '').join('\n'), isError: !!r.isError, structured: r.structuredContent ?? {} };
-    },
-  };
-  open.push(env);
-  return env;
+let port = 9430;
+const open: McpEnv[] = [];
+async function surfaceEnv(surface: Surface): Promise<McpEnv> {
+  const e = await mcpEnv(surface, port++);
+  open.push(e);
+  return e;
 }
 
 afterEach(async () => {
-  for (const e of open.splice(0)) {
-    await e.client.close();
-    await e.http.close();
-    await e.ctx.dispose();
-  }
+  for (const e of open.splice(0)) await e.close();
 });
 
 test('AGENT_DRIVE_SURFACE picks one of four surfaces, v0 by default', () => {

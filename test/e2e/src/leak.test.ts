@@ -45,6 +45,7 @@ const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 const SURFACES: { surface: Surface; port: number }[] = [
   { surface: 'v0', port: 9412 },
   { surface: 'v1', port: 9413 },
+  { surface: 'v2', port: 9414 },
 ];
 
 describe.skipIf(!haveSandbox).each(SURFACES)('ringed items never reach an agent on $surface (needs AGENT_DRIVE_RUNSC and AGENT_DRIVE_ROOTFS)', ({ surface, port }) => {

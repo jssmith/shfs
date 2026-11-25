@@ -8,6 +8,8 @@ import { Sessions } from './sessions/manager.js';
 import { NoExecSandbox, type Sandbox } from './sessions/sandbox.js';
 import { RunscSandbox } from './sessions/runsc.js';
 import { loadImageSettings } from './sessions/image.js';
+import { AutoMerge } from './merge/auto.js';
+import { driveCommands } from './sessions/drive-command.js';
 
 export interface Config {
   dataDir: string;
@@ -50,6 +52,8 @@ export interface Context {
   drive: Drive;
   sessions: Sessions;
   jobs: JobRunner;
+  /** The shell surfaces (v2, v3) only: automatic merge after changing calls. */
+  auto?: AutoMerge;
   close(): Promise<void>;
 }
 
@@ -63,12 +67,20 @@ export function createContext(config: Config, sandbox?: Sandbox): Context {
       : new NoExecSandbox());
   const sessions = new Sessions(drive, path.join(config.dataDir, 'sessions'), sb, config.sandboxPrefix);
   const jobs = new JobRunner(drive, (item_id) => sessions.applyVisibility(item_id));
+  let auto: AutoMerge | undefined;
+  if (config.surface === 'v2' || config.surface === 'v3') {
+    auto = new AutoMerge(sessions);
+    sessions.driveCommand = driveCommands(sessions, auto);
+  }
   return {
     config,
     drive,
     sessions,
     jobs,
+    auto,
     async close() {
+      // Changes still waiting for their automatic merge are merged, not dropped.
+      await auto?.flushAll();
       jobs.stop();
       await sessions.destroyAll();
       await sb.releaseRoot?.();
