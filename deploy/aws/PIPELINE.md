@@ -105,9 +105,9 @@ All commands use `--region us-east-2`.
    If the app is installed on more than one GitHub account or organisation, check
    that the installation number in the *GitHub Apps* box matches the one in
    github.com/settings/installations for the account that owns the repository.
-   A connection bound to another installation is the suspected cause (not yet
-   confirmed) of a connection that shows AVAILABLE while the webhook fails with
-   "Repository not found or permission denied".
+   A connection bound to another installation still shows AVAILABLE, but builds
+   fail with "authorization failed for primary source" and the webhook with
+   "Repository not found or permission denied" (seen 2026-11-25).
 3. **Update the VM stack.** Make a change set and read it before running it:
    the only change should be **Add `ReleaseReadPolicy`**. The template resolves
    `ImageId` from Canonical's SSM parameter on every update, so if Canonical has
