@@ -1,12 +1,13 @@
 // The model stage of the ring check: a small local model behind Ollama's HTTP
-// API. It reads the extracted text and metadata and gives each ring a score.
+// API. It reads the extracted text and metadata and names the ring that fits
+// best, with a confidence; scores are 0.9 / 0.7 / 0.5 for high / medium / low.
 // Configured by AGENT_DRIVE_RING_MODEL (model tag) and AGENT_DRIVE_OLLAMA_URL;
 // with no model configured the stage is a stub that gives no opinion.
 
 import { RINGS, type Ring } from './rules.js';
 
 export interface ModelInput { text: string; name: string; mime: string; source: string; batchLabels: string[] }
-export interface ModelOpinion { scores: Partial<Record<Ring, number>>; raw?: string; ms: number }
+export interface ModelOpinion { scores: Partial<Record<Ring, number>>; none?: number; raw?: string; ms: number }
 export interface RingModel {
   name: string;
   classify(input: ModelInput): Promise<ModelOpinion | null>;
@@ -22,13 +23,17 @@ const SYSTEM = `You sort a person's files into privacy rings. Rings:
 - credentials: passwords, password exports, recovery or backup codes, private keys, API keys or tokens, wallet seed phrases, 2FA secrets.
 Ordinary files are in no ring: receipts, recipes, code without real secrets, articles and fiction that only talk about a topic, contracts, invoices, tickets, notes, manuals.
 Text may come from OCR and contain errors.
-Reply with JSON only: for each ring, a number from 0 to 100 for how likely the file belongs in it.`;
+Reply with JSON only: the one ring that fits best, or "none", and how sure you are.`;
 
 const SCHEMA = {
   type: 'object',
-  properties: Object.fromEntries(RINGS.map((r) => [r.slice(5), { type: 'integer' }])),
-  required: RINGS.map((r) => r.slice(5)),
+  properties: {
+    ring: { type: 'string', enum: [...RINGS.map((r) => r.slice(5)), 'none'] },
+    confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+  },
+  required: ['ring', 'confidence'],
 };
+const CONFIDENCE: Record<string, number> = { high: 0.9, medium: 0.7, low: 0.5 };
 
 export function ollamaModel(model: string, baseUrl = 'http://127.0.0.1:11434', timeoutMs = 120_000): RingModel {
   return {
@@ -44,7 +49,7 @@ export function ollamaModel(model: string, baseUrl = 'http://127.0.0.1:11434', t
         signal: AbortSignal.timeout(timeoutMs),
         body: JSON.stringify({
           model, stream: false, format: SCHEMA, keep_alive: '30m',
-          options: { temperature: 0, num_predict: 80, num_ctx: 2048 },
+          options: { temperature: 0, num_predict: 40, num_ctx: 2048 },
           messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: prompt }],
         }),
       });
@@ -53,11 +58,12 @@ export function ollamaModel(model: string, baseUrl = 'http://127.0.0.1:11434', t
       const raw = body.message?.content ?? '';
       const scores: Partial<Record<Ring, number>> = {};
       try {
-        const parsed = JSON.parse(raw) as Record<string, unknown>;
-        for (const r of RINGS) {
-          const v = Number(parsed[r.slice(5)]);
-          if (Number.isFinite(v)) scores[r] = Math.max(0, Math.min(1, v / 100));
-        }
+        const parsed = JSON.parse(raw) as { ring?: string; confidence?: string };
+        const ring = RINGS.find((r) => r.slice(5) === parsed.ring);
+        const conf = CONFIDENCE[parsed.confidence ?? ''] ?? 0.5;
+        for (const r of RINGS) scores[r] = 0;
+        if (ring) scores[ring] = conf;
+        else if (parsed.ring === 'none') return { scores, none: conf, raw, ms: Date.now() - t0 };
       } catch {
         return { scores: {}, raw, ms: Date.now() - t0 };
       }

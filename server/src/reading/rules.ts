@@ -36,11 +36,11 @@ export function mask(v: string): string {
 
 /** Undo common OCR confusions inside runs that are mostly digits. */
 export function normaliseDigits(text: string): string {
-  return text.replace(/[0-9OoIlSB|][0-9OoIlSB| -]{10,}[0-9OoIlSB|]/g, (run) => {
-    const digits = (run.match(/\d/g) ?? []).length;
-    const letters = (run.match(/[OoIlSB|]/g) ?? []).length;
-    if (digits < 10 || letters > 3) return run;
-    return run.replace(/[Oo]/g, '0').replace(/[Il|]/g, '1').replace(/S/g, '5').replace(/B/g, '8');
+  // Only tokens that are nearly all digits: "4O12" becomes "4012", "ES64" stays.
+  return text.replace(/(?<![A-Za-z0-9])[0-9OoIlSB|]{3,6}(?![A-Za-z0-9])/g, (tok) => {
+    const digits = (tok.match(/\d/g) ?? []).length;
+    if (digits < 2 || digits < tok.length - 1) return tok;
+    return tok.replace(/[Oo]/g, '0').replace(/[Il|]/g, '1').replace(/S/g, '5').replace(/B/g, '8');
   });
 }
 
@@ -62,15 +62,17 @@ function bagScore(n: number): number {
 function keywordBag(text: string, ring: Ring, rule: string, strong: RegExp[], weak: RegExp[]): Signal | null {
   const hits: string[] = [];
   let n = 0;
+  let strongHits = 0;
   for (const re of strong) {
     const m = re.exec(text);
-    if (m) { n += 1; hits.push(m[0].toLowerCase()); }
+    if (m) { n += 1; strongHits++; hits.push(m[0].toLowerCase()); }
   }
   for (const re of weak) {
     const m = re.exec(text);
     if (m) { n += 0.5; hits.push(m[0].toLowerCase()); }
   }
-  const score = bagScore(n);
+  // Weak words alone never assign a ring: at least two distinct strong ones are needed.
+  const score = strongHits >= 2 ? bagScore(n) : Math.min(bagScore(n), 0.6);
   return score > 0 ? { ring, score, rule, detail: `keywords: ${hits.slice(0, 6).join(', ')}` } : null;
 }
 
@@ -94,16 +96,17 @@ const KEY_PATTERNS: [string, RegExp][] = [
   ['kubeconfig-secret', /client-key-data:\s*\S{20,}|\btoken:\s*[A-Za-z0-9._-]{30,}/],
 ];
 
-const ASSIGNMENT = /(?<![A-Za-z])(pass(?:word|wd|phrase)?|pw|pwd|secret|token|api[_ -]?key|auth[_ -]?token|access[_ -]?key|client[_ -]?secret|private[_ -]?key|pin)(?![A-Za-z])["']?\s*[:=]\s*["']?([^\s"',;]{6,})/gi;
+const ASSIGNMENT = /(?<![A-Za-z])(pass(?:word|wd|phrase)?|pw|pwd|secret|token|api[_ -]?key|auth[_ -]?token|access[_ -]?key|client[_ -]?secret|private[_ -]?key|pin)(?:[ _-]?[A-Za-z]{1,10})?(?![A-Za-z])["']?\s*[:=]\s*["']?([^\s"',;]{6,})/gi;
 
 function credentialSignals(text: string, name: string): Signal[] {
   const out: Signal[] = [];
+  const squeezed = text.replace(/[ \t]*([-_])[ \t]*/g, '$1'); // OCR adds spaces around - and _
   for (const [rule, re] of KEY_PATTERNS) {
-    const m = re.exec(text);
+    const m = re.exec(text) ?? re.exec(squeezed);
     if (m && !/EXAMPLE/.test(m[0])) out.push({ ring: 'ring:credentials', score: 0.97, rule, detail: mask(m[0]) });
   }
   // key = value assignments with a real-looking value
-  for (const m of text.matchAll(ASSIGNMENT)) {
+  for (const m of [...text.matchAll(ASSIGNMENT), ...squeezed.matchAll(ASSIGNMENT)]) {
     const value = m[2]!;
     if (PLACEHOLDER.test(value) || /^[a-z_]+\(/.test(value) || /^[a-z]+$/.test(value)) continue;
     const classes = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((re) => re.test(value)).length;
@@ -112,6 +115,8 @@ function credentialSignals(text: string, name: string): Signal[] {
       break;
     }
   }
+  const env = /^\s*(?:export\s+)?[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIALS?)[A-Z0-9_]*\s*[=:]\s*["']?([^\s"']{2,})/m.exec(text);
+  if (env && !PLACEHOLDER.test(env[2]!)) out.push({ ring: 'ring:credentials', score: 0.85, rule: 'env-secret', detail: `${env[1]}=${mask(env[2]!)}` });
   // password-manager export: a CSV header naming password and user columns
   const header = text.split('\n', 3).find((l) => /password/i.test(l) && /user|login/i.test(l) && /,/.test(l));
   if (header) out.push({ ring: 'ring:credentials', score: 0.97, rule: 'password-export', detail: header.slice(0, 60) });
@@ -130,14 +135,20 @@ function credentialSignals(text: string, name: string): Signal[] {
     best = Math.max(best, hits);
     if (best === 12) break;
   }
+  if (words.length >= 8 && words.length < 12) {
+    const hits = words.filter((w) => BIP39.has(w)).length;
+    if (hits >= words.length - 1) best = Math.max(best, Math.round((hits / words.length) * 12) - 1);
+  }
   const seedWords = /seed|recovery phrase|mnemonic|wallet|secret phrase|backup/i.test(text + ' ' + name);
   if (best >= 11 || (best >= 9 && seedWords)) out.push({ ring: 'ring:credentials', score: 0.95, rule: 'seed-phrase', detail: `${best}/12 BIP39 words in a row` });
   else if (best >= 9) out.push({ ring: 'ring:credentials', score: 0.6, rule: 'seed-phrase-weak', detail: `${best}/12 BIP39 words in a row` });
   const b64Lines = text.split('\n').filter((l) => /^[A-Za-z0-9+\/=]{40,}$/.test(l.replace(/\s/g, '')) && /[a-z]/.test(l) && /[A-Z]/.test(l) && /\d/.test(l)).length;
   if (b64Lines >= 4) out.push({ ring: 'ring:credentials', score: 0.75, rule: 'key-material', detail: `${b64Lines} lines of base64` });
   // TOTP setup key: base32, 16+ characters, near a keyword
-  const totp = /(setup|secret|authenticator|2fa|totp)\s+key\W{0,3}((?:[A-Z2-7]{4}\s?){4,})/i.exec(text);
-  if (totp) out.push({ ring: 'ring:credentials', score: 0.95, rule: 'totp-secret', detail: mask(totp[2]!) });
+  const totp = /(setup|secret|authenticator|2fa|totp|otp)\s+(key|secret)\W{0,3}([\s\S]{0,80})/i.exec(text);
+  const body = totp ? (/[A-Za-z0-9]{16,}/.exec(totp[3]!.replace(/[ \t]/g, ''))?.[0] ?? '') : '';
+  if (totp && body) out.push({ ring: 'ring:credentials', score: 0.95, rule: 'totp-secret', detail: mask(body) });
+  else if (totp || /\b2fa setup\b|two-factor setup/i.test(text)) out.push({ ring: 'ring:credentials', score: 0.75, rule: 'totp-phrase', detail: (totp?.[0] ?? '2fa setup').slice(0, 30) });
   // a list of "site: password" lines under a passwords heading
   const listLines = text.split('\n').filter((l) => {
     if (!/^[\w .@-]{2,40}(?:[:\-]\s+|\s+pw:\s*)\S{6,}\s*$/.test(l.trim())) return false;
@@ -167,8 +178,18 @@ function financeSignals(text: string, norm: string): Signal[] {
     out.push({ ring: 'ring:finance', score: ctx ? 0.96 : 0.45, rule: ctx ? 'card-number' : 'card-number-no-context', detail: mask(digits) });
     if (ctx) break;
   }
+  // card-length number next to card words whose checksum failed (often OCR damage)
+  if (!out.some((o) => o.rule === 'card-number')) {
+    const cardish = /(?<![\d])(?:\d[ -]?){12,18}\d(?![ -]?\d)/.exec(norm);
+    if (cardish && near(norm, cardish.index, /valid\s*thr?u|good\s*thru|(credit|debit|visa|master\s?card|amex)\W{1,3}card\s*(number|no)|card number/i, 80)) {
+      out.push({ ring: 'ring:finance', score: 0.8, rule: 'card-like-number', detail: 'card-length number by card words, checksum failed' });
+    }
+  }
+  if (/valid[\s-]*thr?u|good[\s-]*thru/i.test(text)) out.push({ ring: 'ring:finance', score: 0.6, rule: 'card-face', detail: 'valid thru' });
+  if (/sum of\b.{0,60}\b(dollars|pounds|euros)\s+only/is.test(text)) out.push({ ring: 'ring:finance', score: 0.75, rule: 'cheque-wording', detail: 'the sum of ... only' });
   // IBAN (mod-97)
-  for (const m of norm.toUpperCase().matchAll(/\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){10,30}/g)) {
+  const ibanRe = /\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){10,30}/g;
+  for (const m of [...text.toUpperCase().matchAll(ibanRe), ...norm.toUpperCase().matchAll(ibanRe)]) {
     const parts = m[0].split(' ');
     for (let k = parts.length; k >= 3; k--) {
       const cand = parts.slice(0, k).join('');
@@ -177,6 +198,7 @@ function financeSignals(text: string, norm: string): Signal[] {
         break;
       }
     }
+    if (out.some((o) => o.rule === 'iban')) break;
   }
   // US routing number next to the word
   for (const m of norm.matchAll(/\b\d{9}\b/g)) {
@@ -206,7 +228,9 @@ function financeSignals(text: string, norm: string): Signal[] {
 function identitySignals(text: string, norm: string): Signal[] {
   const out: Signal[] = [];
   // machine-readable zone
-  const mrzLines = text.split('\n').map((l) => l.replace(/\s/g, '').replace(/[«‹]/g, '<')).filter((l) => /^[A-Z0-9<]{28,46}$/.test(l) && (l.match(/</g) ?? []).length >= 3);
+  const mrzLines = text.split('\n').map((l) => l.replace(/\s/g, '').replace(/[«‹]/g, '<'))
+    // OCR reads runs of '<' as c, e or k
+    .map((l) => ((l.match(/</g) ?? []).length >= 2 ? l.replace(/<[cekK<]+/g, (r) => '<'.repeat(r.length)).replace(/[cekK]+$/, (r) => '<'.repeat(r.length)) : l)).filter((l) => /^[A-Z0-9<]{28,46}$/.test(l) && (l.match(/</g) ?? []).length >= 3);
   if (mrzLines.length >= 1) {
     let checked = false;
     for (const l of mrzLines) {
@@ -227,6 +251,8 @@ function identitySignals(text: string, norm: string): Signal[] {
       break;
     }
   }
+  if (/\bDL\s?[A-Z]?\d{6,9}\b/.test(norm) && /driver|licen[cs]e/i.test(text)) out.push({ ring: 'ring:identity', score: 0.9, rule: 'driver-licence-number', detail: 'DL number' });
+  if (/number has been established for/i.test(text)) out.push({ ring: 'ring:identity', score: 0.9, rule: 'ssn-card', detail: 'social security card wording' });
   // UK National Insurance number
   const ni = /\b[A-CEGHJ-PR-TW-Z]{2}\s?\d{2}\s?\d{2}\s?\d{2}\s?[A-D]\b/.exec(norm);
   if (ni) {
@@ -234,7 +260,12 @@ function identitySignals(text: string, norm: string): Signal[] {
     out.push({ ring: 'ring:identity', score: ctx ? 0.95 : 0.55, rule: 'ni-number', detail: mask(ni[0]) });
   }
   // a document number next to an identity document word
-  const idNum = /\b(passport\s*(no\.?|number|#)|document\s*(no\.?|number)|permit\s*(no\.?|number)|licen[cs]e\s*(no\.?|number)|\bDL\b|certificate\s*no\.?)\s*[:#]?\s*([A-Z]{0,3}\s?[A-Z0-9]?\d{5,9}[A-Z0-9]?)\b/i.exec(norm);
+  const idRe = /\b(passport\s*(no\.?|number|#)|document\s*(no\.?|number)|permit\s*(no\.?|number)|licen[cs]e\s*(no\.?|number)|\bDL|certificate\s*no\.?)\s*[:#.,]?\s*([A-Za-z0-9]{0,4}\s?[A-Za-z0-9]{4,12})\b/gi;
+  const idNum = [...norm.matchAll(idRe)].find((m) => {
+    const v = m[6]!.replace(/\s/g, '');
+    if (!/^[A-Z0-9]{6,14}$/.test(v)) return false;
+    return (v.match(/\d/g) ?? []).length >= 2 || (/passport/i.test(m[1]!) && v.length >= 8 && v.length <= 9);
+  });
   if (idNum) {
     const doc = /passport|identity card|driver|licen[cs]e|residence permit|birth|national id|visa/i.test(text);
     out.push({ ring: 'ring:identity', score: doc ? 0.93 : 0.6, rule: 'id-document-number', detail: `${idNum[1]} ${mask(idNum[6] ?? '')}` });
@@ -248,8 +279,8 @@ function identitySignals(text: string, norm: string): Signal[] {
   if (bag) out.push({ ...bag, score: Math.min(bag.score, 0.65) });
   // Field structure: "Surname: X", "Nationality: Y", "Date of birth: 01.02.1980" as labelled lines.
   const fields = [
-    /\b(surname|last name|LN)\b\s*:?\s+[A-Z][A-Za-z'-]+/, /\b(given names?|first name|FN)\b\s*:?\s+[A-Z][A-Za-z'-]+/,
-    /\bnationality\s*:?\s+[A-Z][A-Za-z ]+/i, /\bsex\s*:?\s+[MFX]\b/i, /\bplace of birth\s*:?\s+[A-Z]/i,
+    /\b(surname|last name|LN)\b\s*:?\s+[A-Z][A-Za-z'-]+/i, /\b(given names?|first name|FN)\b\s*:?\s+[A-Z][A-Za-z'-]+/i,
+    /\bnationality\s*:?\s+[A-Z][A-Za-z ]+/i, /\bsex\s*:?\s+(M|F|X|male|female)\b/i, /\b(full (legal )?name|name and surname)\s*:\s+[A-Z]/i, /\bplace of birth\s*:?\s+[A-Z]/i,
     /\b(date of birth|DOB)\s*:?\s+\d{1,2}[./ -]\d{1,2}[./ -]\d{2,4}/i, /\b(date of expiry|expiry|EXP|valid until)\s*:?\s+\d{1,2}[./ -]\d{1,2}[./ -]\d{2,4}/i,
     /\b(HGT|height|eyes)\s*:?\s+\S+/i, /\b(mother|father)\s*:\s+[A-Z]/i,
   ].filter((re) => re.test(text)).length;
@@ -271,6 +302,11 @@ function healthSignals(text: string, norm: string): Signal[] {
   if (mrn) out.push({ ring: 'ring:health', score: 0.93, rule: 'mrn', detail: mrn[1]! });
   const icd = /\b[A-TV-Z]\d{2}\.\d{1,3}\b/.exec(norm);
   if (icd && /diagnos|icd/i.test(text)) out.push({ ring: 'ring:health', score: 0.9, rule: 'icd10', detail: icd[0] });
+  const vaccines = ['MMR', 'Hepatitis', 'Tetanus', 'Influenza', 'HPV', 'Yellow fever', 'COVID', 'Polio', 'Measles', 'Rabies', 'Typhoid']
+    .filter((v) => text.toLowerCase().includes(v.toLowerCase())).length;
+  if (vaccines >= 2 && /immuni[sz]|vaccin|\bbatch\b|\blot\b|\bdose\b/i.test(text) && /\bDOB\b|date of birth|name:/i.test(text)) {
+    out.push({ ring: 'ring:health', score: 0.85, rule: 'vaccination-record', detail: `${vaccines} vaccines with a person` });
+  }
   const bag = keywordBag(text, 'ring:health', 'health-keywords', [
     /\bpatient\b/i, /diagnos[ie]s/i, /prescri(ption|bed|ber)|\bRx\b/i, /discharge(d)?\b/i, /referr(al|ing)/i,
     /laboratory|reference range|haemoglobin|hemoglobin|HbA1c|ferritin|cholesterol/i, /PHQ-9/i, /GAD-7/i, /\bCBT\b|cognitive|behavioural activation|behavioral activation/i, /suicidal|self-harm/i, /session notes|presenting:|low mood/i,
@@ -286,9 +322,11 @@ function healthSignals(text: string, norm: string): Signal[] {
 function intimateSignals(text: string): Signal[] {
   const bag = keywordBag(text, 'ring:intimate', 'intimate-keywords', [
     /\bmy (love|dearest|darling)\b|\bdarling\b/i, /all my love|forever yours|yours,? always/i, /falling for you|in love with|i love you/i,
-    /\baffair\b|sex life|attractive/i, /couples? counsell?ing|our counsellor|separation|moved out/i, /\bi am gay\b|came out/i,
-    /nobody else knows|just between us|not telling anyone/i, /dear diary|private\.?$/im, /\bmiss (you|the weight|being close)/i,
-  ], [/\blove\b/i, /cried|tears|shaking/i, /lonely|guilty|relieved|scared/i, /\bforgive\b/i, /\bdate with\b/i, /hand in mine|held me/i]);
+    /\baffair\b/i, /sex life|\bintimacy\b/i, /\battractive\b|\bclose to you\b/i, /couples? counsell?ing|our counsellor/i, /separation|moved out|divorce|break ?up/i,
+    /\bi am (gay|lesbian|bi|trans)\b|came out/i, /nobody else knows|just between us|not telling anyone/i, /dear diary|^\s*private\.?\s*$/im,
+    /\bmiss (you|the weight|being close)/i, /\bargued\b|\bargument\b|\bjealous/i, /try(ing)? for a baby|pregnan/i,
+    /checking my phone|(her|his) old messages/i, /things i want to say to you|before our talk/i,
+  ], [/\blove\b/i, /cried|tears|shaking/i, /lonely|guilty|relieved|scared|nervous/i, /\bforgive\b/i, /\bdate with\b/i, /hand in mine|held me/i, /\bfight\b/i]);
   return bag ? [bag] : [];
 }
 

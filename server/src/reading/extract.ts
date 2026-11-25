@@ -124,6 +124,13 @@ export async function ocrImage(imagePath: string, workDir: string): Promise<OcrR
       '-resize', '1600x1600<', '-normalize', '-unsharp', '0x1', cleaned], opts);
     best = better(best, await tesseract(cleaned));
     if (best.confidence < 0.6) best = better(best, await tesseract(cleaned, 6)); // single text block
+    // OSD misses some upside-down and sideways photos; try the other orientations.
+    for (const extra of [180, 90, 270]) {
+      if (best.confidence >= 0.6) break;
+      const turned = join(workDir, `turn-${extra}-${Math.random().toString(36).slice(2)}.png`);
+      await run('convert', [cleaned, '-rotate', String(extra), turned], opts);
+      best = better(best, await tesseract(turned));
+    }
   } catch {
     // keep the first pass
   }
