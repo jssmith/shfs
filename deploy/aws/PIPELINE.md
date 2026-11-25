@@ -99,9 +99,15 @@ All commands use `--region us-east-2`.
      --parameter-overrides Webhook=false
    ```
 2. **Johann completes the connection.** Console, us-east-2: Developer Tools >
-   Settings > Connections > `agent-drive-github-jssmith` > *Update pending connection* >
+   Settings > Connections > `agent-drive-github-personal` > *Update pending connection* >
    install the AWS Connector for GitHub app on `jssmith/agent-drive` only (*Only
    select repositories*) > *Connect*. Status becomes AVAILABLE.
+   If the app is installed on more than one GitHub account or organisation, check
+   that the installation number in the *GitHub Apps* box matches the one in
+   github.com/settings/installations for the account that owns the repository.
+   A connection bound to another installation is the suspected cause (not yet
+   confirmed) of a connection that shows AVAILABLE while the webhook fails with
+   "Repository not found or permission denied".
 3. **Update the VM stack.** Make a change set and read it before running it:
    the only change should be **Add `ReleaseReadPolicy`**. The template resolves
    `ImageId` from Canonical's SSM parameter on every update, so if Canonical has
@@ -171,7 +177,7 @@ statement (and `codebuild:StartBuild`, `codebuild:BatchGetBuilds` and
 
 | Can | Resource |
 | --- | --- |
-| `codeconnections:UseConnection`, `GetConnection`, `GetConnectionToken` | the `agent-drive-github-jssmith` connection |
+| `codeconnections:UseConnection`, `GetConnection`, `GetConnectionToken` | the `agent-drive-github-personal` connection |
 | `logs:CreateLogStream`, `logs:PutLogEvents` | log group `/aws/codebuild/agent-drive-build` |
 | `s3:PutObject`, only with `If-None-Match` | `releases/*` in the artifact bucket |
 | `s3:GetObject` | `releases/*` in the artifact bucket |
