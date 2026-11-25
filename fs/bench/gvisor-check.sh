@@ -2,7 +2,8 @@
 # Correctness of the session file system inside gVisor: mounts the daemon on the host, starts a
 # sandbox with it at /drive (--file-access-mounts=shared, --network=none), and repeats the key
 # checks from inside. Cleans up the sandbox and the mount on exit, also after failures.
-# Usage: gvisor-check.sh [rootfs]   (default /tmp/a2-gv/rootfs, see make-rootfs.sh)
+# Usage: [FS_FLAGS="--entry-timeout-ms 60000 --attr-timeout-ms 60000"] gvisor-check.sh [rootfs]
+# (rootfs default /tmp/a2-gv/rootfs, see make-rootfs.sh; FS_FLAGS are extra daemon flags)
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 bin=$here/../target/release/agent-drive-fs
@@ -13,7 +14,6 @@ sbx=a2-check-sbx
 mnt=$data/sessions/$id/mnt
 work=/tmp/a2-gv/check-work
 bundle=/tmp/a2-gv/check-bundle
-export GVISOR_SIDECAR_BINARIES_DIR=${GVISOR_SIDECAR_BINARIES_DIR:-/tmp/a2-gv/gvisor-bin}
 runsc=(runsc --root /tmp/a2-runsc --network=none --file-access-mounts=shared)
 pass=0
 fail=0
@@ -38,7 +38,7 @@ ex() { "${runsc[@]}" exec "$sbx" "$@" 2>&1; }
 rm -rf "$data" "$work" "$bundle"
 mkdir -p "$work" "$bundle" /tmp/a2-runsc
 "$bin" stub --data "$data" --dir-id "$id" --synthetic >/dev/null
-"$bin" mount --data "$data" --dir-id "$id" --name a2-fsd-check >/tmp/a2-gv/check-daemon.log 2>&1 &
+"$bin" mount --data "$data" --dir-id "$id" --name a2-fsd-check ${FS_FLAGS:-} >/tmp/a2-gv/check-daemon.log 2>&1 &
 daemon=$!
 for _ in $(seq 50); do mountpoint -q "$mnt" && break; sleep 0.1; done
 mountpoint -q "$mnt" || { echo "mount failed"; cat /tmp/a2-gv/check-daemon.log; exit 1; }

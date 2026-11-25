@@ -6,7 +6,7 @@ usage: bench.py <runs> <out.json> <label>=<root> [...]
 
 Each root has repos/sympy (a Git checkout, .git included) and repos/mpmath.
 Benchmarks (wall time, one warm-up run first, which is not counted):
-  git_status   git status --porcelain in repos/sympy
+  git_status   git status --porcelain in repos/sympy, after one index refresh
   rg           rg -c 'def ' over repos/sympy
   find         find repos/sympy -type f (a metadata walk)
   py_import    python3 -c 'import sympy' with the checkout on PYTHONPATH (bytecode cached by
@@ -73,6 +73,12 @@ def small_files(root):
 
 benches = [git_status, rg, find, py_import, small_files]
 results = {}
+# Refresh the index's stat data once (it came from the clone on the host), so git_status
+# measures the steady state rather than re-hashing every file. On the drive this writes
+# .git/index by lock file and rename-over.
+for root in roots.values():
+    sh(["git", "-c", "core.fileMode=false", "update-index", "-q", "--refresh"],
+       cwd=f"{root}/repos/sympy", ok=(0, 1))
 for b in benches:
     for label, root in roots.items():
         b(root)  # warm-up

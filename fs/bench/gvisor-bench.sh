@@ -12,7 +12,6 @@ bin=$here/../target/release/agent-drive-fs
 runs=${1:-7}
 rootfs=/tmp/a2-gv/rootfs
 out=/tmp/a2-gv/bench-work
-export GVISOR_SIDECAR_BINARIES_DIR=${GVISOR_SIDECAR_BINARIES_DIR:-/tmp/a2-gv/gvisor-bin}
 runsc=(runsc --root /tmp/a2-runsc --network=none)
 daemons=()
 mnts=()
