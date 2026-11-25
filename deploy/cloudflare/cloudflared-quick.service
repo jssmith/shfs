@@ -1,0 +1,21 @@
+[Unit]
+Description=Cloudflare quick tunnel for a first Agent Drive test (random trycloudflare.com address)
+After=network-online.target agent-drive.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=true
+# The address is printed in the journal: journalctl -u cloudflared-quick | grep trycloudflare
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --url http://localhost:8787
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+# Not enabled by setup.sh: start it by hand for a test, and set
+# AGENT_DRIVE_PUBLIC_URL to the address it prints, then restart agent-drive.
+[Install]
+WantedBy=multi-user.target

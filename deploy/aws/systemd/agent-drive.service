@@ -1,0 +1,28 @@
+[Unit]
+Description=Agent Drive server (MCP, OAuth, app) on localhost
+Documentation=https://github.com/jssmith/agent-drive
+After=network-online.target local-fs.target
+Wants=network-online.target ollama.service
+RequiresMountsFor=@AGENT_DRIVE_DATA@
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/agent-drive/agent-drive.env
+WorkingDirectory=@AGENT_DRIVE_REPO@
+ExecStart=/usr/local/bin/agent-drive serve
+Restart=on-failure
+RestartSec=3
+# Runs as root for now: runsc needs it to create sandboxes (rootless is a later check).
+User=root
+# Session sandboxes are runsc children; stop them with the server.
+KillMode=control-group
+TimeoutStopSec=30
+LimitNOFILE=1048576
+# Basic hardening that does not get in runsc's way.
+ProtectHome=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+# Common npm packages installed globally in the sandbox image.
+typescript
+tsx
+@types/node
+prettier
+eslint
+pnpm
+zod
+lodash
+date-fns
+marked
+yaml
+csv-parse
+csv-stringify
+cheerio
+better-sqlite3
+vitest

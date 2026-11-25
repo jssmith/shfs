@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Agent Drive development VM. One EC2 instance with nested virtualization, no
+  inbound rules, Session Manager for administration, an encrypted 200 GB gp3
+  data volume (XFS with reflink, formatted by setup.sh), nightly snapshots.
+  Synthetic data only.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: m8i.2xlarge
+    AllowedValues: [m8i.2xlarge, c8i.2xlarge, r8i.2xlarge, m8i.4xlarge]
+    Description: 8 vCPU / 32 GB by default. C8i/M8i/R8i support nested virtualization (gVisor's KVM platform).
+  NestedVirtualization:
+    Type: String
+    Default: enabled
+    AllowedValues: [enabled, disabled]
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Ubuntu 24.04 LTS, resolved from Canonical's public SSM parameter at deploy time.
+  RootVolumeSize:
+    Type: Number
+    Default: 40
+    MinValue: 20
+  DataVolumeSize:
+    Type: Number
+    Default: 200
+    MinValue: 50
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+  SubnetCidr:
+    Type: String
+    Default: 10.42.1.0/24
+  RepoUrl:
+    Type: String
+    Default: https://github.com/jssmith/agent-drive.git
+  RepoRef:
+    Type: String
+    Default: main
+    Description: Branch, tag or commit for setup.sh.
+  PublicUrl:
+    Type: String
+    Default: ""
+    Description: The tunnel's HTTPS address (AGENT_DRIVE_PUBLIC_URL); can be set later on the VM.
+  RunSetup:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Run deploy/aws/setup.sh from user data on first boot.
+  SnapshotRetainCount:
+    Type: Number
+    Default: 7
+
+Resources:
+  # --- Network: a public subnet for outbound only. The security group has no
+  # inbound rules, so nothing reaches the instance from outside; Session Manager
+  # and cloudflared both connect outbound.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: agent-drive, Value: dev }, { Key: Name, Value: agent-drive-dev }]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: agent-drive, Value: dev }]
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway }
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref SubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: agent-drive, Value: dev }, { Key: Name, Value: agent-drive-dev }]
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: agent-drive, Value: dev }]
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties: { RouteTableId: !Ref RouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway }
+  SubnetRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref Subnet, RouteTableId: !Ref RouteTable }
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Agent Drive dev VM. No inbound rules; all outbound.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0, Description: "outbound: packages, SSM, Cloudflare tunnel" }
+      Tags: [{ Key: agent-drive, Value: dev }]
+
+  # --- Identity for the instance: Session Manager only.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub agent-drive-dev-instance-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags: [{ Key: agent-drive, Value: dev }]
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub agent-drive-dev-instance-${AWS::Region}
+      Roles: [!Ref InstanceRole]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: agent-drive-dev
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags: [{ Key: agent-drive, Value: dev }]
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        CpuOptions:
+          NestedVirtualization: !Ref NestedVirtualization
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs: { VolumeSize: !Ref RootVolumeSize, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: agent-drive, Value: dev }, { Key: Name, Value: agent-drive-dev }]
+          - ResourceType: volume
+            Tags: [{ Key: agent-drive, Value: dev }]
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref Subnet
+      SecurityGroupIds: [!Ref SecurityGroup]
+      Tags: [{ Key: agent-drive, Value: dev }, { Key: Name, Value: agent-drive-dev }]
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            # First boot: write setup.env, check out the repository, run setup.sh.
+            set -euo pipefail
+            exec > >(tee -a /var/log/agent-drive-setup.log) 2>&1
+            mkdir -p /etc/agent-drive
+            cat > /etc/agent-drive/setup.env <<'EOF'
+            DATA_VOLUME_ID=${DataVolume}
+            AGENT_DRIVE_MOUNT=/srv/agent-drive
+            AGENT_DRIVE_DATA=/srv/agent-drive/data
+            AGENT_DRIVE_PUBLIC_URL=${PublicUrl}
+            EOF
+            [ "${RunSetup}" = "true" ] || exit 0
+            apt-get update -q && apt-get install -y -q git
+            if [ ! -d /opt/agent-drive/.git ]; then git clone ${RepoUrl} /opt/agent-drive; fi
+            git -C /opt/agent-drive fetch -q origin ${RepoRef} && git -C /opt/agent-drive checkout -q FETCH_HEAD
+            /opt/agent-drive/deploy/aws/setup.sh
+          - { DataVolume: !Ref DataVolume }
+
+  # --- The data volume, separate from the instance so the VM can be rebuilt
+  # around it. Snapshot on stack deletion.
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Size: !Ref DataVolumeSize
+      VolumeType: gp3
+      Iops: 3000
+      Throughput: 250
+      Encrypted: true
+      Tags:
+        - { Key: agent-drive, Value: dev }
+        - { Key: agent-drive-backup, Value: nightly }
+        - { Key: Name, Value: agent-drive-dev-data }
+  DataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      InstanceId: !Ref Instance
+      VolumeId: !Ref DataVolume
+      Device: /dev/sdf
+
+  # --- Nightly snapshots of the data volume (Data Lifecycle Manager).
+  SnapshotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub agent-drive-dev-dlm-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: dlm.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole
+      Tags: [{ Key: agent-drive, Value: dev }]
+  SnapshotPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Properties:
+      Description: Agent Drive dev data volume nightly
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt SnapshotRole.Arn
+      PolicyDetails:
+        ResourceTypes: [VOLUME]
+        TargetTags: [{ Key: agent-drive-backup, Value: nightly }]
+        Schedules:
+          - Name: nightly
+            CreateRule: { Interval: 24, IntervalUnit: HOURS, Times: ["03:00"] }
+            RetainRule: { Count: !Ref SnapshotRetainCount }
+            CopyTags: true
+            TagsToAdd: [{ Key: agent-drive, Value: dev }]
+      Tags: [{ Key: agent-drive, Value: dev }]
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  DataVolumeId:
+    Value: !Ref DataVolume
+  SessionCommand:
+    Description: Shell on the VM through Session Manager (needs the Session Manager plugin).
+    Value: !Sub aws ssm start-session --target ${Instance} --region ${AWS::Region}
+  SetupLog:
+    Description: Follow the first-boot setup.
+    Value: !Sub >-
+      aws ssm send-command --instance-ids ${Instance} --document-name AWS-RunShellScript
+      --parameters commands='tail -n 50 /var/log/agent-drive-setup.log' --region ${AWS::Region}

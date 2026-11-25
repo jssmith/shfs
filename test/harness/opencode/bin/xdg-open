@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stand-in for xdg-open while OpenCode signs in to an MCP server: instead of a
+# person's browser, headless Chromium completes the sign-in page, and the browser
+# lands on OpenCode's own callback listener (127.0.0.1:19876).
+here="$(cd "$(dirname "$0")" && pwd)"
+log="${OC_HOME:-/tmp/a3-data/opencode}/browser-login.log"
+exec node "$here/../../client/browser-login.ts" "$1" >> "$log" 2>&1
