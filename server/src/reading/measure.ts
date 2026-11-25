@@ -45,12 +45,12 @@ const pct = (n: number, d: number) => (d ? `${((100 * n) / d).toFixed(1)}%` : 'n
 
 interface Row { path: string; ex: Extraction & { ms: number }; opinion?: ModelOpinion | null }
 
-function evaluate(items: Item[], rows: Map<string, Row>, label: string, withModel: boolean, outDir: string) {
+function evaluate(items: Item[], rows: Map<string, Row>, label: string, withModel: boolean, outDir: string, policy: { modelClears?: boolean } = {}) {
   const results = new Map<string, RingResult>();
   for (const it of items) {
     const row = rows.get(it.path)!;
     const input = { text: row.ex.text, name: it.path, mime: it.mime, source: 'upload', batchLabels: [], extraction: row.ex };
-    results.set(it.path, decide(input, ruleSignals({ text: input.text, name: input.name }), withModel ? row.opinion ?? null : null));
+    results.set(it.path, decide(input, ruleSignals({ text: input.text, name: input.name }), withModel ? row.opinion ?? null : null, policy));
   }
   const lines: string[] = [];
   lines.push(`\n### ${label}\n`);
@@ -201,6 +201,9 @@ async function main() {
     const b = evaluate(items, rows, `Rules and model ${model}`, true, cache);
     out.push(b.text);
     summaries.model = b.summary;
+    const c = evaluate(items, rows, `Rules and model ${model}, model may settle weak rule uncertainty`, true, cache, { modelClears: true });
+    out.push(c.text);
+    summaries.modelClears = c.summary;
     const mms = items.map((i) => rows.get(i.path)!.opinion?.ms ?? 0).filter((x) => x > 0).sort((x, y) => x - y);
     if (mms.length) out.push(`\nModel time per item: median ${(mms[Math.floor(mms.length / 2)]! / 1000).toFixed(1)} s, p90 ${(mms[Math.floor(mms.length * 0.9)]! / 1000).toFixed(1)} s (${mms.length} items, one at a time).`);
   }

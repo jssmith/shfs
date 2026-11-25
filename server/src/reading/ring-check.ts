@@ -29,11 +29,13 @@ export interface RingCheckOptions {
   modelAssign?: number;
   modelUncertain?: number;
   minOcrConfidence?: number;
+  /** Policy option, off by default: a confident "none" from the model settles an item that rules found only weakly suspicious (never credentials, never unreadable). */
+  modelClears?: boolean;
   /** Receives the model's raw opinion (for measurement). */
   onModel?: (opinion: ModelOpinion | null) => void;
 }
 
-export const DEFAULTS = { ruleAssign: 0.7, ruleUncertain: 0.5, modelAssign: 0.8, modelUncertain: 0.6, minOcrConfidence: 0.45 };
+export const DEFAULTS = { ruleAssign: 0.7, ruleUncertain: 0.5, modelAssign: 0.8, modelUncertain: 0.6, minOcrConfidence: 0.45, modelClears: false };
 
 /** Noisy-OR of the signals for each ring. */
 export function ruleScores(signals: Signal[]): Record<Ring, number> {
@@ -81,7 +83,12 @@ export function decide(input: RingCheckInput, signals: Signal[], opinion: ModelO
     uncertain = true;
     reasons.push({ ring: 'unknown', source: 'rule', detail: 'no readable text' });
   } else if (rings.size === 0 && unsure.size > 0) {
-    uncertain = true;
+    const ruleOnly = [...unsure].every((r) => r !== 'ring:credentials' && !(opinion?.scores[r] ?? 0));
+    if (t.modelClears && ruleOnly && (opinion?.none ?? 0) >= 0.9 && !lowOcr) {
+      reasons.push({ ring: 'none', source: 'model', detail: 'weak rule signals; model is confident the item is ordinary' });
+    } else {
+      uncertain = true;
+    }
   } else if (unsure.has('ring:credentials')) {
     uncertain = true; // credentials are never released, so a possible credential always goes to the person
   } else if (rings.size === 0 && lowOcr) {

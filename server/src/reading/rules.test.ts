@@ -126,6 +126,17 @@ describe('decide', () => {
     expect(unsure).toMatchObject({ rings: [], uncertain: true });
   });
 
+  test('with modelClears, a confident "none" settles weak rule suspicion but never credentials or unreadable text', () => {
+    const text = 'Five ways to cut bank fees. Check your statement. An IBAN transfer may be cheaper. Keep a balance.';
+    const signals = ruleSignals({ text, name: 'x' });
+    const none = { scores: {}, none: 0.9, ms: 1 };
+    expect(decide({ ...base, text }, signals, none).uncertain).toBe(true);
+    expect(decide({ ...base, text }, signals, none, { modelClears: true }).uncertain).toBe(false);
+    const weakCredential = [{ ring: 'ring:credentials' as const, score: 0.6, rule: 'seed-phrase-weak', detail: '9/12' }];
+    expect(decide({ ...base, text }, weakCredential, none, { modelClears: true }).uncertain).toBe(true);
+    expect(decide({ ...base, text: '' }, [], none, { modelClears: true }).uncertain).toBe(true);
+  });
+
   test('a model failure never clears an item', async () => {
     const failing = { name: 'broken', classify: async () => { throw new Error('down'); } };
     const r = await ringCheck({ ...base, text: 'a perfectly ordinary note about the garden' }, { model: failing });
