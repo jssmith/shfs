@@ -83,6 +83,11 @@ test('packages close together form a turn; a gap starts a new one; a turn undoes
   expect(second!.packages.map((p) => p.summary_claimed)).toEqual(['write /drive/notes/a.md', 'write /drive/notes/c.md']);
   expect(first!.packages.map((p) => p.summary_claimed)).toEqual(['write /drive/notes/b.md', 'write /drive/notes/a.md']);
   expect(second!.turn_id).not.toBe(first!.turn_id);
+  // The files each turn changed, oldest change first, for the session page.
+  expect(s.turns.map((t: { files: unknown }) => t.files)).toEqual([
+    [{ path: 'notes/c.md', ops: ['create'] }, { path: 'notes/a.md', ops: ['update'] }],
+    [{ path: 'notes/a.md', ops: ['update'] }, { path: 'notes/b.md', ops: ['create'] }],
+  ]);
 
   // Undoing the first turn: b goes; a was changed again in the second turn, so it is left and reported.
   const u1 = await app.post('/api/app/undo-turn', { turn_id: first!.turn_id });
