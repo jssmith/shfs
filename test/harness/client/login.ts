@@ -69,7 +69,7 @@ export async function loginWithBrowser(authorizationUrl: string, opts: LoginOpti
     await page.goto(authorizationUrl, { timeout: opts.timeoutMs ?? 30_000 });
     if (!callback) {
       const userField = page.locator(USER_SEL).first();
-      if (await userField.count()) await userField.fill(opts.user);
+      if (await userField.isVisible()) await userField.fill(opts.user);
       await page.locator(PASS_SEL).first().fill(opts.password);
       if (opts.screenshot) await page.screenshot({ path: opts.screenshot });
       await page.locator(SUBMIT_SEL).first().click();
@@ -101,7 +101,7 @@ export async function completeInBrowser(authorizationUrl: string, creds: Credent
     await page.goto(authorizationUrl, { timeout: timeoutMs });
     if (new URL(page.url()).origin === authOrigin) {
       const userField = page.locator(USER_SEL).first();
-      if (await userField.count()) await userField.fill(creds.user);
+      if (await userField.isVisible()) await userField.fill(creds.user);
       await page.locator(PASS_SEL).first().fill(creds.password);
       await page.locator(SUBMIT_SEL).first().click();
       await page.waitForURL((u: URL) => u.origin !== authOrigin, { timeout: timeoutMs, waitUntil: 'load' });
@@ -145,9 +145,12 @@ export async function loginWithForm(authorizationUrl: string, opts: LoginOptions
       if (!name) continue;
       const type = (attr(input, 'type') ?? 'text').toLowerCase();
       if (type === 'password') body.set(name, opts.password);
-      else if (/^(username|user|email)$/i.test(name)) body.set(name, opts.user);
+      else if (/^(username|user|email)$/i.test(name) && !attr(input, 'value')) body.set(name, opts.user);
       else body.set(name, attr(input, 'value') ?? '');
     }
+    // A named submit button (e.g. action=allow) is sent as the browser would: the first one.
+    const button = form.match(/<button\b[^>]*>/gi)?.find((b) => (attr(b, 'type') ?? 'submit').toLowerCase() === 'submit' && attr(b, 'name'));
+    if (button) body.set(attr(button, 'name')!, attr(button, 'value') ?? '');
     url = action;
     res = await fetch(action, {
       method: (attr(formTag, 'method') ?? 'post').toUpperCase(),

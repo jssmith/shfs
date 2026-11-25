@@ -66,7 +66,7 @@ export class RunscSandbox implements Sandbox {
       process: {
         user: { uid: 0, gid: 0 },
         args: ['sleep', 'infinity'],
-        env: ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'TERM=xterm', 'HOME=/work', 'LANG=C.UTF-8'],
+        env: ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'TERM=xterm', 'HOME=/work', 'LANG=C.UTF-8', 'PYTHONDONTWRITEBYTECODE=1'],
         cwd: '/drive',
         capabilities: { bounding: caps, effective: caps, inheritable: caps, permitted: caps },
         rlimits: [{ type: 'RLIMIT_NOFILE', hard: 4096, soft: 4096 }],

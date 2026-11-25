@@ -23,7 +23,7 @@ const { values } = parseArgs({
     'owui-url': { type: 'string', default: process.env.OWUI_URL ?? 'http://localhost:9310' },
     'mcp-url': { type: 'string', default: process.env.AGENT_DRIVE_MCP_URL ?? 'http://localhost:9301/mcp' },
     'server-id': { type: 'string', default: 'drive' },
-    chat: { type: 'string' },
+    chat: { type: 'string', multiple: true, default: [] },
     model: { type: 'string', default: process.env.OWUI_MODEL ?? 'accounts/fireworks/models/kimi-k3' },
     screenshot: { type: 'string' },
   },
@@ -91,7 +91,7 @@ try {
   const driveOrigin = new URL(mcpUrl).origin;
   if (new URL(page.url()).origin === driveOrigin) {
     const user = page.locator(USER_SEL).first();
-    if (await user.count()) await user.fill(process.env.AGENT_DRIVE_TEST_USER ?? 'test');
+    if (await user.isVisible()) await user.fill(process.env.AGENT_DRIVE_TEST_USER ?? 'test');
     await page.locator(PASS_SEL).first().fill(process.env.AGENT_DRIVE_TEST_PASSWORD ?? 'test-password');
     await page.locator(SUBMIT_SEL).first().click();
     await page.waitForURL((u: URL) => u.origin === new URL(owui).origin, { timeout: 30_000 });
@@ -105,42 +105,54 @@ try {
 // 5. Tools as Open WebUI sees them; then one chat.
 const tools = await api('/api/v1/tools/', token);
 report.tools = (Array.isArray(tools) ? tools : []).map((t: any) => t.id);
-if (values.chat) {
-  // Open WebUI runs the tool loop only for a saved chat processed in the
-  // background (chat_id + session_id + message id), the way its own page does;
-  // a bare /api/chat/completions call returns the model's tool call unexecuted.
-  const t0 = Date.now();
-  const userId = crypto.randomUUID(), asstId = crypto.randomUUID();
-  const now = Math.floor(Date.now() / 1000);
-  const userMsg = { id: userId, parentId: null, childrenIds: [asstId], role: 'user', content: values.chat, timestamp: now, models: [values.model] };
-  const asstMsg = { id: asstId, parentId: userId, childrenIds: [], role: 'assistant', content: '', model: values.model, done: false, timestamp: now };
-  const chat = await api('/api/v1/chats/new', token, {
-    body: { chat: { title: 'harness tool call', models: [values.model], messages: [userMsg, asstMsg], history: { currentId: asstId, messages: { [userId]: userMsg, [asstId]: asstMsg } } } },
-  });
-  const started = await api('/api/chat/completions', token, {
-    body: {
-      model: values.model, stream: true,
-      messages: [{ role: 'user', content: values.chat }],
-      tool_ids: [`server:mcp:${serverId}`],
-      params: { function_calling: 'native' },
-      chat_id: chat.id, id: asstId, session_id: 'a3-harness', user_message: userMsg, parent_id: userId,
-    },
-  });
-  let message: any;
-  for (let i = 0; i < 120; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    const c = await api(`/api/v1/chats/${chat.id}`, token);
-    message = c.chat?.history?.messages?.[asstId];
-    if (message?.done) break;
+// One chat, one or more turns (--chat repeated). Open WebUI runs the tool loop
+// only for a saved chat processed in the background (chat_id + session_id +
+// message id), the way its own page does; a bare /api/chat/completions call
+// returns the model's tool call unexecuted. Earlier assistant turns are sent
+// with their `output` items (tool calls and results), which Open WebUI expands
+// back into the history the model sees, as its page does.
+const turns: Record<string, unknown>[] = [];
+if (values.chat.length) {
+  const history: Record<string, any> = {};
+  const sent: Record<string, unknown>[] = [];
+  let chatId: string | undefined;
+  let parent: string | null = null;
+  for (const prompt of values.chat) {
+    const t0 = Date.now();
+    const userId = crypto.randomUUID(), asstId = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+    const userMsg = { id: userId, parentId: parent, childrenIds: [asstId], role: 'user', content: prompt, timestamp: now, models: [values.model] };
+    const asstMsg = { id: asstId, parentId: userId, childrenIds: [], role: 'assistant', content: '', model: values.model, done: false, timestamp: now };
+    if (parent) history[parent].childrenIds = [userId];
+    history[userId] = userMsg; history[asstId] = asstMsg;
+    const chatBody = { title: 'harness chat', models: [values.model], history: { currentId: asstId, messages: history } };
+    if (!chatId) chatId = (await api('/api/v1/chats/new', token, { body: { chat: chatBody } })).id;
+    else await api(`/api/v1/chats/${chatId}`, token, { body: { chat: chatBody } });
+    sent.push({ role: 'user', content: prompt });
+    const started = await api('/api/chat/completions', token, {
+      body: {
+        model: values.model, stream: true, messages: sent,
+        tool_ids: [`server:mcp:${serverId}`], params: { function_calling: 'native' },
+        chat_id: chatId, id: asstId, session_id: 'a3-harness', user_message: userMsg, parent_id: userId,
+      },
+    });
+    let message: any;
+    for (let i = 0; i < 180; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      message = (await api(`/api/v1/chats/${chatId}`, token)).chat?.history?.messages?.[asstId];
+      if (message?.done) break;
+    }
+    history[asstId] = message ?? asstMsg;
+    sent.push({ role: 'assistant', content: message?.content ?? '', ...(message?.output ? { output: message.output } : {}) });
+    parent = asstId;
+    turns.push({ prompt, ms: Date.now() - t0, chatId, started, done: message?.done ?? false, content: message?.content, output: message?.output, error: message?.error, usage: message?.usage });
   }
-  report.chat = {
-    ms: Date.now() - t0, model: values.model, chatId: chat.id, started,
-    done: message?.done ?? false, content: message?.content, output: message?.output, error: message?.error,
-  };
+  report.model = values.model;
+  report.turns = turns;
 }
 console.log(JSON.stringify(report, null, 2));
-if (values.chat) {
-  const out = ((report.chat as { output?: { type: string; status?: string; tool_type?: string }[] }).output ?? []);
+if (turns.length) {
+  const out = (turns[0]!.output as { type: string; status?: string; tool_type?: string }[] | undefined) ?? [];
   const called = out.some((o) => o.type === 'function_call' && o.status === 'completed' && o.tool_type === 'mcp');
-  if (!called) { console.error('no completed MCP tool call in the chat'); process.exit(1); }
+  if (!called) { console.error('no completed MCP tool call in the first turn'); process.exit(1); }
 }

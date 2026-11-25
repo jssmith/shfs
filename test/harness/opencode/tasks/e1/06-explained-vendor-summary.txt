@@ -1,0 +1,3 @@
+My files are in Agent Drive, which you reach through the drive MCP tools. First call start_session with a one-line purpose and keep the session_id it returns; pass that session_id to every other drive tool. Read get_skill once. The files are under /drive in the session; use run for shell commands there.
+
+Task: from the October expenses CSV, total the spending per vendor and save it as a Markdown table in a new file vendor-totals.md next to the CSV. When the file is written, call finish with a one-sentence summary so the change is merged into my drive.
