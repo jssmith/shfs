@@ -280,6 +280,46 @@ export class Sessions {
     }
   }
 
+  /**
+   * The other half of live visibility, for the person's own changes (a held
+   * item released, an undo that restores an item): an item that became
+   * reachable joins the view of every open session at once. A session that
+   * already sees the item, or has its own file at that path, is left as it
+   * is; it gets the item at its next rebase. Takes each session's lock, so a
+   * running command finishes first.
+   */
+  async reveal(item_id: string): Promise<string[]> {
+    const shown: string[] = [];
+    if (!this.drive.reachable(item_id)) return shown;
+    const rows = all<SessionRow>(this.drive.db, "SELECT * FROM sessions WHERE status IN ('open', 'needs_resolution')");
+    for (const row of rows) {
+      if (this.lifecycle(row) === 'expired') continue;
+      await this.lock.run(row.dir_id, async () => {
+        const v = this.drive.reachable(item_id);
+        if (!v) return;
+        const db = this.drive.db;
+        if (get(db, 'SELECT 1 FROM session_view WHERE dir_id = ? AND (item_id = ? OR path = ?)', row.dir_id, item_id, v.path)) return;
+        if (get(db, 'SELECT 1 FROM session_base WHERE dir_id = ? AND (item_id = ? OR path = ?)', row.dir_id, item_id, v.path)) return;
+        const d = this.dirs(row.dir_id);
+        if ((await safeHash(d.upper, v.path)) !== null) return;
+        await safeWrite(d.upper, v.path, await this.drive.blobs.get(v.blob_hash));
+        tx(db, () => {
+          run(db, "INSERT INTO session_view (dir_id, path, kind, item_id, version, target, writable) VALUES (?, ?, 'file', ?, ?, NULL, 1)", row.dir_id, v.path, item_id, v.version);
+          run(db, 'INSERT INTO session_base (dir_id, path, item_id, version, blob_hash) VALUES (?, ?, ?, ?, ?)', row.dir_id, v.path, item_id, v.version, v.blob_hash);
+          this.bumpEpoch(row.dir_id);
+        });
+        shown.push(row.dir_id);
+      });
+    }
+    return shown;
+  }
+
+  /** After a change by the person: hide what is no longer reachable, show what now is. */
+  async syncVisibility(item_id: string): Promise<void> {
+    await this.applyVisibility(item_id);
+    await this.reveal(item_id);
+  }
+
   // ---------- tools ----------
 
   summary(dir_id: string): { files: number; top: Record<string, number>; hidden: Record<string, number>; topics: string[] } {

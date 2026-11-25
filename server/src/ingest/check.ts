@@ -130,7 +130,8 @@ export class JobRunner {
       run(drive.db, "UPDATE item_versions SET ring_check = 'done', rings = ? WHERE item_id = ? AND version = ?", JSON.stringify(res.rings), item_id, version);
       run(drive.db, 'INSERT OR REPLACE INTO extracted_text (item_id, version, method, confidence, text) VALUES (?, ?, ?, ?, ?)', item_id, version, res.extracted.method, res.extracted.confidence, res.extracted.text);
       drive.reindex(item_id);
-      drive.activity({ actor: 'drive', op: 'ring_check', item_id, detail: { version, rings: res.rings, reasons: res.reasons.map((r) => ({ ring: r.ring, source: r.source })) } });
+      // The reasons' details (masked by the rules) are for the person's held-items review (ingest/held.ts); activity is owner-only.
+      drive.activity({ actor: 'drive', op: 'ring_check', item_id, detail: { version, rings: res.rings, reasons: res.reasons.map((r) => ({ ring: r.ring, source: r.source, detail: r.detail.slice(0, 200) })), method: res.extracted.method, confidence: res.extracted.confidence } });
     });
   }
 }
