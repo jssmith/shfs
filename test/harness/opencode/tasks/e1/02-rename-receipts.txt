@@ -1,0 +1,1 @@
+In my drive, rename the receipt files so each one is called YYYY-MM-DD-vendor.md, using the date and the vendor written inside it (lowercase, hyphens for spaces).
