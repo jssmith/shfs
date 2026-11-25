@@ -52,6 +52,16 @@ Parameters:
   SnapshotRetainCount:
     Type: Number
     Default: 7
+  PipelineStackName:
+    Type: String
+    Default: agent-drive-pipeline
+    Description: >-
+      The deployment pipeline stack (deploy/aws/pipeline.yaml), whose exports name the
+      artifact bucket and the signing key. Empty: no release access (the VM can still
+      be set up from a checkout).
+
+Conditions:
+  HasPipeline: !Not [!Equals [!Ref PipelineStackName, ""]]
 
 Resources:
   # --- Network: a public subnet for outbound only. The security group has no
@@ -114,6 +124,27 @@ Resources:
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
       Tags: [{ Key: agent-drive, Value: dev }]
+  # Releases: read them (releases/* only) and check their signature. The
+  # deploy runs from the SSM document AgentDrive-Deploy (pipeline stack).
+  ReleaseReadPolicy:
+    Type: AWS::IAM::RolePolicy
+    Condition: HasPipeline
+    Properties:
+      RoleName: !Ref InstanceRole
+      PolicyName: agent-drive-releases
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadReleases
+            Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub
+              - "${Bucket}/releases/*"
+              - Bucket: { "Fn::ImportValue": !Sub "${PipelineStackName}-ArtifactBucketArn" }
+          - Sid: VerifyReleaseSignatures
+            Effect: Allow
+            Action: [kms:GetPublicKey, kms:Verify]
+            Resource: { "Fn::ImportValue": !Sub "${PipelineStackName}-SigningKeyArn" }
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
