@@ -1,0 +1,588 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Agent Drive deployment pipeline (stack agent-drive-pipeline). CodeBuild builds
+  and tests every push to main through a CodeConnections GitHub connection,
+  signs a versioned release with a KMS key, stores it in S3 and deploys it to
+  instances tagged agent-drive=dev through the fixed SSM document
+  AgentDrive-Deploy. See deploy/aws/PIPELINE.md.
+
+Parameters:
+  RepositoryUrl:
+    Type: String
+    Default: https://github.com/jssmith/agent-drive
+  Branch:
+    Type: String
+    Default: main
+    AllowedPattern: "^[A-Za-z0-9._/-]+$"
+  Webhook:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Build on every push to the branch. Leave false until the connection is
+      AVAILABLE (CodeBuild cannot create the webhook through a PENDING
+      connection), then update the stack with true.
+  ComputeType:
+    Type: String
+    Default: BUILD_GENERAL1_LARGE
+    AllowedValues: [BUILD_GENERAL1_MEDIUM, BUILD_GENERAL1_LARGE, BUILD_GENERAL1_XLARGE]
+    Description: LARGE is 8 vCPU / 15 GB; the suite, the sandbox image build and the gVisor tests fit in it.
+  BuildImage:
+    Type: String
+    Default: aws/codebuild/standard:7.0
+    Description: The current CodeBuild standard Ubuntu image (x86_64). Node 22 is installed by the build itself.
+  DeployTagValue:
+    Type: String
+    Default: dev
+    AllowedValues: [dev]
+    Description: Instances tagged agent-drive=<this> receive the deploy. Only dev for now.
+  VmInstanceRoleName:
+    Type: String
+    Default: ""
+    Description: >-
+      The drive VM's instance role, which may read the signing public key.
+      Empty means agent-drive-dev-instance-<region>, the role the agent-drive-dev stack creates.
+
+Conditions:
+  WebhookOn: !Equals [!Ref Webhook, "true"]
+  DefaultVmRole: !Equals [!Ref VmInstanceRoleName, ""]
+
+Resources:
+  # --- GitHub access. Created PENDING; completed once by hand in the console
+  # (Developer Tools > Settings > Connections > agent-drive-github > Update
+  # pending connection), which installs the AWS Connector GitHub App on
+  # jssmith/agent-drive only. AWS holds the access; no token is stored here.
+  GitHubConnection:
+    Type: AWS::CodeConnections::Connection
+    Properties:
+      ConnectionName: agent-drive-github
+      ProviderType: GitHub
+      Tags: [{ Key: agent-drive, Value: pipeline }]
+
+  # --- Releases: releases/<version>/{release.tar.zst,manifest.json,manifest.sig}.
+  # SSE-S3: releases are built from a public repository and hold no secrets;
+  # integrity comes from the KMS signature, not from the bucket's encryption, and
+  # SSE-S3 keeps every reader free of extra KMS permissions.
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub agent-drive-artifacts-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-noncurrent-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 90 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+      Tags: [{ Key: agent-drive, Value: pipeline }]
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  # --- Release signing. The private key never leaves KMS; only the build role
+  # may sign (the explicit Deny keeps even account administrators from signing).
+  SigningKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Agent Drive release signing (manifest.json of each release)
+      KeySpec: ECC_NIST_P256
+      KeyUsage: SIGN_VERIFY
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: BuildRoleSigns
+            Effect: Allow
+            Principal: { AWS: !GetAtt BuildRole.Arn }
+            Action: kms:Sign
+            Resource: "*"
+            Condition: { StringEquals: { "kms:SigningAlgorithm": ECDSA_SHA_256 } }
+          - Sid: OnlyTheBuildRoleSigns
+            Effect: Deny
+            Principal: "*"
+            Action: kms:Sign
+            Resource: "*"
+            Condition: { ArnNotEquals: { "aws:PrincipalArn": !GetAtt BuildRole.Arn } }
+          - Sid: VerifyReleases
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt BuildRole.Arn
+                - !If
+                  - DefaultVmRole
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agent-drive-dev-instance-${AWS::Region}"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${VmInstanceRoleName}"
+            Action: [kms:GetPublicKey, kms:Verify]
+            Resource: "*"
+      Tags: [{ Key: agent-drive, Value: pipeline }]
+  SigningKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/agent-drive-release-signing
+      TargetKeyId: !Ref SigningKey
+
+  # --- Build.
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: /aws/codebuild/agent-drive-build
+      RetentionInDays: 30
+      Tags: [{ Key: agent-drive, Value: pipeline }]
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub agent-drive-build-${AWS::Region}
+      Description: CodeBuild service role for agent-drive-build. Its permissions are in BuildPolicy.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/agent-drive-build" }
+      Tags: [{ Key: agent-drive, Value: pipeline }]
+
+  # A separate policy resource: it names the signing key, whose key policy
+  # names the role, so the role itself cannot hold it without a cycle.
+  BuildPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref BuildRole
+      PolicyName: agent-drive-build
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: UseTheGitHubConnection
+            Effect: Allow
+            Action:
+              - codeconnections:UseConnection
+              - codeconnections:GetConnection
+              - codeconnections:GetConnectionToken
+            Resource: !GetAtt GitHubConnection.ConnectionArn
+          - Sid: WriteBuildLogs
+            Effect: Allow
+            Action: [logs:CreateLogStream, logs:PutLogEvents]
+            Resource: !GetAtt BuildLogGroup.Arn
+          - Sid: WriteNewReleasesOnly
+            Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub "${ArtifactBucket.Arn}/releases/*"
+            # Only conditional puts (If-None-Match: *), so a release is never overwritten.
+            Condition: { "Null": { "s3:if-none-match": "false" } }
+          - Sid: ReadReleases
+            Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub "${ArtifactBucket.Arn}/releases/*"
+          - Sid: SignAndCheckReleases
+            Effect: Allow
+            Action: [kms:Sign, kms:GetPublicKey, kms:Verify]
+            Resource: !GetAtt SigningKey.Arn
+          - Sid: RunTheDeployDocument
+            Effect: Allow
+            Action: ssm:SendCommand
+            Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${DeployDocument}"
+          - Sid: OnDevInstancesOnly
+            Effect: Allow
+            Action: ssm:SendCommand
+            Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+            Condition: { StringEquals: { "ssm:resourceTag/agent-drive": !Ref DeployTagValue } }
+          - Sid: FollowTheDeploy
+            Effect: Allow
+            # These two have no resource-level permissions.
+            Action: [ssm:GetCommandInvocation, ssm:ListCommandInvocations]
+            Resource: "*"
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: BuildPolicy
+    Properties:
+      Name: agent-drive-build
+      Description: Test, package, sign and deploy Agent Drive (buildspec.yml in the repository)
+      ServiceRole: !GetAtt BuildRole.Arn
+      Source:
+        Type: GITHUB
+        Location: !Ref RepositoryUrl
+        BuildSpec: buildspec.yml
+        GitCloneDepth: 1
+        ReportBuildStatus: true
+        Auth:
+          Type: CODECONNECTIONS
+          Resource: !GetAtt GitHubConnection.ConnectionArn
+      SourceVersion: !Sub refs/heads/${Branch}
+      Triggers: !If
+        - WebhookOn
+        - Webhook: true
+          FilterGroups:
+            - - { Type: EVENT, Pattern: PUSH }
+              - { Type: HEAD_REF, Pattern: !Sub "^refs/heads/${Branch}$" }
+        - Webhook: false
+      Artifacts: { Type: NO_ARTIFACTS }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref ComputeType
+        Image: !Ref BuildImage
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: ARTIFACT_BUCKET, Value: !Ref ArtifactBucket }
+          - { Name: SIGNING_KEY_ARN, Value: !GetAtt SigningKey.Arn }
+          - { Name: DEPLOY_DOCUMENT, Value: !Ref DeployDocument }
+          - { Name: DEPLOY_TAG_VALUE, Value: !Ref DeployTagValue }
+          - { Name: RELEASE_BRANCH, Value: !Ref Branch }
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED, GroupName: !Ref BuildLogGroup }
+      TimeoutInMinutes: 60
+      QueuedTimeoutInMinutes: 120
+      # One build at a time, so deploys never overlap.
+      ConcurrentBuildLimit: 1
+      Tags: [{ Key: agent-drive, Value: pipeline }]
+
+  # --- The deploy. The caller passes only Version, a git sha; the steps are
+  # fixed here. The script below is deploy/aws/deploy-release.sh, embedded
+  # verbatim (deploy/aws/sync-deploy-document.py writes it; the test checks it),
+  # because the VM must verify a release before running anything from it.
+  DeployDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: AgentDrive-Deploy
+      DocumentType: Command
+      UpdateMethod: NewVersion
+      Content:
+        schemaVersion: "2.2"
+        description: >-
+          Deploy one signed Agent Drive release: verify, unpack, provision if
+          needed, switch, restart, health-check, roll back on failure.
+          Log on the instance: /var/log/agent-drive-deploy.log.
+        parameters:
+          Version:
+            type: String
+            description: The release version (the 40-character git commit sha).
+            allowedPattern: "^[0-9a-f]{40}$"
+        mainSteps:
+          - action: aws:runShellScript
+            name: deployRelease
+            precondition:
+              StringEquals: [platformType, Linux]
+            inputs:
+              timeoutSeconds: "3300"
+              runCommand:
+                - set -eu
+                - install -d -m 0755 /usr/local/sbin
+                - |
+                  cat > /usr/local/sbin/agent-drive-deploy-release.new <<'AGENT_DRIVE_DEPLOY_RELEASE'
+                  #!/usr/bin/env bash
+                  # Deploy one signed release of Agent Drive on this machine. Runs as root, from
+                  # the SSM document AgentDrive-Deploy (deploy/aws/pipeline.yaml embeds this file
+                  # verbatim; deploy/aws/sync-deploy-document.py keeps the two the same).
+                  #
+                  #   deploy-release.sh --version <git sha> --bucket <bucket> --key-id <kms key arn> [--region <region>]
+                  #
+                  # Steps: fetch releases/<version>/manifest.json and manifest.sig (instance
+                  # role), verify the signature with the KMS public key, download the archive and
+                  # check its sha256, unpack to $root/releases/<version>, run the release's
+                  # deploy/aws/setup.sh when its provisioning hash differs from the last applied
+                  # one, point $root/current at the release, restart agent-drive.service, wait
+                  # for /healthz. On a failure after the switch, point current back at the
+                  # previous release, restart, and exit non-zero. Keeps the last $KEEP releases.
+                  #
+                  # Nothing here is secret and nothing secret is printed: the instance role's
+                  # credentials stay inside the AWS CLI.
+                  #
+                  # Knobs (environment; the defaults are the real machine's, the test overrides them):
+                  #   DEPLOY_ROOT      /opt/agent-drive              releases/ and current live here
+                  #   DEPLOY_STATE     /var/lib/agent-drive/deploy   applied provisioning hash, history
+                  #   DEPLOY_LOG       /var/log/agent-drive-deploy.log
+                  #   HEALTH_URL       http://127.0.0.1:8787/healthz
+                  #   HEALTH_TIMEOUT   180 (seconds)     HEALTH_INTERVAL 2
+                  #   KEEP             5
+                  #   DEPLOY_UNIT      agent-drive.service
+                  set -euo pipefail
+                  umask 022
+                  export PATH="$PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+                  export HOME="${HOME:-/root}"
+
+                  root="${DEPLOY_ROOT:-/opt/agent-drive}"
+                  state="${DEPLOY_STATE:-/var/lib/agent-drive/deploy}"
+                  logfile="${DEPLOY_LOG:-/var/log/agent-drive-deploy.log}"
+                  health_url="${HEALTH_URL:-http://127.0.0.1:8787/healthz}"
+                  health_timeout="${HEALTH_TIMEOUT:-180}"
+                  health_interval="${HEALTH_INTERVAL:-2}"
+                  keep="${KEEP:-5}"
+                  unit="${DEPLOY_UNIT:-agent-drive.service}"
+
+                  version="" bucket="" key_id="" region="${AWS_REGION:-}"
+                  while [ $# -gt 0 ]; do
+                    case "$1" in
+                      --version) version="${2:-}"; shift 2 ;;
+                      --bucket) bucket="${2:-}"; shift 2 ;;
+                      --key-id) key_id="${2:-}"; shift 2 ;;
+                      --region) region="${2:-}"; shift 2 ;;
+                      *) echo "unknown argument: $1" >&2; exit 2 ;;
+                    esac
+                  done
+
+                  [[ "$version" =~ ^[0-9a-f]{40}$ ]] || { echo "version must be a 40-character git sha, got '$version'" >&2; exit 2; }
+                  [[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || { echo "bad or missing --bucket" >&2; exit 2; }
+                  [ -n "$key_id" ] || { echo "missing --key-id" >&2; exit 2; }
+                  [ "$(id -u)" = 0 ] || [ -n "${DEPLOY_ALLOW_NONROOT:-}" ] || { echo "run as root" >&2; exit 1; }
+
+                  mkdir -p "$root/releases" "$state" "$(dirname "$logfile")"
+                  exec > >(tee -a "$logfile") 2>&1
+
+                  # One deploy at a time.
+                  exec 9>"$state/lock"
+                  flock -w 600 9 || { echo "another deploy is running" >&2; exit 1; }
+
+                  log() { printf '%s [deploy %s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${version:0:12}" "$*"; }
+                  fail() { log "FAILED: $*"; exit 1; }
+                  aws_() { if [ -n "$region" ]; then aws --region "$region" "$@"; else aws "$@"; fi; }
+
+                  # --- tools this script needs; the VM may have nothing beyond the Ubuntu image.
+                  ensure_tools() {
+                    local missing=()
+                    for t in zstd jq curl openssl flock sha256sum; do command -v "$t" >/dev/null || missing+=("$t"); done
+                    if [ ${#missing[@]} -gt 0 ]; then
+                      log "installing ${missing[*]}"
+                      export DEBIAN_FRONTEND=noninteractive
+                      apt-get update -q && apt-get install -y -q --no-install-recommends zstd jq curl openssl util-linux coreutils
+                    fi
+                    if ! command -v aws >/dev/null; then
+                      # The AWS CLI v2 snap, published by AWS; snapd verifies its signature.
+                      log "installing the AWS CLI (snap aws-cli)"
+                      snap install aws-cli --classic
+                    fi
+                  }
+
+                  # --- download and verify -----------------------------------------------------
+                  tmp=""
+                  switched=0 previous="" release_dir=""
+                  cleanup() {
+                    local rc=$?
+                    set +e
+                    if [ "$rc" != 0 ] && [ "$switched" = 1 ]; then rollback; fi
+                    [ -n "$tmp" ] && rm -rf "$tmp"
+                    if [ "$rc" = 0 ]; then log "done: $(readlink "$root/current")"; else log "exit $rc"; fi
+                    exit "$rc"
+                  }
+                  trap cleanup EXIT
+
+                  fetch() { # key dest
+                    aws_ s3api get-object --bucket "$bucket" --key "releases/$version/$1" "$2" >/dev/null \
+                      || fail "cannot fetch s3://$bucket/releases/$version/$1"
+                  }
+
+                  verify_manifest() {
+                    fetch manifest.json "$tmp/manifest.json"
+                    fetch manifest.sig "$tmp/manifest.sig"
+                    aws_ kms get-public-key --key-id "$key_id" --query PublicKey --output text > "$tmp/pub.b64" \
+                      || fail "cannot read the release signing public key"
+                    base64 -d "$tmp/pub.b64" > "$tmp/pub.der" || fail "public key is not base64"
+                    openssl pkey -pubin -inform DER -in "$tmp/pub.der" -out "$tmp/pub.pem" 2>/dev/null || fail "public key unreadable"
+                    # KMS signed the SHA-256 digest of manifest.json (MessageType DIGEST,
+                    # ECDSA_SHA_256, DER signature); openssl dgst -verify checks exactly that.
+                    openssl dgst -sha256 -verify "$tmp/pub.pem" -signature "$tmp/manifest.sig" "$tmp/manifest.json" >/dev/null 2>&1 \
+                      || fail "manifest signature does not verify; refusing release"
+                    log "manifest signature verified"
+                    jq -e . "$tmp/manifest.json" >/dev/null || fail "manifest is not JSON"
+                    [ "$(jq -r .format "$tmp/manifest.json")" = 1 ] || fail "unknown manifest format"
+                    # A signed manifest for another version, copied under this path, is refused.
+                    [ "$(jq -r .version "$tmp/manifest.json")" = "$version" ] || fail "manifest is for version $(jq -r .version "$tmp/manifest.json")"
+                  }
+
+                  fetch_archive() {
+                    local name want got
+                    name=$(jq -r .archive.name "$tmp/manifest.json")
+                    want=$(jq -r .archive.sha256 "$tmp/manifest.json")
+                    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || fail "bad archive name in manifest"
+                    [[ "$want" =~ ^[0-9a-f]{64}$ ]] || fail "bad archive sha256 in manifest"
+                    fetch "$name" "$tmp/$name"
+                    got=$(sha256sum "$tmp/$name" | cut -d' ' -f1)
+                    [ "$got" = "$want" ] || fail "archive sha256 $got does not match the manifest's $want; refusing release"
+                    log "archive sha256 ok ($(du -h "$tmp/$name" | cut -f1))"
+                    archive="$tmp/$name"
+                  }
+
+                  unpack() {
+                    release_dir="$root/releases/$version"
+                    if [ "$(readlink "$root/current" 2>/dev/null || true)" = "releases/$version" ]; then
+                      log "release is already current; restarting it"
+                      return
+                    fi
+                    local stage="$root/releases/.$version.new"
+                    rm -rf "$stage" && mkdir -p "$stage"
+                    tar --zstd -xf "$archive" -C "$stage" --no-same-owner || fail "cannot unpack archive"
+                    cp "$tmp/manifest.json" "$stage/manifest.json"
+                    [ -f "$stage/deploy/aws/setup.sh" ] || fail "release has no deploy/aws/setup.sh"
+                    [ "$(sha256sum "$stage/deploy/aws/setup.sh" | cut -d' ' -f1)" = "$(jq -r .setup_sha256 "$tmp/manifest.json")" ] \
+                      || fail "setup.sh does not match the manifest"
+                    rm -rf "$release_dir"
+                    mv "$stage" "$release_dir"
+                    log "unpacked to $release_dir"
+                  }
+
+                  # --- provisioning: setup.sh only when what it installs changed ---------------
+                  provision() {
+                    local want have=""
+                    want=$(jq -r .provision_sha256 "$tmp/manifest.json")
+                    [ -f "$state/provision.sha256" ] && have=$(cat "$state/provision.sha256")
+                    if [ "$want" = "$have" ]; then
+                      log "provisioning unchanged ($want); setup.sh not run"
+                      return
+                    fi
+                    log "provisioning changed (${have:-none} -> $want); running setup.sh"
+                    AGENT_DRIVE_HOME="$root/current" bash "$release_dir/deploy/aws/setup.sh" || fail "setup.sh failed"
+                    echo "$want" > "$state/provision.sha256.new" && mv "$state/provision.sha256.new" "$state/provision.sha256"
+                    log "setup.sh done"
+                  }
+
+                  # --- switch, restart, check ------------------------------------------------------
+                  point_current_at() { # target relative to $root, or "" to remove
+                    if [ -z "$1" ]; then rm -f "$root/current"; return; fi
+                    ln -sfn "$1" "$root/current.new"
+                    mv -Tf "$root/current.new" "$root/current"
+                  }
+
+                  restart() {
+                    systemctl daemon-reload
+                    systemctl restart "$unit"
+                  }
+
+                  healthy() {
+                    local deadline=$((SECONDS + health_timeout)) body
+                    while [ "$SECONDS" -lt "$deadline" ]; do
+                      if body=$(curl -fsS -m 5 "$health_url" 2>/dev/null) && jq -e '.ok == true' >/dev/null 2>&1 <<<"$body"; then
+                        systemctl is-active --quiet "$unit" && return 0
+                      fi
+                      sleep "$health_interval"
+                    done
+                    return 1
+                  }
+
+                  rollback() {
+                    log "rolling back to ${previous:-nothing}"
+                    point_current_at "$previous"
+                    switched=0
+                    if [ -n "$previous" ]; then
+                      restart || log "restart after rollback failed"
+                      if healthy; then log "rolled back; $previous is healthy"; else log "rolled back, but $previous is not healthy either"; fi
+                    else
+                      systemctl stop "$unit" || true
+                    fi
+                    # The failed release is not kept (it is not the current one any more).
+                    [ -n "$release_dir" ] && [ "releases/$version" != "$previous" ] && rm -rf "$release_dir"
+                  }
+
+                  prune() {
+                    local cur n=0 v
+                    cur=$(readlink "$root/current")
+                    # Newest first by the time each release was last deployed (touched below).
+                    while read -r v; do
+                      n=$((n + 1))
+                      if [ "$n" -gt "$keep" ] && [ "releases/$v" != "$cur" ]; then
+                        log "pruning release $v"
+                        rm -rf "${root:?}/releases/$v"
+                      fi
+                    done < <(find "$root/releases" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9a-f]{40}' -printf '%T@ %f\n' | sort -rn | cut -d' ' -f2)
+                  }
+
+                  main() {
+                    log "deploying s3://$bucket/releases/$version"
+                    ensure_tools
+                    tmp=$(mktemp -d "$root/.deploy.XXXXXX")
+                    verify_manifest
+                    fetch_archive
+                    unpack
+                    provision
+                    previous=$(readlink "$root/current" 2>/dev/null || true)
+                    [ "$previous" = "releases/$version" ] && previous=$(cat "$state/previous" 2>/dev/null || true)
+                    switched=1
+                    point_current_at "releases/$version"
+                    log "current -> releases/$version (previous: ${previous:-none})"
+                    restart || fail "restart of $unit failed"
+                    healthy || fail "$health_url not healthy within ${health_timeout}s"
+                    switched=0
+                    log "healthy"
+                    touch "$release_dir"
+                    [ -n "$previous" ] && [ "$previous" != "releases/$version" ] && echo "$previous" > "$state/previous"
+                    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$version" >> "$state/history"
+                    prune
+                  }
+
+                  main
+                  AGENT_DRIVE_DEPLOY_RELEASE
+                - chmod 0755 /usr/local/sbin/agent-drive-deploy-release.new
+                - mv -f /usr/local/sbin/agent-drive-deploy-release.new /usr/local/sbin/agent-drive-deploy-release
+                - !Sub >-
+                  exec /usr/local/sbin/agent-drive-deploy-release --version '{{ Version }}'
+                  --bucket '${ArtifactBucket}' --key-id '${SigningKey.Arn}' --region '${AWS::Region}'
+      Tags: [{ Key: agent-drive, Value: pipeline }]
+
+Outputs:
+  ConnectionArn:
+    Value: !GetAtt GitHubConnection.ConnectionArn
+  CompleteTheConnection:
+    Description: The connection starts PENDING; complete it once, by hand.
+    Value: !Sub >-
+      Console: Developer Tools > Settings > Connections (${AWS::Region}) > agent-drive-github >
+      Update pending connection > install the AWS Connector for GitHub app on jssmith/agent-drive only
+      (Only select repositories) > Connect. Then update this stack with Webhook=true.
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+    Export: { Name: !Sub "${AWS::StackName}-ArtifactBucketName" }
+  ArtifactBucketArn:
+    Value: !GetAtt ArtifactBucket.Arn
+    Export: { Name: !Sub "${AWS::StackName}-ArtifactBucketArn" }
+  SigningKeyArn:
+    Value: !GetAtt SigningKey.Arn
+    Export: { Name: !Sub "${AWS::StackName}-SigningKeyArn" }
+  DeployDocumentName:
+    Value: !Ref DeployDocument
+    Export: { Name: !Sub "${AWS::StackName}-DeployDocumentName" }
+  BuildProjectName:
+    Value: !Ref BuildProject
+  BuildRoleArn:
+    Value: !GetAtt BuildRole.Arn
+  StartBuild:
+    Description: Build, release and deploy the head of the branch by hand.
+    Value: !Sub >-
+      aws codebuild start-build --project-name ${BuildProject} --region ${AWS::Region}
+      --environment-variables-override name=RELEASE,value=true,type=PLAINTEXT
+  DeployVersion:
+    Description: Deploy (or roll back to) a release that is already in the bucket.
+    Value: !Sub >-
+      aws ssm send-command --document-name ${DeployDocument} --targets Key=tag:agent-drive,Values=${DeployTagValue}
+      --parameters Version=<git sha> --region ${AWS::Region}
