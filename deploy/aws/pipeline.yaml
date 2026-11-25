@@ -49,13 +49,13 @@ Conditions:
 
 Resources:
   # --- GitHub access. Created PENDING; completed once by hand in the console
-  # (Developer Tools > Settings > Connections > agent-drive-github > Update
+  # (Developer Tools > Settings > Connections > agent-drive-github-jssmith > Update
   # pending connection), which installs the AWS Connector GitHub App on
   # jssmith/agent-drive only. AWS holds the access; no token is stored here.
   GitHubConnection:
     Type: AWS::CodeConnections::Connection
     Properties:
-      ConnectionName: agent-drive-github
+      ConnectionName: agent-drive-github-jssmith
       ProviderType: GitHub
       Tags: [{ Key: agent-drive, Value: pipeline }]
 
@@ -557,7 +557,7 @@ Outputs:
   CompleteTheConnection:
     Description: The connection starts PENDING; complete it once, by hand.
     Value: !Sub >-
-      Console: Developer Tools > Settings > Connections (${AWS::Region}) > agent-drive-github >
+      Console: Developer Tools > Settings > Connections (${AWS::Region}) > agent-drive-github-jssmith >
       Update pending connection > install the AWS Connector for GitHub app on jssmith/agent-drive only
       (Only select repositories) > Connect. Then update this stack with Webhook=true.
   ArtifactBucketName:

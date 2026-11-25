@@ -99,7 +99,7 @@ All commands use `--region us-east-2`.
      --parameter-overrides Webhook=false
    ```
 2. **Johann completes the connection.** Console, us-east-2: Developer Tools >
-   Settings > Connections > `agent-drive-github` > *Update pending connection* >
+   Settings > Connections > `agent-drive-github-jssmith` > *Update pending connection* >
    install the AWS Connector for GitHub app on `jssmith/agent-drive` only (*Only
    select repositories*) > *Connect*. Status becomes AVAILABLE.
 3. **Update the VM stack.** Make a change set and read it before running it:
@@ -143,6 +143,8 @@ All commands use `--region us-east-2`.
    If the gVisor suites cannot run in CodeBuild, add
    `name=GVISOR_TESTS,value=skip,type=PLAINTEXT` and report it.
 
+   Choose **Install a new app** and install it on your **personal account** with *Only select repositories* → `agent-drive`. Do not pick an existing installation on an organization (an employer's, for example): the connection would point this AWS account at that organization, and a connection can't change installation once it is Available (it has to be replaced).
+
 ## Deploying or rolling back by hand
 
 Any release still in the bucket can be deployed again, older ones included:
@@ -169,7 +171,7 @@ statement (and `codebuild:StartBuild`, `codebuild:BatchGetBuilds` and
 
 | Can | Resource |
 | --- | --- |
-| `codeconnections:UseConnection`, `GetConnection`, `GetConnectionToken` | the `agent-drive-github` connection |
+| `codeconnections:UseConnection`, `GetConnection`, `GetConnectionToken` | the `agent-drive-github-jssmith` connection |
 | `logs:CreateLogStream`, `logs:PutLogEvents` | log group `/aws/codebuild/agent-drive-build` |
 | `s3:PutObject`, only with `If-None-Match` | `releases/*` in the artifact bucket |
 | `s3:GetObject` | `releases/*` in the artifact bucket |
