@@ -9,7 +9,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { UnauthorizedError, type OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 import type { OAuthClientInformationMixed, OAuthClientMetadata, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
-import { createContext, type Context } from '../../../server/src/context.js';
+import { createContext, type Context, type Surface } from '../../../server/src/context.js';
 import { startHttp, type HttpServer } from '../../../server/src/http.js';
 import { addDevice, setOwnerPassword } from '../../../server/src/auth/owner.js';
 
@@ -26,18 +26,23 @@ export interface Drive {
 
 export const RUNSC = process.env.AGENT_DRIVE_RUNSC;
 export const ROOTFS = process.env.AGENT_DRIVE_ROOTFS;
+/** Shared machines: shift test ports and rename sandboxes (e.g. AGENT_DRIVE_TEST_PORT_OFFSET=100 AGENT_DRIVE_TEST_PREFIX=a5). */
+export const PORT_OFFSET = Number(process.env.AGENT_DRIVE_TEST_PORT_OFFSET ?? 0);
+export const PREFIX = process.env.AGENT_DRIVE_TEST_PREFIX ?? 'a4';
 
-export async function startDrive(port: number): Promise<Drive> {
-  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'a4-e2e-'));
+export async function startDrive(basePort: number, opts: { surface?: Surface } = {}): Promise<Drive> {
+  const port = basePort + PORT_OFFSET;
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), `${PREFIX}-e2e-`));
   const url = `http://127.0.0.1:${port}`;
   const ctx = createContext({
     dataDir,
     port,
     publicUrl: url,
     runsc: RUNSC ?? null,
-    runscRoot: path.join('/run', `a4-e2e-${port}`),
+    runscRoot: path.join('/run', `${PREFIX}-e2e-${port}`),
     rootfs: ROOTFS ?? '',
-    sandboxPrefix: `a4-e2e${port}-`,
+    sandboxPrefix: `${PREFIX}-e2e${port}-`,
+    surface: opts.surface ?? 'v0',
   });
   setOwnerPassword(ctx.drive.db, PASSWORD);
   const deviceToken = addDevice(ctx.drive.db, 'test laptop').token;

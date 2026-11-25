@@ -6,6 +6,12 @@ export interface SandboxSpec {
   driveDir: string; // host directory mounted at /drive
   workDir: string; // host directory mounted at /work
   stateDir: string; // host directory for the bundle and logs
+  /** Host directories mounted read-only (the drive command, the session's socket directory). */
+  readOnlyMounts?: { source: string; destination: string }[];
+  /** Let the sandbox connect to host Unix sockets inside its mounts (runsc --host-uds=open). */
+  hostSockets?: boolean;
+  /** Prepended to PATH, e.g. /opt/drive/bin. */
+  pathPrefix?: string;
 }
 
 export interface ExecResult {
@@ -18,7 +24,7 @@ export interface ExecResult {
 export interface Sandbox {
   /** Create and start the sandbox (idempotent: an existing running sandbox is reused). */
   create(spec: SandboxSpec): Promise<void>;
-  exec(id: string, command: string, opts: { timeoutMs: number; stdin?: string; cwd?: string }): Promise<ExecResult>;
+  exec(id: string, command: string, opts: { timeoutMs: number; stdin?: string; cwd?: string; shell?: 'sh' | 'bash' }): Promise<ExecResult>;
   destroy(id: string): Promise<void>;
   /** Every sandbox this server started that is still around (for cleanup). */
   list(): Promise<string[]>;

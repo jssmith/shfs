@@ -6,11 +6,12 @@ import { createContext, type Context } from './context.js';
 import { ingestUpload } from './ingest/upload.js';
 import { NoExecSandbox } from './sessions/sandbox.js';
 import type { Sandbox } from './sessions/sandbox.js';
+import type { Surface } from './context.js';
 
-export function tempContext(sandbox: Sandbox = new NoExecSandbox()): Context & { dir: string; dispose(): Promise<void> } {
+export function tempContext(sandbox: Sandbox = new NoExecSandbox(), surface: Surface = 'v0'): Context & { dir: string; dispose(): Promise<void> } {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'a4-test-'));
   const ctx = createContext(
-    { dataDir: dir, port: 0, publicUrl: 'http://localhost', runsc: null, runscRoot: path.join(dir, 'runsc'), rootfs: '', sandboxPrefix: 'a4-t-' },
+    { dataDir: dir, port: 0, publicUrl: 'http://localhost', runsc: null, runscRoot: path.join(dir, 'runsc'), rootfs: '', sandboxPrefix: 'a4-t-', surface },
     sandbox,
   );
   return Object.assign(ctx, {

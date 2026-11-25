@@ -52,6 +52,15 @@ function spawnCollect(cmd: string, args: string[], opts: { stdin?: string; timeo
   });
 }
 
+function withPathPrefix(env: string[], prefix: string | undefined): string[] {
+  if (!prefix) return env;
+  const i = env.findIndex((e) => e.startsWith('PATH='));
+  if (i < 0) return [...env, `PATH=${prefix}:${DEFAULT_ENV[0]!.slice(5)}`];
+  const out = [...env];
+  out[i] = `PATH=${prefix}:${env[i]!.slice(5)}`;
+  return out;
+}
+
 export class RunscSandbox implements Sandbox {
   get user(): { uid: number; gid: number } {
     return this.o.image?.user ?? { uid: 0, gid: 0 };
@@ -72,7 +81,7 @@ export class RunscSandbox implements Sandbox {
       process: {
         user: this.user,
         args: ['sleep', 'infinity'],
-        env: this.o.image?.env ?? DEFAULT_ENV,
+        env: withPathPrefix(this.o.image?.env ?? DEFAULT_ENV, spec.pathPrefix),
         cwd: '/drive',
         capabilities: { bounding: caps, effective: caps, inheritable: caps, permitted: caps },
         rlimits: [{ type: 'RLIMIT_NOFILE', hard: 4096, soft: 4096 }],
@@ -88,6 +97,7 @@ export class RunscSandbox implements Sandbox {
         { destination: '/drive', type: 'bind', source: spec.driveDir, options: ['rbind', 'rw'] },
         { destination: '/work', type: 'bind', source: spec.workDir, options: ['rbind', 'rw'] },
         { destination: '/tmp', type: 'tmpfs', source: 'tmpfs', options: ['nosuid', 'nodev', 'size=536870912'] },
+        ...(spec.readOnlyMounts ?? []).map((m) => ({ destination: m.destination, type: 'bind', source: m.source, options: ['rbind', 'ro', 'nosuid', 'nodev'] })),
       ],
       linux: {
         namespaces: [{ type: 'pid' }, { type: 'network' }, { type: 'ipc' }, { type: 'uts' }, { type: 'mount' }],
@@ -121,7 +131,7 @@ export class RunscSandbox implements Sandbox {
       const code = await new Promise<number>((resolve, reject) => {
         const child = spawn(
           this.o.runsc,
-          [...this.base(), '--network=none', '--platform=systrap', '--file-access-mounts=shared', 'run', '-detach', '-bundle', bundle, spec.id],
+          [...this.base(), '--network=none', '--platform=systrap', '--file-access-mounts=shared', ...(spec.hostSockets ? ['--host-uds=open'] : []), 'run', '-detach', '-bundle', bundle, spec.id],
           { stdio: [nullFd, logFd, logFd] },
         );
         child.on('error', reject);
@@ -134,10 +144,12 @@ export class RunscSandbox implements Sandbox {
     }
   }
 
-  async exec(id: string, command: string, opts: { timeoutMs: number; stdin?: string; cwd?: string }): Promise<ExecResult> {
+  async exec(id: string, command: string, opts: { timeoutMs: number; stdin?: string; cwd?: string; shell?: 'sh' | 'bash' }): Promise<ExecResult> {
     const secs = Math.max(1, Math.ceil(opts.timeoutMs / 1000));
     // `timeout` inside the sandbox kills the command; the host-side timer is a backstop.
-    const args = [...this.base(), 'exec', '--cwd', opts.cwd ?? '/drive', id, 'timeout', '-s', 'KILL', String(secs), 'sh', '-c', command];
+    // bash when asked for and the image has it, else sh.
+    const shell = opts.shell === 'bash' ? ['sh', '-c', 'if command -v bash >/dev/null 2>&1; then exec bash -c "$1"; else exec sh -c "$1"; fi', 'sh', command] : ['sh', '-c', command];
+    const args = [...this.base(), 'exec', '--cwd', opts.cwd ?? '/drive', id, 'timeout', '-s', 'KILL', String(secs), ...shell];
     const r = await spawnCollect(this.o.runsc, args, { stdin: opts.stdin, timeoutMs: opts.timeoutMs + 5000 });
     if (r.exitCode === 137 && !r.timedOut) r.timedOut = true;
     return r;

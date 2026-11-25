@@ -8,6 +8,8 @@ import { Sessions } from './sessions/manager.js';
 import { NoExecSandbox, type Sandbox } from './sessions/sandbox.js';
 import { RunscSandbox } from './sessions/runsc.js';
 import { loadImageSettings } from './sessions/image.js';
+import { AutoMerge } from './merge/auto.js';
+import { driveCommands } from './sessions/drive-command.js';
 
 export interface Config {
   dataDir: string;
@@ -17,6 +19,17 @@ export interface Config {
   runscRoot: string;
   rootfs: string;
   sandboxPrefix: string;
+  /** Which MCP surface to offer (AGENT_DRIVE_SURFACE): v0 today's, v1 reworded, v2 shell-first, v3 shell-first minimal. */
+  surface: Surface;
+}
+
+export const SURFACES = ['v0', 'v1', 'v2', 'v3'] as const;
+export type Surface = (typeof SURFACES)[number];
+
+export function parseSurface(v: string | undefined): Surface {
+  const s = (v ?? 'v0').trim() || 'v0';
+  if (!(SURFACES as readonly string[]).includes(s)) throw new Error(`AGENT_DRIVE_SURFACE must be one of ${SURFACES.join(', ')}; got "${s}"`);
+  return s as Surface;
 }
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
@@ -30,6 +43,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     runscRoot: env.AGENT_DRIVE_RUNSC_ROOT ?? path.join(dataDir, 'runsc'),
     rootfs: env.AGENT_DRIVE_ROOTFS ?? path.join(dataDir, 'images', 'default', 'rootfs'),
     sandboxPrefix: env.AGENT_DRIVE_SANDBOX_PREFIX ?? 'ad-',
+    surface: parseSurface(env.AGENT_DRIVE_SURFACE),
   };
 }
 
@@ -38,6 +52,8 @@ export interface Context {
   drive: Drive;
   sessions: Sessions;
   jobs: JobRunner;
+  /** The shell surfaces (v2, v3) only: automatic merge after changing calls. */
+  auto?: AutoMerge;
   close(): Promise<void>;
 }
 
@@ -51,12 +67,20 @@ export function createContext(config: Config, sandbox?: Sandbox): Context {
       : new NoExecSandbox());
   const sessions = new Sessions(drive, path.join(config.dataDir, 'sessions'), sb, config.sandboxPrefix);
   const jobs = new JobRunner(drive, (item_id) => sessions.applyVisibility(item_id));
+  let auto: AutoMerge | undefined;
+  if (config.surface === 'v2' || config.surface === 'v3') {
+    auto = new AutoMerge(sessions);
+    sessions.driveCommand = driveCommands(sessions, auto);
+  }
   return {
     config,
     drive,
     sessions,
     jobs,
+    auto,
     async close() {
+      // Changes still waiting for their automatic merge are merged, not dropped.
+      await auto?.flushAll();
       jobs.stop();
       await sessions.destroyAll();
       await sb.releaseRoot?.();

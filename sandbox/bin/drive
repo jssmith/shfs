@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+# drive: Agent Drive's command inside a session sandbox (v2, v3 surfaces).
+#
+# Mounted read-only at /opt/drive/bin by the server, not built into the image.
+# It sends its arguments to the drive over the session's Unix socket at
+# /run/drive/drive.sock and prints the answer. The socket is the session's
+# own: nothing secret is here, and the server decides everything.
+#   drive search <words> [--all] | drive status | drive save "message" | drive help
+import json
+import socket
+import sys
+
+SOCK = "/run/drive/drive.sock"
+
+
+def main() -> int:
+    req = (json.dumps({"argv": sys.argv[1:]}) + "\n").encode()
+    if len(req) > 64 * 1024:
+        print("drive: arguments too long", file=sys.stderr)
+        return 2
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(600)
+        s.connect(SOCK)
+        s.sendall(req)
+        s.shutdown(socket.SHUT_WR)
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+    except OSError as e:
+        print(f"drive: cannot reach the drive ({e.strerror or e}); try again in a moment", file=sys.stderr)
+        return 69
+    try:
+        r = json.loads(buf.decode("utf-8"))
+    except ValueError:
+        print("drive: unexpected answer from the drive", file=sys.stderr)
+        return 70
+    sys.stdout.write(r.get("stdout", ""))
+    sys.stderr.write(r.get("stderr", ""))
+    return int(r.get("exit", 1))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
