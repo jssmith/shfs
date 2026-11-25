@@ -28,7 +28,7 @@ aws organizations list-create-account-status --states SUCCEEDED   # note the Acc
 
 Optional but recommended: move it to an organizational unit `Development` and
 attach a service control policy that only allows the regions you use (e.g.
-`us-east-1`), so a mistake cannot start instances elsewhere.
+`us-east-2`), so a mistake cannot start instances elsewhere.
 
 ## 2. Budget alert
 
@@ -140,8 +140,8 @@ role* to `OrganizationAccountAccessRole` in the dev account), then, in the
 region you use:
 
 ```sh
-aws ec2 enable-ebs-encryption-by-default --region us-east-1
-aws ec2 get-ebs-encryption-by-default --region us-east-1
+aws ec2 enable-ebs-encryption-by-default --region us-east-2
+aws ec2 get-ebs-encryption-by-default --region us-east-2
 ```
 
 The template encrypts its volumes anyway; this covers anything made by hand.
@@ -152,13 +152,13 @@ Still as administrator in the dev account (the stack creates the instance role,
 which the `AgentDriveDev` identity may not):
 
 ```sh
-aws cloudformation deploy --region us-east-1 \
+aws cloudformation deploy --region us-east-2 \
   --stack-name agent-drive-dev \
   --template-file deploy/aws/dev-vm.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
   --tags agent-drive=dev \
   --parameter-overrides RepoRef=main
-aws cloudformation describe-stacks --stack-name agent-drive-dev --region us-east-1 \
+aws cloudformation describe-stacks --stack-name agent-drive-dev --region us-east-2 \
   --query 'Stacks[0].Outputs'
 ```
 
