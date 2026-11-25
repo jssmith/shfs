@@ -135,5 +135,7 @@ export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoin
     throw e;
   }
   await s.materialise(dir_id);
+  // An item this merge placed behind a ring leaves every other session's view at once.
+  for (const op of ops) await s.applyVisibility(op.item_id);
   return { ok: true, pkg_id: applied.pkg_id, state_id: applied.state_id, changes: report, conflicts: [], withheld };
 }

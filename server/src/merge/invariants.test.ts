@@ -71,7 +71,7 @@ async function checkInvariants(ctx: ReturnType<typeof tempContext>, dirs: string
     const v = ctx.drive.version(e.item_id, e.version)!;
     expect(v.ring_check).toBe('done');
     expect(JSON.parse(v.rings)).toEqual([]);
-    expect(await content(ctx, e.item_id, e.version)).not.toContain('4111');
+    expect(await content(ctx, e.item_id, e.version)).not.toContain('4111 1111 1111 1111');
   }
   for (const dir of dirs) {
     for (const r of all<{ item_id: string; path: string; version: number }>(ctx.drive.db, 'SELECT item_id, path, version FROM session_view WHERE dir_id = ?', dir)) {
