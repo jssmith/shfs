@@ -11,6 +11,7 @@ import { newId, newSessionId, now, secretHash, SESSION_ID_RE } from '../util/ids
 import { KeyedMutex } from '../util/mutex.js';
 import type { Sandbox } from './sandbox.js';
 import { isToolCache } from '../merge/ignore.js';
+import { chownTree } from './image.js';
 
 export const OUTPUT_CAP = 64 * 1024;
 export const READ_CAP = 256 * 1024;
@@ -194,6 +195,12 @@ export class Sessions {
     return this.lock.run(dir_id, async () => {
       const d = this.dirs(dir_id);
       const id = this.sandboxId(dir_id);
+      // A non-root sandbox user must own what the host wrote into /drive and /work.
+      const u = this.sandbox.user;
+      if (u && u.uid !== 0) {
+        await chownTree(d.upper, u.uid, u.gid);
+        await chownTree(d.work, u.uid, u.gid);
+      }
       await this.sandbox.create({ id, driveDir: d.upper, workDir: d.work, stateDir: d.state });
       const t0 = Date.now();
       const r = await this.sandbox.exec(id, command, { timeoutMs: timeoutSec * 1000 });

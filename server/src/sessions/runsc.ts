@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { mkdirSync, openSync, closeSync, writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import type { ExecResult, Sandbox, SandboxSpec } from './sandbox.js';
+import { DEFAULT_ENV, type ImageSettings } from './image.js';
 
 export interface RunscOptions {
   runsc: string; // path to the runsc binary
@@ -11,6 +12,7 @@ export interface RunscOptions {
   rootfs: string; // read-only root file system directory (never modified)
   prefix: string; // sandbox name prefix, e.g. 'ad-'
   memoryBytes?: number;
+  image?: ImageSettings; // env and user from image.json (sessions/image.ts)
 }
 
 const MAX_CAPTURE = 16 * 1024 * 1024;
@@ -51,6 +53,10 @@ function spawnCollect(cmd: string, args: string[], opts: { stdin?: string; timeo
 }
 
 export class RunscSandbox implements Sandbox {
+  get user(): { uid: number; gid: number } {
+    return this.o.image?.user ?? { uid: 0, gid: 0 };
+  }
+
   constructor(private o: RunscOptions) {
     mkdirSync(o.stateRoot, { recursive: true });
   }
@@ -64,9 +70,9 @@ export class RunscSandbox implements Sandbox {
     return {
       ociVersion: '1.0.0',
       process: {
-        user: { uid: 0, gid: 0 },
+        user: this.user,
         args: ['sleep', 'infinity'],
-        env: ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'TERM=xterm', 'HOME=/work', 'LANG=C.UTF-8', 'PYTHONDONTWRITEBYTECODE=1'],
+        env: this.o.image?.env ?? DEFAULT_ENV,
         cwd: '/drive',
         capabilities: { bounding: caps, effective: caps, inheritable: caps, permitted: caps },
         rlimits: [{ type: 'RLIMIT_NOFILE', hard: 4096, soft: 4096 }],
