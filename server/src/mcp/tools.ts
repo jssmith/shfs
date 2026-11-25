@@ -216,9 +216,23 @@ export function buildMcpServer(ctx: Context): McpServer {
       const r = await sessions.lock.run(row.dir_id, () => mergeSession(sessions, row.dir_id, kind, summary));
       run(db, 'UPDATE session_meta SET summary_last = ? WHERE dir_id = ?', summary, row.dir_id);
       if (!r.ok) {
-        if (kind === 'finish') run(db, "UPDATE sessions SET status = 'needs_resolution' WHERE dir_id = ?", row.dir_id);
-        return fail('merge_conflict', `nothing was merged. ${r.conflicts.map((c) => `${c.path}: ${c.reason}`).join('; ')}`, { conflicts: r.conflicts });
+        const list = r.conflicts.map((c) => `${c.path}: ${c.reason}${c.yours ? ` (your version is saved at ${c.yours})` : ''}`).join('; ');
+        const next =
+          'Each conflicting file in /drive now holds the drive\'s current version (or is gone, if it left the drive); your version is saved under /work/conflicts/. ' +
+          'Redo your change on top of the file in /drive, then merge again.';
+        if (kind === 'finish') {
+          run(db, "UPDATE sessions SET status = 'needs_resolution' WHERE dir_id = ?", row.dir_id);
+          return fail(
+            'merge_conflict',
+            `nothing was merged and the session is NOT finished: it is still open (status needs_resolution). ${list}. ${next} ` +
+              'Then call finish(session_id, summary) again with the same session_id; your other changes are still in /drive and merge with it. ' +
+              'resume_session(session_id) shows what is unmerged.',
+            { conflicts: r.conflicts, status: 'needs_resolution' },
+          );
+        }
+        return fail('merge_conflict', `nothing was merged. ${list}. ${next} Then call checkpoint again.`, { conflicts: r.conflicts });
       }
+      if (kind === 'checkpoint' && row.status === 'needs_resolution') run(db, "UPDATE sessions SET status = 'open' WHERE dir_id = ?", row.dir_id);
       if (kind === 'finish') {
         run(db, "UPDATE sessions SET status = 'finished' WHERE dir_id = ?", row.dir_id);
         await sessions.destroySandbox(row.dir_id);

@@ -3,10 +3,10 @@
 import path from 'node:path';
 import { checkContent } from '../ingest/check.js';
 import { mimeFor } from '../ingest/check.js';
-import { tx } from '../store/db.js';
+import { run, tx } from '../store/db.js';
 import { PreconditionError, type NewVersion, type Op } from '../store/drive.js';
 import type { Sessions } from '../sessions/manager.js';
-import { safeRead, walkFiles } from '../util/fsafe.js';
+import { safeRead, safeRemove, safeWrite, walkFiles } from '../util/fsafe.js';
 import { newId } from '../util/ids.js';
 import { isToolCache } from './ignore.js';
 
@@ -66,6 +66,49 @@ export async function diffWithIgnored(s: Sessions, dir_id: string): Promise<{ ch
   return { changes, ignored };
 }
 
+interface ConflictRef { item_id: string; agentPath: string | null; basePath: string | null }
+
+/**
+ * After a failed merge, make each conflicting item mergeable on the next try:
+ * the session's version moves to /work/conflicts/<path>, and /drive gets the
+ * drive's current version of that item (or loses it, if the session can no
+ * longer see it), with the session's base updated to match. The shared drive
+ * is not touched. The agent redoes its change on top and merges again.
+ */
+async function refreshConflicted(s: Sessions, dir_id: string, refs: ConflictRef[], conflicts: { path: string; reason: string; yours?: string }[]): Promise<void> {
+  const d = s.dirs(dir_id);
+  const db = s.drive.db;
+  for (const [i, r] of refs.entries()) {
+    if (r.agentPath) {
+      const mine = await safeRead(d.upper, r.agentPath);
+      if (mine) {
+        await safeWrite(d.work, `conflicts/${r.agentPath}`, mine.data);
+        await safeRemove(d.upper, r.agentPath);
+        conflicts[i]!.yours = `/work/conflicts/${r.agentPath}`;
+      }
+    }
+    const now = s.drive.reachable(r.item_id);
+    tx(db, () => {
+      run(db, 'DELETE FROM session_base WHERE dir_id = ? AND item_id = ?', dir_id, r.item_id);
+      run(db, 'DELETE FROM session_view WHERE dir_id = ? AND item_id = ?', dir_id, r.item_id);
+      if (now) {
+        run(db, 'INSERT OR REPLACE INTO session_base (dir_id, path, item_id, version, blob_hash) VALUES (?, ?, ?, ?, ?)', dir_id, now.path, r.item_id, now.version, now.blob_hash);
+        run(db, "INSERT OR REPLACE INTO session_view (dir_id, path, kind, item_id, version, target, writable) VALUES (?, ?, 'file', ?, ?, NULL, 1)", dir_id, now.path, r.item_id, now.version);
+      }
+      s.bumpEpoch(dir_id);
+    });
+    if (now) {
+      // Never overwrite other work of the session's that sits at that path.
+      const there = await safeRead(d.upper, now.path);
+      if (there && now.path !== r.agentPath) {
+        await safeWrite(d.work, `conflicts/${now.path}`, there.data);
+        conflicts.push({ path: now.path, reason: 'the drive\'s version of a conflicting item now sits at this path', yours: `/work/conflicts/${now.path}` });
+      }
+      await safeWrite(d.upper, now.path, await s.drive.blobs.get(now.blob_hash));
+    }
+  }
+}
+
 /** `dir/name (2).ext`, the first such path no live item and no reserved path uses. */
 function freeSibling(drive: Sessions['drive'], p: string, reserved: Set<string>): string {
   const slash = p.lastIndexOf('/');
@@ -85,7 +128,8 @@ export interface MergeResult {
   pkg_id?: string;
   state_id?: string;
   changes: { kind: string; path: string; from_path?: string }[];
-  conflicts: { path: string; reason: string }[];
+  /** `yours`: where the session's own version of a conflicting file was saved. */
+  conflicts: { path: string; reason: string; yours?: string }[];
   /** Paths the session wrote whose new content the ring check placed behind a ring or held. */
   withheld: { path: string; rings: string[] }[];
   /** Tool caches in the working copy that were not merged (merge/ignore.ts). */
@@ -108,7 +152,8 @@ export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoin
   }
 
   // Conflicts: an item changed since the base, or a create onto a taken path.
-  const conflicts: { path: string; reason: string }[] = [];
+  const conflicts: { path: string; reason: string; yours?: string }[] = [];
+  const refs: ConflictRef[] = [];
   const freed = new Set<string>();
   for (const c of changes) {
     if (!c.item_id) continue;
@@ -116,6 +161,7 @@ export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoin
     const basePath = c.kind === 'move' ? c.from_path! : c.path;
     if (!t || t.state !== 'live' || t.version !== c.base_version || t.path !== basePath) {
       conflicts.push({ path: basePath, reason: 'changed in the drive since this session last checkpointed' });
+      refs.push({ item_id: c.item_id, agentPath: c.kind === 'archive' ? null : c.path, basePath });
     } else if (c.kind === 'move' || c.kind === 'archive') freed.add(basePath);
   }
   // A create or move onto a path held by an item the agent can see is a
@@ -130,14 +176,20 @@ export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoin
     if (c.kind !== 'create' && c.kind !== 'move') continue;
     const at = drive.liveItemAt(c.path);
     if (!at || freed.has(c.path)) continue;
-    if (drive.reachable(at.item_id)) conflicts.push({ path: c.path, reason: 'path_taken: another item is at this path in the drive' });
+    if (drive.reachable(at.item_id)) {
+      conflicts.push({ path: c.path, reason: 'path_taken: another item is at this path in the drive' });
+      refs.push({ item_id: at.item_id, agentPath: c.path, basePath: null });
+    }
     else {
       const to = freeSibling(drive, c.path, reserved);
       reserved.add(to);
       aside.push({ op: 'move', item_id: at.item_id, from_path: c.path, path: to });
     }
   }
-  if (conflicts.length) return { ok: false, changes: report, conflicts, withheld: [], ignored };
+  if (conflicts.length) {
+    await refreshConflicted(s, dir_id, refs, conflicts);
+    return { ok: false, changes: report, conflicts, withheld: [], ignored };
+  }
 
   // New versions: store blobs and run the ring check before the transaction.
   const d = s.dirs(dir_id);
