@@ -20,6 +20,6 @@ Agent Drive: one owned home for a person's files and context, with a computer at
 
 ## The shared machine
 
-Several agents may share one workspace. Use your assigned port range and name prefix for servers, sandboxes and containers; keep scratch files under your own scratch directory; unmount and stop what you start. Docker, if needed, may have to be started: `dockerd` as a background process. gVisor's `runsc` is not installed system-wide; see `docs/wave-1.md` for where to get it.
+Several agents may share one workspace. Use your assigned port range and name prefix for servers, sandboxes and containers; keep scratch files under your own scratch directory; unmount and stop what you start. Docker, if needed, may have to be started: `dockerd` as a background process. gVisor's `runsc` is at `/usr/local/bin/runsc` with its sidecars in `/usr/local/bin/gvisor-bin/` (the environment's setup script installs both; `sandbox/install-runsc.sh` does the same elsewhere).
 
 When changing `server/src/mcp/tools.ts` or `skill.ts`, update `docs/mcp-tools.md` in the same commit.
