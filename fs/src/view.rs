@@ -1,0 +1,129 @@
+//! The session's view of the store at one epoch: what `session_view` says it may see.
+
+use std::collections::{BTreeMap, HashMap};
+
+use crate::store::ViewRow;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Lower {
+    File {
+        item_id: String,
+        version: i64,
+        blob: String,
+        size: u64,
+        mtime: i64,
+        writable: bool,
+    },
+    Symlink {
+        target: String,
+    },
+    Dir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildKind {
+    File,
+    Symlink,
+    Dir,
+}
+
+#[derive(Debug, Default)]
+pub struct View {
+    pub epoch: i64,
+    /// Files and symlinks by path (no leading slash).
+    pub entries: HashMap<String, Lower>,
+    /// Directory path ("" is the root) to its children.
+    pub dirs: HashMap<String, BTreeMap<String, ChildKind>>,
+}
+
+pub fn parent_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[..i],
+        None => "",
+    }
+}
+
+pub fn join(parent: &str, name: &str) -> String {
+    if parent.is_empty() { name.to_string() } else { format!("{parent}/{name}") }
+}
+
+fn normalise(p: &str) -> Option<String> {
+    let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
+    if parts.is_empty() || parts.contains(&"..") {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+impl View {
+    pub fn build(epoch: i64, rows: Vec<ViewRow>) -> View {
+        let mut v = View { epoch, ..Default::default() };
+        v.dirs.insert(String::new(), BTreeMap::new());
+        for r in rows {
+            let Some(path) = normalise(&r.path) else {
+                log::warn!("skipping bad view path {:?}", r.path);
+                continue;
+            };
+            let (lower, kind) = match r.kind.as_str() {
+                "file" => match (r.item_id, r.version, r.blob_hash, r.size) {
+                    (Some(item_id), Some(version), Some(blob), Some(size)) => (
+                        Lower::File {
+                            item_id,
+                            version,
+                            blob,
+                            size: size.max(0) as u64,
+                            mtime: r.created_at.as_deref().map(crate::time::parse_iso).unwrap_or(0),
+                            writable: r.writable,
+                        },
+                        ChildKind::File,
+                    ),
+                    _ => {
+                        log::warn!("skipping file row without a version: {path}");
+                        continue;
+                    }
+                },
+                "symlink" => match r.target {
+                    Some(target) => (Lower::Symlink { target }, ChildKind::Symlink),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            // Intermediate directories.
+            let mut parent = String::new();
+            let comps: Vec<&str> = path.split('/').collect();
+            let mut clash = false;
+            for c in &comps[..comps.len() - 1] {
+                let child = join(&parent, c);
+                if v.entries.contains_key(&child) {
+                    clash = true;
+                    break;
+                }
+                v.dirs.entry(parent.clone()).or_default().insert(c.to_string(), ChildKind::Dir);
+                v.dirs.entry(child.clone()).or_default();
+                parent = child;
+            }
+            if clash || v.dirs.contains_key(&path) {
+                log::warn!("skipping {path}: a file and a directory share a path");
+                continue;
+            }
+            v.dirs.entry(parent).or_default().insert(comps[comps.len() - 1].to_string(), kind);
+            v.entries.insert(path, lower);
+        }
+        v
+    }
+
+    pub fn get(&self, path: &str) -> Option<Lower> {
+        if self.dirs.contains_key(path) {
+            return Some(Lower::Dir);
+        }
+        self.entries.get(path).cloned()
+    }
+
+    /// Every file and symlink at or under `dir`.
+    pub fn descendants<'a>(&'a self, dir: &'a str) -> impl Iterator<Item = (&'a String, &'a Lower)> {
+        let prefix = format!("{dir}/");
+        self.entries
+            .iter()
+            .filter(move |(p, _)| dir.is_empty() || p.starts_with(&prefix))
+    }
+}
