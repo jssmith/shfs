@@ -76,7 +76,10 @@ export function decide(input: RingCheckInput, signals: Signal[], opinion: ModelO
       }
     }
   }
-  const readable = input.text.replace(/\s/g, '').length >= 15 && input.extraction?.method !== 'none';
+  // Plain text and PDF text layers are read in full, so even a short file is readable. The length test applies
+  // when the text came from OCR, or when the caller didn't say how it was read: little text there means a failed read.
+  const m = input.extraction?.method;
+  const readable = m === 'none' ? false : m === 'plain' || m === 'text-layer' ? true : input.text.replace(/\s/g, '').length >= 15;
   const lowOcr = input.extraction?.method === 'ocr' && input.extraction.confidence < t.minOcrConfidence;
   let uncertain = false;
   if (!readable) {

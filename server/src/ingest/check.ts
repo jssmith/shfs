@@ -31,11 +31,18 @@ export interface CheckResult {
 
 export async function checkContent(drive: Drive, a: { blob_hash: string; mime: string; name: string; source: string; batchLabels: string[] }): Promise<CheckResult> {
   const ex = await extract(drive.blobs.pathOf(a.blob_hash), a.mime, a.name);
-  const rr = await ringCheck({ text: ex.text, name: a.name, mime: a.mime, source: a.source, batchLabels: a.batchLabels });
+  const rr = await ringCheck({ text: ex.text, name: a.name, mime: a.mime, source: a.source, batchLabels: a.batchLabels, extraction: { method: ex.method, confidence: ex.confidence } });
   const rings = new Set(rr.rings);
+  const reasons = [...rr.reasons];
   // Unreadable input is never released unchecked, whatever the module says.
   if (rr.uncertain || ex.method === 'none') rings.add(HELD);
-  return { rings: [...rings].sort(), extracted: { text: ex.text, method: ex.method, confidence: ex.confidence }, reasons: rr.reasons };
+  // Text read by OCR (photos, screenshots, scans) is only as good as the OCR; decision 0002 measured misses there.
+  // Until a vision model and a real sample pass the marks, an OCR item nothing placed in a ring waits for the person.
+  if (ex.method === 'ocr' && rr.rings.length === 0 && !rings.has(HELD)) {
+    rings.add(HELD);
+    reasons.push({ ring: 'unknown', source: 'rule', detail: 'read by OCR and placed in no ring: held until the person clears it (decision 0002)' });
+  }
+  return { rings: [...rings].sort(), extracted: { text: ex.text, method: ex.method, confidence: ex.confidence }, reasons };
 }
 
 export function enqueueCheck(drive: Drive, item_id: string, version: number): void {

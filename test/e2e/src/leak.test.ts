@@ -12,7 +12,7 @@ const haveSandbox = !!(RUNSC && ROOTFS);
 
 // Synthetic markers. Names and contents of hidden items carry them.
 const NAME_MARKERS = ['statement-zebra', 'recovery-zebra', 'scan-zebra'];
-const CONTENT_MARKERS = ['quokkasecret', '4111', 'ALPHA-BRAVO-CHARLIE', 'wombatbinary'];
+const CONTENT_MARKERS = ['quokkasecret', '4539', 'ALPHA-BRAVO-CHARLIE', 'wombatbinary'];
 const ALL = [...NAME_MARKERS, ...CONTENT_MARKERS];
 
 function noMarkers(s: string, markers = ALL): void {
@@ -46,7 +46,7 @@ describe.skipIf(!haveSandbox)('ringed items never reach an agent (needs AGENT_DR
   test('hidden items show up only as counts', async () => {
     const root = path.join(tmp, 'home');
     const files: Record<string, string | Buffer> = {
-      'money/statement-zebra.txt': 'Account statement for a synthetic person. Card 4111 1111 1111 1111. Codeword quokkasecret.\n',
+      'money/statement-zebra.txt': 'Account statement for a synthetic person. Card 4539 1488 0343 6467. Codeword quokkasecret.\n',
       'keys/recovery-zebra.txt': 'Your recovery code is ALPHA-BRAVO-CHARLIE. Keep it safe. quokkasecret\n',
       'scans/scan-zebra.bin': Buffer.concat([Buffer.from([0, 1, 2, 3]), Buffer.from(' wombatbinary quokkasecret ')]),
       'notes/statement-guide.txt': 'How to read a bank statement: look at the totals first.\n',

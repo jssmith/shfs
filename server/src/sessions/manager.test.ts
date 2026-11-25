@@ -54,8 +54,8 @@ test('symlinks planted in the working space never lead the host outside it', asy
 
 test('stub ring rules', async () => {
   const rc = (text: string) => ringCheck({ text, name: 'x.txt', mime: 'text/plain', source: 'upload', batchLabels: [] });
-  expect((await rc('card 4111 1111 1111 1111')).rings).toEqual(['ring:finance']);
-  expect((await rc('number 4111 1111 1111 1112')).rings).toEqual([]); // fails Luhn
+  expect((await rc('card 4539 1488 0343 6467')).rings).toEqual(['ring:finance']);
+  expect((await rc('number 4539 1488 0343 6468')).rings).toEqual([]); // fails Luhn
   expect((await rc('IBAN GB82 WEST 1234 5698 7654 32')).rings).toEqual(['ring:finance']);
   expect((await rc('My Recovery Code: abc')).rings).toEqual(['ring:credentials']);
   expect((await rc('-----BEGIN RSA PRIVATE KEY-----')).rings).toEqual(['ring:credentials']);

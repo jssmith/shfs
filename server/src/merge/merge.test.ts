@@ -13,7 +13,7 @@ afterEach(async () => {
   await ctx.dispose();
 });
 
-const CARD = '4111 1111 1111 1111'; // a well-known test number, Luhn-valid
+const CARD = '4539 1488 0343 6467'; // synthetic, Luhn-valid, not on the rules' list of published test numbers
 
 test('uploads are unreachable until checked, ringed ones stay hidden', async () => {
   await upload(ctx, { 'notes/a.md': '# hello', 'notes/card.txt': `card ${CARD}` }, ['topic:project:demo']);

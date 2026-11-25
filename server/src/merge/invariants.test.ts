@@ -13,7 +13,7 @@ import { trashItem, undoPackage } from './undo.js';
 import { all } from '../store/db.js';
 import type { ItemTriple } from '../store/drive.js';
 
-const CARD = 'card 4111 1111 1111 1111';
+const CARD = 'card 4539 1488 0343 6467';
 const PATHS = ['p/one.txt', 'p/two.txt', 'q/three.txt', 'four.txt', 'p/five.txt'];
 const CONTENTS = ['alpha', 'beta', 'gamma', 'delta', CARD];
 const SESSIONS = 3;
@@ -71,7 +71,7 @@ async function checkInvariants(ctx: ReturnType<typeof tempContext>, dirs: string
     const v = ctx.drive.version(e.item_id, e.version)!;
     expect(v.ring_check).toBe('done');
     expect(JSON.parse(v.rings)).toEqual([]);
-    expect(await content(ctx, e.item_id, e.version)).not.toContain('4111 1111 1111 1111');
+    expect(await content(ctx, e.item_id, e.version)).not.toContain('4539 1488 0343 6467');
   }
   for (const dir of dirs) {
     for (const r of all<{ item_id: string; path: string; version: number }>(ctx.drive.db, 'SELECT item_id, path, version FROM session_view WHERE dir_id = ?', dir)) {
