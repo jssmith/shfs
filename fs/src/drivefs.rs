@@ -31,7 +31,7 @@ use rusqlite::Connection;
 
 use crate::store::{self, ActivityLog, OpenRecord};
 use crate::upper::{Stat, Upper, open_trusted};
-use crate::view::{ChildKind, Lower, View, join, parent_of};
+use crate::view::{ChildKind, DEFAULT_DIR_MODE, Lower, View, join, parent_of};
 
 pub const ROOT_INO: u64 = 1;
 /// The temporary name used for copy-up in each directory of `upper/`; never listed.
@@ -531,11 +531,9 @@ impl DriveFs {
         s.st_gid = self.gid;
         s.st_blksize = 4096;
         let (mode, nlink, size, t) = match l {
-            Lower::File { size, mtime, writable, .. } => {
-                (libc::S_IFREG | if *writable { 0o644 } else { 0o444 }, 1, *size, *mtime)
-            }
+            Lower::File { size, mtime, mode, .. } => (libc::S_IFREG | *mode, 1, *size, *mtime),
             Lower::Symlink { target } => (libc::S_IFLNK | 0o777, 1, target.len() as u64, self.mount_time),
-            Lower::Dir => (libc::S_IFDIR | 0o755, 2, 4096, self.mount_time),
+            Lower::Dir { mode } => (libc::S_IFDIR | *mode, 2, 4096, self.mount_time),
         };
         s.st_mode = mode;
         s.st_nlink = nlink;
@@ -575,16 +573,20 @@ impl DriveFs {
 
     // ---- copy-up ---------------------------------------------------------------------------
 
-    fn ensure_upper_dir(&self, dir: &str) -> io::Result<()> {
-        self.upper.mkdir_all(dir)
+    /// Makes `dir` exist in `upper/`; directories created on the way get the store's mode.
+    fn ensure_upper_dir(&self, st: &State, dir: &str) -> io::Result<()> {
+        self.upper.mkdir_all(dir, &|p| match Self::lower(st, p) {
+            Some(Lower::Dir { mode }) => mode,
+            _ => DEFAULT_DIR_MODE,
+        })
     }
 
     /// Makes `path` exist in `upper/`, copying the item's content unless `content` is false.
-    fn copy_up(&self, path: &str, l: &Lower, content: bool) -> io::Result<()> {
+    fn copy_up(&self, st: &State, path: &str, l: &Lower, content: bool) -> io::Result<()> {
         let dir = parent_of(path);
-        self.ensure_upper_dir(dir)?;
+        self.ensure_upper_dir(st, dir)?;
         match l {
-            Lower::File { blob, mtime, writable, .. } => {
+            Lower::File { blob, mtime, mode, .. } => {
                 // Callers hold the state lock, so one temporary name per directory is enough.
                 // Whatever is at that name (even a symlink) is replaced, never followed.
                 let tmp = join(dir, COPYUP);
@@ -593,7 +595,7 @@ impl DriveFs {
                 if content {
                     io::copy(&mut open_trusted(&store::blob_path(&self.cfg.data, blob))?, &mut f)?;
                 }
-                f.set_permissions(fs::Permissions::from_mode(if *writable { 0o644 } else { 0o444 }))?;
+                f.set_permissions(fs::Permissions::from_mode(*mode))?;
                 if content {
                     let t = std::time::UNIX_EPOCH + Duration::from_secs((*mtime).max(0) as u64);
                     let _ = f.set_modified(t);
@@ -602,28 +604,28 @@ impl DriveFs {
                 self.upper.rename(&tmp, path)?;
             }
             Lower::Symlink { target } => self.upper.symlink(target.as_bytes(), path)?,
-            Lower::Dir => self.upper.mkdir_all(path)?,
+            Lower::Dir { .. } => self.ensure_upper_dir(st, path)?,
         }
         Ok(())
     }
 
     /// Copies a whole lower directory into `upper/`, for a directory rename.
     fn copy_up_tree(&self, st: &State, dir: &str) -> io::Result<()> {
-        self.ensure_upper_dir(dir)?;
+        self.ensure_upper_dir(st, dir)?;
         let view = st.view.clone();
         let mut subdirs: Vec<&String> =
             view.dirs.keys().filter(|d| Self::under(d, dir)).collect();
         subdirs.sort();
         for d in subdirs {
             if Self::lower(st, d).is_some() {
-                self.upper.mkdir_all(d)?;
+                self.ensure_upper_dir(st, d)?;
             }
         }
         for (p, l) in view.descendants(dir) {
             if Self::lower(st, p).is_none() || self.upper.exists(p) {
                 continue;
             }
-            self.copy_up(p, l, true)?;
+            self.copy_up(st, p, l, true)?;
         }
         Ok(())
     }
@@ -634,11 +636,11 @@ impl DriveFs {
         let mut names: BTreeMap<String, ChildKind> = BTreeMap::new();
         let in_upper = match self.resolve(st, dir) {
             Some(Node::Upper(m)) if m.is_dir() => true,
-            Some(Node::Lower(Lower::Dir)) => false,
+            Some(Node::Lower(Lower::Dir { .. })) => false,
             Some(_) => return Err(err(libc::ENOTDIR)),
             None => return Err(err(libc::ENOENT)),
         };
-        if let Some(Lower::Dir) = Self::lower(st, dir) {
+        if let Some(Lower::Dir { .. }) = Self::lower(st, dir) {
             let view = st.view.clone();
             if let Some(children) = view.dirs.get(dir) {
                 for (name, kind) in children {
@@ -711,7 +713,7 @@ impl DriveFs {
                 let file = self.upper.open_file(path, flags as i32 & keep, 0)?;
                 Handle { file, path: path.to_string(), lower_item: None }
             }
-            Node::Lower(Lower::Dir) => return Err(err(libc::EISDIR)),
+            Node::Lower(Lower::Dir { .. }) => return Err(err(libc::EISDIR)),
             Node::Lower(Lower::Symlink { .. }) => return Err(err(libc::ELOOP)),
             Node::Lower(ref l @ Lower::File { ref blob, writable, .. }) => {
                 if wants_write(flags) {
@@ -719,7 +721,7 @@ impl DriveFs {
                         return Err(err(libc::EACCES));
                     }
                     let trunc = flags as i32 & libc::O_TRUNC != 0;
-                    self.copy_up(path, l, !trunc)?;
+                    self.copy_up(st, path, l, !trunc)?;
                     let file = self.upper.open_file(path, flags as i32 & keep, 0)?;
                     Handle { file, path: path.to_string(), lower_item: None }
                 } else {
@@ -829,7 +831,7 @@ impl FileSystem for DriveFs {
                         return Err(err(libc::EACCES));
                     }
                     let content = !(valid.contains(SetattrValid::SIZE) && attr.st_size == 0);
-                    self.copy_up(&path, &l, content)?;
+                    self.copy_up(&st, &path, &l, content)?;
                 }
             }
             path
@@ -860,7 +862,7 @@ impl FileSystem for DriveFs {
         if self.resolve(&st, &path).is_some() {
             return Err(err(libc::EEXIST));
         }
-        self.ensure_upper_dir(&dir)?;
+        self.ensure_upper_dir(&st, &dir)?;
         self.upper.symlink(linkname.to_bytes(), &path)?;
         self.entry_for(&mut st, &path, true)
     }
@@ -886,7 +888,7 @@ impl FileSystem for DriveFs {
         if self.resolve(&st, &path).is_some() {
             return Err(err(libc::EEXIST));
         }
-        self.ensure_upper_dir(&dir)?;
+        self.ensure_upper_dir(&st, &dir)?;
         self.upper.mkdir(&path, 0o700)?;
         self.upper.chmod(&path, mode & !umask & 0o7777)?;
         self.entry_for(&mut st, &path, true)
@@ -899,7 +901,7 @@ impl FileSystem for DriveFs {
         let path = join(&Self::path_of(&st, parent)?, name);
         let had_upper = match self.resolve(&st, &path).ok_or_else(|| err(libc::ENOENT))? {
             Node::Upper(m) if m.is_dir() => return Err(err(libc::EISDIR)),
-            Node::Lower(Lower::Dir) => return Err(err(libc::EISDIR)),
+            Node::Lower(Lower::Dir { .. }) => return Err(err(libc::EISDIR)),
             Node::Upper(_) => {
                 self.upper.unlink(&path)?;
                 true
@@ -924,7 +926,7 @@ impl FileSystem for DriveFs {
         let path = join(&Self::path_of(&st, parent)?, name);
         let upper_dir = match self.resolve(&st, &path).ok_or_else(|| err(libc::ENOENT))? {
             Node::Upper(m) if m.is_dir() => true,
-            Node::Lower(Lower::Dir) => false,
+            Node::Lower(Lower::Dir { .. }) => false,
             _ => return Err(err(libc::ENOTDIR)),
         };
         if !self.is_empty_dir(&mut st, &path)? {
@@ -960,14 +962,14 @@ impl FileSystem for DriveFs {
             return Err(err(libc::EINVAL));
         }
         let src = self.resolve(&st, &old).ok_or_else(|| err(libc::ENOENT))?;
-        let src_dir = matches!(&src, Node::Upper(m) if m.is_dir()) || matches!(src, Node::Lower(Lower::Dir));
+        let src_dir = matches!(&src, Node::Upper(m) if m.is_dir()) || matches!(src, Node::Lower(Lower::Dir { .. }));
         let dst = self.resolve(&st, &new);
         let mut dst_lower_dir = false;
         if let Some(d) = &dst {
             if flags & libc::RENAME_NOREPLACE != 0 {
                 return Err(err(libc::EEXIST));
             }
-            let dst_dir = matches!(d, Node::Upper(m) if m.is_dir()) || matches!(d, Node::Lower(Lower::Dir));
+            let dst_dir = matches!(d, Node::Upper(m) if m.is_dir()) || matches!(d, Node::Lower(Lower::Dir { .. }));
             match (src_dir, dst_dir) {
                 (false, true) => return Err(err(libc::EISDIR)),
                 (true, false) => return Err(err(libc::ENOTDIR)),
@@ -982,12 +984,12 @@ impl FileSystem for DriveFs {
         }
         // Bring the source fully into upper/, then move it there.
         match &src {
-            Node::Lower(Lower::Dir) => self.copy_up_tree(&st, &old)?,
+            Node::Lower(Lower::Dir { .. }) => self.copy_up_tree(&st, &old)?,
             Node::Upper(m) if m.is_dir() => self.copy_up_tree(&st, &old)?,
-            Node::Lower(l) => self.copy_up(&old, l, true)?,
+            Node::Lower(l) => self.copy_up(&st, &old, l, true)?,
             Node::Upper(_) => {}
         }
-        self.ensure_upper_dir(&newparent)?;
+        self.ensure_upper_dir(&st, &newparent)?;
         if dst_lower_dir {
             // The target is an empty merged directory with nothing of its own in upper/.
             let _ = self.upper.rmdir(&new);
@@ -1058,7 +1060,7 @@ impl FileSystem for DriveFs {
         }
         match self.resolve(&st, &dir) {
             Some(Node::Upper(m)) if m.is_dir() => {}
-            Some(Node::Lower(Lower::Dir)) => self.ensure_upper_dir(&dir)?,
+            Some(Node::Lower(Lower::Dir { .. })) => self.ensure_upper_dir(&st, &dir)?,
             _ => return Err(err(libc::ENOENT)),
         }
         let keep = libc::O_ACCMODE | libc::O_APPEND | libc::O_TRUNC;

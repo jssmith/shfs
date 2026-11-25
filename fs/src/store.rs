@@ -90,23 +90,32 @@ pub struct ViewRow {
     pub version: Option<i64>,
     pub target: Option<String>,
     pub writable: bool,
+    /// Permission bits (`session_view.mode`); None for NULL or a store without the column.
+    pub mode: Option<u32>,
     pub blob_hash: Option<String>,
     pub size: Option<i64>,
     pub created_at: Option<String>,
 }
 
-/// Reads the view and its epoch in one read transaction, so they agree.
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut st = conn.prepare_cached("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?;
+    st.exists(params![table, column])
+}
+
+/// Reads the view and its epoch in one read transaction, so they agree. A store whose
+/// `session_view` predates the `mode` column is read as if every mode were NULL.
 pub fn load_view(conn: &mut Connection, dir_id: &str) -> rusqlite::Result<(i64, Vec<ViewRow>)> {
     let tx = conn.transaction()?;
     let ep = epoch(&tx, dir_id)?;
+    let mode = if has_column(&tx, "session_view", "mode")? { "sv.mode" } else { "NULL" };
     let rows = {
-        let mut st = tx.prepare_cached(
+        let mut st = tx.prepare_cached(&format!(
             "SELECT sv.path, sv.kind, sv.item_id, sv.version, sv.target, sv.writable,
-                    iv.blob_hash, iv.size, iv.created_at
+                    iv.blob_hash, iv.size, iv.created_at, {mode}
              FROM session_view sv
              LEFT JOIN item_versions iv ON iv.item_id = sv.item_id AND iv.version = sv.version
-             WHERE sv.dir_id = ?1",
-        )?;
+             WHERE sv.dir_id = ?1"
+        ))?;
         st.query_map(params![dir_id], |r| {
             Ok(ViewRow {
                 path: r.get(0)?,
@@ -118,6 +127,7 @@ pub fn load_view(conn: &mut Connection, dir_id: &str) -> rusqlite::Result<(i64, 
                 blob_hash: r.get(6)?,
                 size: r.get(7)?,
                 created_at: r.get(8)?,
+                mode: r.get::<_, Option<i64>>(9)?.map(|m| (m & 0o7777) as u32),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -259,6 +269,21 @@ pub fn hide_path(conn: &Connection, dir_id: &str, path: &str) -> rusqlite::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_store_without_the_mode_column() {
+        let tmp = tempfile::Builder::new().prefix("a8-store-").tempdir().unwrap();
+        let mut s = crate::stub::StubStore::create(tmp.path(), "a8-m").unwrap();
+        s.add_synthetic().unwrap();
+        s.set_mode("notes/todo.txt", 0o755).unwrap();
+        let mut c = open(tmp.path()).unwrap();
+        let (_, rows) = load_view(&mut c, "a8-m").unwrap();
+        assert_eq!(rows.iter().find(|r| r.path == "notes/todo.txt").unwrap().mode, Some(0o755));
+        s.conn.execute_batch("ALTER TABLE session_view DROP COLUMN mode").unwrap();
+        let (_, rows) = load_view(&mut c, "a8-m").unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|r| r.mode.is_none()));
+    }
 
     #[test]
     fn change_probe_sees_writes_from_another_connection() {

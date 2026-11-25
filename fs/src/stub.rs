@@ -57,6 +57,14 @@ impl StubStore {
         Ok(StubStore { data: data.to_path_buf(), dir_id: dir_id.to_string(), conn, next: 0 })
     }
 
+    /// Opens an existing stub data directory, to add to it.
+    pub fn open(data: &Path, dir_id: &str) -> anyhow::Result<StubStore> {
+        let conn = Connection::open(store::db_path(data))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let next: i64 = conn.query_row("SELECT count(*) FROM items", [], |r| r.get(0))?;
+        Ok(StubStore { data: data.to_path_buf(), dir_id: dir_id.to_string(), conn, next: next as u64 + 1000 })
+    }
+
     pub fn put_blob(&self, bytes: &[u8]) -> io::Result<String> {
         let hash = hex::encode(Sha256::digest(bytes));
         let p = store::blob_path(&self.data, &hash);
@@ -96,6 +104,25 @@ impl StubStore {
         Ok(item_id)
     }
 
+    /// Sets the mode of a view row (`session_view.mode`).
+    pub fn set_mode(&self, path: &str, mode: u32) -> anyhow::Result<()> {
+        let n = self.conn.execute(
+            "UPDATE session_view SET mode = ?3 WHERE dir_id = ?1 AND path = ?2",
+            params![self.dir_id, path, mode as i64],
+        )?;
+        anyhow::ensure!(n == 1, "no view row at {path}");
+        Ok(())
+    }
+
+    /// A `kind = 'dir'` row: a directory that exists even with nothing in it.
+    pub fn add_dir(&self, path: &str, mode: Option<u32>) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO session_view (dir_id, path, kind, mode) VALUES (?1, ?2, 'dir', ?3)",
+            params![self.dir_id, path, mode.map(|m| m as i64)],
+        )?;
+        Ok(())
+    }
+
     pub fn add_symlink(&self, path: &str, target: &str) -> anyhow::Result<()> {
         self.conn.execute(
             "INSERT INTO session_view (dir_id, path, kind, target) VALUES (?1, ?2, 'symlink', ?3)",
@@ -123,10 +150,17 @@ impl StubStore {
         n
     }
 
+    /// Loads a directory: files keep their permission bits, and an empty directory gets a
+    /// `kind = 'dir'` row.
     fn load_dir(&mut self, dir: &Path, prefix: &str) -> anyhow::Result<usize> {
         let mut n = 0;
         let mut entries: Vec<_> = fs::read_dir(dir)?.flatten().collect();
         entries.sort_by_key(|e| e.file_name());
+        if entries.is_empty() && !prefix.is_empty() {
+            let mode = fs::metadata(dir)?.permissions().mode() & 0o7777;
+            self.add_dir(prefix, (mode != crate::view::DEFAULT_DIR_MODE).then_some(mode))?;
+            return Ok(1);
+        }
         for e in entries {
             let name = e.file_name().to_string_lossy().into_owned();
             let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
@@ -142,6 +176,10 @@ impl StubStore {
             } else if ft.is_file() {
                 let bytes = fs::read(e.path())?;
                 self.add_item(&path, &bytes, &[], true)?;
+                let mode = e.metadata()?.permissions().mode() & 0o7777;
+                if mode != crate::view::DEFAULT_FILE_MODE {
+                    self.set_mode(&path, mode)?;
+                }
                 n += 1;
             }
         }
@@ -162,8 +200,13 @@ pub fn materialize(data: &Path, dir_id: &str, out: &Path) -> anyhow::Result<usiz
         match (r.kind.as_str(), r.blob_hash, r.target) {
             ("file", Some(h), _) => {
                 fs::copy(store::blob_path(data, &h), &dst)?;
-                fs::set_permissions(&dst, fs::Permissions::from_mode(0o644))?;
                 fs::File::options().write(true).open(&dst)?.set_modified(mtime)?;
+                let mode = r.mode.unwrap_or(crate::view::DEFAULT_FILE_MODE);
+                fs::set_permissions(&dst, fs::Permissions::from_mode(if r.writable { mode } else { mode & !0o222 }))?;
+            }
+            ("dir", _, _) => {
+                fs::create_dir_all(&dst)?;
+                fs::set_permissions(&dst, fs::Permissions::from_mode(r.mode.unwrap_or(crate::view::DEFAULT_DIR_MODE)))?;
             }
             ("symlink", _, Some(t)) => std::os::unix::fs::symlink(t, &dst)?,
             _ => continue,

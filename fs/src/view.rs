@@ -13,12 +13,20 @@ pub enum Lower {
         size: u64,
         mtime: i64,
         writable: bool,
+        /// Permission bits as served (the row's mode, or 0o644; write bits cleared when not
+        /// writable).
+        mode: u32,
     },
     Symlink {
         target: String,
     },
-    Dir,
+    Dir {
+        mode: u32,
+    },
 }
+
+pub const DEFAULT_FILE_MODE: u32 = 0o644;
+pub const DEFAULT_DIR_MODE: u32 = 0o755;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildKind {
@@ -34,6 +42,8 @@ pub struct View {
     pub entries: HashMap<String, Lower>,
     /// Directory path ("" is the root) to its children.
     pub dirs: HashMap<String, BTreeMap<String, ChildKind>>,
+    /// Modes of directories that have a `kind = 'dir'` row with a mode; others are 0o755.
+    pub dir_modes: HashMap<String, u32>,
 }
 
 pub fn parent_of(path: &str) -> &str {
@@ -64,6 +74,10 @@ impl View {
                 log::warn!("skipping bad view path {:?}", r.path);
                 continue;
             };
+            if r.kind == "dir" {
+                v.add_dir(&path, r.mode);
+                continue;
+            }
             let (lower, kind) = match r.kind.as_str() {
                 "file" => match (r.item_id, r.version, r.blob_hash, r.size) {
                     (Some(item_id), Some(version), Some(blob), Some(size)) => (
@@ -74,6 +88,7 @@ impl View {
                             size: size.max(0) as u64,
                             mtime: r.created_at.as_deref().map(crate::time::parse_iso).unwrap_or(0),
                             writable: r.writable,
+                            mode: r.mode.unwrap_or(DEFAULT_FILE_MODE) & if r.writable { 0o7777 } else { !0o222 & 0o7777 },
                         },
                         ChildKind::File,
                     ),
@@ -112,9 +127,33 @@ impl View {
         v
     }
 
+    /// A `kind = 'dir'` row: the directory and the ones above it, unless a file or symlink
+    /// row already holds one of those paths.
+    fn add_dir(&mut self, path: &str, mode: Option<u32>) {
+        let comps: Vec<&str> = path.split('/').collect();
+        let mut p = String::new();
+        for c in &comps {
+            p = join(&p, c);
+            if self.entries.contains_key(&p) {
+                log::warn!("skipping directory row {path}: {p} is a file");
+                return;
+            }
+        }
+        let mut parent = String::new();
+        for c in &comps {
+            let child = join(&parent, c);
+            self.dirs.entry(parent.clone()).or_default().insert(c.to_string(), ChildKind::Dir);
+            self.dirs.entry(child.clone()).or_default();
+            parent = child;
+        }
+        if let Some(m) = mode {
+            self.dir_modes.insert(path.to_string(), m & 0o7777);
+        }
+    }
+
     pub fn get(&self, path: &str) -> Option<Lower> {
         if self.dirs.contains_key(path) {
-            return Some(Lower::Dir);
+            return Some(Lower::Dir { mode: self.dir_modes.get(path).copied().unwrap_or(DEFAULT_DIR_MODE) });
         }
         self.entries.get(path).cloned()
     }

@@ -509,6 +509,74 @@ fn hard_links_are_refused(e: Env) {
     }
 }
 
+fn modes_and_empty_directories(e: Env) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |rel: &str| fs::symlink_metadata(e.p(rel)).unwrap().permissions().mode() & 0o7777;
+    let conn = e.conn();
+    let set_mode = |path: &str, m: u32| {
+        conn.execute("UPDATE session_view SET mode = ?3 WHERE dir_id = ?1 AND path = ?2", params![DIR, path, m as i64]).unwrap()
+    };
+    set_mode("code/src/main.rs", 0o755);
+    set_mode("code/README", 0o755); // not writable: served 0o555
+    conn.execute("INSERT INTO session_view (dir_id, path, kind) VALUES (?1, 'repo/.git/refs/tags', 'dir')", params![DIR]).unwrap();
+    conn.execute("INSERT INTO session_view (dir_id, path, kind, mode) VALUES (?1, 'private', 'dir', 448)", params![DIR]).unwrap();
+    conn.execute("INSERT INTO session_view (dir_id, path, kind) VALUES (?1, 'notes', 'dir')", params![DIR]).unwrap();
+    // A directory row where a file row is: the file wins.
+    conn.execute("INSERT INTO session_view (dir_id, path, kind) VALUES (?1, 'notes/todo.txt/sub', 'dir')", params![DIR]).unwrap();
+    e.bump();
+
+    assert_eq!(mode("code/src/main.rs"), 0o755);
+    assert_eq!(mode("code/README"), 0o555);
+    assert_eq!(mode("notes/todo.txt"), 0o644);
+    assert!(fs::metadata(e.p("notes/todo.txt")).unwrap().is_file());
+    assert_eq!(e.ls("repo/.git/refs"), ["tags"]);
+    assert!(e.ls("repo/.git/refs/tags").is_empty());
+    assert_eq!(mode("repo/.git/refs/tags"), 0o755);
+    assert_eq!(mode("private"), 0o700);
+    assert!(e.ls("").contains(&"private".to_string()));
+    assert_eq!(e.ls("notes"), ["readme.md", "todo.txt"]);
+
+    // The mode survives copy-up, and so do the store's directory modes on the way.
+    fs::OpenOptions::new().append(true).open(e.p("code/src/main.rs")).unwrap().write_all(b"// more\n").unwrap();
+    assert_eq!(fs::metadata(e.upper("code/src/main.rs")).unwrap().permissions().mode() & 0o7777, 0o755);
+    assert_eq!(mode("code/src/main.rs"), 0o755);
+    fs::write(e.p("private/inside.txt"), b"x").unwrap();
+    assert_eq!(fs::metadata(e.upper("private")).unwrap().permissions().mode() & 0o7777, 0o700);
+    assert_eq!(mode("private"), 0o700);
+    // A script from the store runs: the kernel checks the exec bit the daemon serves.
+    let mut s = StubStore::open(&e.data, DIR).unwrap();
+    s.add_item("bin/hello.sh", b"#!/bin/sh\necho hello from the drive\n", &[], true).unwrap();
+    s.set_mode("bin/hello.sh", 0o755).unwrap();
+    s.add_item("bin/plain.sh", b"#!/bin/sh\necho no\n", &[], true).unwrap();
+    drop(s);
+    e.bump();
+    let out = std::process::Command::new(e.p("bin/hello.sh")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello from the drive\n");
+    let denied = std::process::Command::new(e.p("bin/plain.sh")).output().unwrap_err();
+    assert_eq!(denied.raw_os_error(), Some(libc::EACCES));
+
+    // An empty store directory can be removed (a whiteout) and made again, empty.
+    fs::remove_dir(e.p("repo/.git/refs/tags")).unwrap();
+    assert!(e.ls("repo/.git/refs").is_empty());
+    assert!(e.whiteouts().contains("repo/.git/refs/tags"));
+    fs::create_dir(e.p("repo/.git/refs/tags")).unwrap();
+    assert!(e.ls("repo/.git/refs/tags").is_empty());
+    // A directory row going away hides it at once; a mode change shows at once.
+    conn.execute("DELETE FROM session_view WHERE dir_id = ?1 AND path = 'private'", params![DIR]).unwrap();
+    set_mode("code/src/lib.rs", 0o700);
+    e.bump();
+    assert!(e.ls("").contains(&"private".to_string()), "private/ has the session's own file");
+    assert_eq!(e.ls("private"), ["inside.txt"]);
+    assert_eq!(mode("code/src/lib.rs"), 0o700);
+    // A directory renamed with its empty store subdirectory keeps it.
+    conn.execute("INSERT INTO session_view (dir_id, path, kind, mode) VALUES (?1, 'code/src/empty', 'dir', 504)", params![DIR]).unwrap();
+    e.bump();
+    fs::rename(e.p("code/src"), e.p("code/moved")).unwrap();
+    assert_eq!(e.ls("code/moved"), ["empty", "lib.rs", "main.rs"]);
+    assert_eq!(mode("code/moved/empty"), 0o770);
+    assert_eq!(mode("code/moved/lib.rs"), 0o700);
+}
+
 macro_rules! both_modes {
     ($($name:ident),* $(,)?) => {
         mod zero_timeouts { $( #[test] fn $name() { super::$name(super::Env::new(false)) } )* }
@@ -540,4 +608,5 @@ both_modes!(
     added_item_appears,
     inode_table_stays_bounded,
     hard_links_are_refused,
+    modes_and_empty_directories,
 );

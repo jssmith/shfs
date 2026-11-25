@@ -160,9 +160,10 @@ impl Upper {
         Ok(())
     }
 
-    /// `mkdir -p` inside `upper/`: each component is created if missing and must then be a
-    /// real directory (a symlink in the way is an error, never followed).
-    pub fn mkdir_all(&self, dir: &str) -> io::Result<()> {
+    /// `mkdir -p` inside `upper/`: each component is created if missing (with the mode
+    /// `mode_of` gives for its path) and must then be a real directory (a symlink in the way is
+    /// an error, never followed).
+    pub fn mkdir_all(&self, dir: &str, mode_of: &dyn Fn(&str) -> u32) -> io::Result<()> {
         if dir.is_empty() {
             return Ok(());
         }
@@ -171,14 +172,22 @@ impl Upper {
             return Ok(());
         }
         let mut cur: Option<OwnedFd> = None;
+        let mut prefix = String::new();
         for comp in dir.split('/') {
             let at = cur.as_ref().map(|f| f.as_raw_fd()).unwrap_or(self.fd());
             let c = cstr(comp.as_bytes())?;
-            if unsafe { libc::mkdirat(at, c.as_ptr(), 0o755) } < 0 {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(comp);
+            if unsafe { libc::mkdirat(at, c.as_ptr(), 0o700) } < 0 {
                 let e = last();
                 if e.raw_os_error() != Some(libc::EEXIST) {
                     return Err(e);
                 }
+            } else {
+                // Exactly this mode, whatever the daemon's umask.
+                chmod_at(at, &c, mode_of(&prefix))?;
             }
             let next = openat2(at, &c, libc::O_PATH | libc::O_DIRECTORY, 0).map_err(|e| {
                 // A symlink or a file where a directory should be.
@@ -276,22 +285,7 @@ impl Upper {
     /// `chmod` without following a symlink (a symlink's mode cannot be changed: EOPNOTSUPP).
     pub fn chmod(&self, path: &str, mode: u32) -> io::Result<()> {
         let (p, n) = self.parent(path)?;
-        let r = unsafe { libc::syscall(libc::SYS_fchmodat2, p.as_raw_fd(), n.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) };
-        if r == 0 {
-            return Ok(());
-        }
-        let e = last();
-        if e.raw_os_error() != Some(libc::ENOSYS) {
-            return Err(e);
-        }
-        // Kernels before 6.6: open the file itself (ELOOP for a symlink) and fchmod it.
-        let f = openat2(p.as_raw_fd(), &n, libc::O_RDONLY | libc::O_NONBLOCK, 0).map_err(|e| {
-            if e.raw_os_error() == Some(libc::ELOOP) { err(libc::EOPNOTSUPP) } else { e }
-        })?;
-        if unsafe { libc::fchmod(f.as_raw_fd(), mode) } < 0 {
-            return Err(last());
-        }
-        Ok(())
+        chmod_at(p.as_raw_fd(), &n, mode)
     }
 
     pub fn chown(&self, path: &str, uid: u32, gid: u32) -> io::Result<()> {
@@ -336,6 +330,25 @@ impl Upper {
     }
 }
 
+/// `fchmodat2(AT_SYMLINK_NOFOLLOW)` on one name in a directory fd.
+fn chmod_at(dir: RawFd, name: &CStr, mode: u32) -> io::Result<()> {
+    let r = unsafe { libc::syscall(libc::SYS_fchmodat2, dir, name.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = last();
+    if e.raw_os_error() != Some(libc::ENOSYS) {
+        return Err(e);
+    }
+    // Kernels before 6.6: open the file itself (ELOOP for a symlink) and fchmod it.
+    let f = openat2(dir, name, libc::O_RDONLY | libc::O_NONBLOCK, 0)
+        .map_err(|e| if e.raw_os_error() == Some(libc::ELOOP) { err(libc::EOPNOTSUPP) } else { e })?;
+    if unsafe { libc::fchmod(f.as_raw_fd(), mode) } < 0 {
+        return Err(last());
+    }
+    Ok(())
+}
+
 /// Opens a file outside `upper/` that the server owns (a blob), refusing a symlink as the
 /// last name.
 pub fn open_trusted(path: &Path) -> io::Result<File> {
@@ -372,7 +385,7 @@ mod tests {
         assert!(u.stat("d/leaf").unwrap().is_symlink());
         assert_eq!(u.open_file("d/leaf", libc::O_RDONLY, 0).err().and_then(|e| e.raw_os_error()), Some(libc::ELOOP));
         assert!(refused(u.mkdir("link/x", 0o755)));
-        assert_eq!(eloop(u.mkdir_all("link/x/y")), Some(libc::ENOTDIR));
+        assert_eq!(eloop(u.mkdir_all("link/x/y", &|_| 0o755)), Some(libc::ENOTDIR));
         assert!(refused(u.symlink(b"t", "link/s")));
         assert!(refused(u.unlink("link/secret")));
         assert!(refused(u.rename("link/secret", "moved")));
