@@ -1,0 +1,4 @@
+#!/bin/sh
+# Writes the synthetic test corpus: test/fixtures/generate --out /tmp/a1-corpus [--seed 1] [--limit N]
+# Needs python3 with Pillow, numpy and reportlab, and the DejaVu or Liberation fonts.
+exec python3 -I "$(dirname "$0")/generate.py" "$@"
