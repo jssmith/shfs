@@ -88,6 +88,8 @@ c_package() { # out
   for w in server cli test; do mkdir -p "$stage/$w" && cp "$w/package.json" "$stage/$w/"; done
   cp -r server/dist "$stage/server/" && cp -r cli/dist "$stage/cli/"
   find "$stage" -name '*.tsbuildinfo' -delete
+  # Data files the server reads from src/ at run time (word lists, schemas).
+  find server/src cli/src -type f ! -name '*.ts' -exec cp --parents {} "$stage/" \;
   (cd "$stage" && npm ci --omit=dev --ignore-scripts --no-fund --no-audit)
   rm -rf "$stage/test"; rm -f "$stage/node_modules/@agent-drive/test"
   mkdir -p "$stage/deploy" && cp -r deploy/aws deploy/cloudflare "$stage/deploy/"

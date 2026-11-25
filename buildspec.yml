@@ -1,0 +1,33 @@
+# AWS CodeBuild: test, build, package, sign, upload and deploy Agent Drive.
+# The project (deploy/aws/pipeline.yaml) runs this on every push to main, in
+# privileged mode so the gVisor tests can start sandboxes. The steps live in
+# deploy/aws/ci.sh so that they can be run and tested outside CodeBuild.
+#
+# A release is made only for a push to main, or for a manual build started
+# with RELEASE=true (see the StartBuild output of the pipeline stack).
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    GVISOR_TESTS: run          # "skip" leaves the gVisor e2e suites out
+    RELEASE: "false"
+
+phases:
+  install:
+    commands:
+      - deploy/aws/ci.sh install
+  build:
+    commands:
+      - deploy/aws/ci.sh test
+  post_build:
+    commands:
+      # post_build runs even when build failed; release only a passing build.
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" != 1 ]; then echo "build failed: no release"; exit 1; fi
+        if [ "${CODEBUILD_WEBHOOK_HEAD_REF:-}" = "refs/heads/${RELEASE_BRANCH:-main}" ] || [ "$RELEASE" = true ]; then
+          deploy/aws/ci.sh package "$CODEBUILD_SRC_DIR/../release"
+          deploy/aws/ci.sh publish "$CODEBUILD_SRC_DIR/../release"
+        else
+          echo "not a push to ${RELEASE_BRANCH:-main} and RELEASE is not true: no release"
+        fi
