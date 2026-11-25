@@ -52,7 +52,7 @@ s_packages() {
   apt-get install -y -q --no-install-recommends \
     ca-certificates curl gnupg git jq xfsprogs zstd xz-utils unzip sqlite3 \
     build-essential python3 \
-    tesseract-ocr tesseract-ocr-eng poppler-utils \
+    tesseract-ocr tesseract-ocr-eng poppler-utils imagemagick \
     docker.io docker-buildx
 }
 
@@ -196,6 +196,7 @@ s_check() {
   echo "runsc:      $(command -v runsc) $(runsc --version 2>/dev/null | head -1)"
   echo "tesseract:  $(tesseract --version 2>&1 | head -1)"
   echo "pdftotext:  $(pdftotext -v 2>&1 | head -1)"
+  echo "convert:    $(convert -version 2>/dev/null | head -1)"
   echo "node:       $(command node -v)"
   echo "cloudflared:$(command cloudflared --version 2>/dev/null | head -1)"
   echo "ollama:     $(command -v ollama || echo missing)"

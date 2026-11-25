@@ -177,10 +177,20 @@ Resources:
           - { DataVolume: !Ref DataVolume }
 
   # --- The data volume, separate from the instance so the VM can be rebuilt
-  # around it. Snapshot on stack deletion.
+  # around it.
+  # DeletionPolicy RetainExceptOnCreate: deleting the stack keeps the volume
+  # itself (at least as safe as the old Snapshot policy: nothing is lost, and
+  # it can still be snapshotted or attached to a new stack), but when the
+  # operation that created the volume rolls back, CloudFormation deletes it.
+  # A failed first deploy then leaves nothing behind; with Snapshot it left an
+  # empty 200 GB snapshot of a volume that never held data. There is no
+  # "snapshot except on create" policy. The kept volume costs as much as a
+  # live one until it is deleted by hand (snapshot it first if wanted; the
+  # nightly snapshots already taken stay too). Replacement on update still
+  # snapshots the old volume.
   DataVolume:
     Type: AWS::EC2::Volume
-    DeletionPolicy: Snapshot
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Snapshot
     Properties:
       AvailabilityZone: !Select [0, !GetAZs ""]

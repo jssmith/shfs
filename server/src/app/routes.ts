@@ -6,7 +6,11 @@ import type { Op } from '../store/drive.js';
 import { COOKIE, createWebSession, endWebSession, ownerHasPassword, parseCookies, verifyOwnerPassword, verifyWebSession } from '../auth/owner.js';
 import { trashItem, undoPackage } from '../merge/undo.js';
 import { TURN_GAP_MS, turnOf, turnPackages, undoTurn } from '../sessions/turns.js';
-import { APP_HTML, loginPage } from './page.js';
+import { APP_HTML, HELD_HTML, SESSION_HTML, loginPage } from './page.js';
+import { heldRouter } from './held.js';
+
+// Item content never runs in the app's origin: no script but the page's own, images only from the drive's preview endpoint.
+const APP_CSP = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 
 export function appRouter(ctx: Context): Router {
   const r = express.Router();
@@ -52,7 +56,7 @@ export function appRouter(ctx: Context): Router {
       res.redirect(303, '/login');
       return;
     }
-    res.type('html').set('Content-Security-Policy', "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'").send(APP_HTML);
+    res.type('html').set('Content-Security-Policy', APP_CSP).send(APP_HTML);
   });
 
   function pathOf(item_id: string): string {
@@ -73,45 +77,75 @@ export function appRouter(ctx: Context): Router {
     };
   }
 
-  r.get('/api/app/sessions', owner, (_req, res) => {
-    const rows = all<{ dir_id: string; session_id_hash: string; purpose: string; status: string; created_at: string; last_call_at: string; client_name: string | null; client_version: string | null; registered_name: string | null; summary_last: string | null }>(
-      db,
-      `SELECT s.*, m.client_name, m.client_version, m.registered_name, m.summary_last
-         FROM sessions s LEFT JOIN session_meta m ON m.dir_id = s.dir_id ORDER BY s.created_at DESC, s.rowid DESC LIMIT 100`,
-    );
-    res.json({
-      turn_gap_ms: TURN_GAP_MS,
-      sessions: rows.map((s) => {
-        const merges = all<{ pkg_id: string; kind: string; summary_claimed: string | null; summary_observed: string | null; operations: string; created_at: string }>(
-          db, 'SELECT * FROM packages WHERE session_id_hash = ? ORDER BY rowid DESC', s.session_id_hash,
-        ).map(describePackage);
-        // Merges grouped by turn, newest turn first (sessions/turns.ts).
-        const turns: { turn_id: string | null; packages: typeof merges; undone: boolean }[] = [];
-        for (const m of merges) {
-          const t = turnOf(db, m.pkg_id);
-          const last = turns[turns.length - 1];
-          if (last && last.turn_id === t && t !== null) last.packages.push(m);
-          else turns.push({ turn_id: t, packages: [m], undone: false });
+  type SessionRowJ = { dir_id: string; session_id_hash: string; purpose: string; status: string; created_at: string; last_call_at: string; client_name: string | null; client_version: string | null; registered_name: string | null; summary_last: string | null };
+  const SESSION_SQL = `SELECT s.*, m.client_name, m.client_version, m.registered_name, m.summary_last
+         FROM sessions s LEFT JOIN session_meta m ON m.dir_id = s.dir_id`;
+
+  function sessionJson(s: SessionRowJ) {
+    const merges = all<{ pkg_id: string; kind: string; summary_claimed: string | null; summary_observed: string | null; operations: string; created_at: string }>(
+      db, 'SELECT * FROM packages WHERE session_id_hash = ? ORDER BY rowid DESC', s.session_id_hash,
+    ).map(describePackage);
+    // Merges grouped by turn, newest turn first (sessions/turns.ts).
+    const turns: { turn_id: string | null; packages: typeof merges; undone: boolean; files: { path: string; ops: string[] }[] }[] = [];
+    for (const m of merges) {
+      const t = turnOf(db, m.pkg_id);
+      const last = turns[turns.length - 1];
+      if (last && last.turn_id === t && t !== null) last.packages.push(m);
+      else turns.push({ turn_id: t, packages: [m], undone: false, files: [] });
+    }
+    for (const t of turns) {
+      t.undone = t.packages.every((p) => p.undone_by);
+      // The files the turn changed, oldest change first, each with what happened to it.
+      const files = new Map<string, string[]>();
+      for (const p of [...t.packages].reverse()) {
+        for (const o of p.operations) {
+          const label = o.from_path ? `${o.op} from ${o.from_path}` : o.op;
+          const k = o.path;
+          const ops = files.get(k) ?? [];
+          if (!ops.includes(label)) ops.push(label);
+          files.set(k, ops);
         }
-        for (const t of turns) t.undone = t.packages.every((p) => p.undone_by);
-        // Lifecycle (idle, expired) shows in place of an open status.
-        const life = s.status === 'open' || s.status === 'needs_resolution' ? sessions.lifecycle(s as never) : 'active';
-        return {
-        dir_id: s.dir_id,
-        purpose: s.purpose,
-        status: life === 'active' ? s.status : life,
-        created_at: s.created_at,
-        last_call_at: s.last_call_at,
-        agent: { declared_name: s.client_name, declared_version: s.client_version, registered_name: s.registered_name },
-        summary_claimed: s.summary_last,
-        activity: all<{ ts: string; op: string; item_id: string | null; bytes_returned: number | null; detail: string | null }>(
-          db, "SELECT ts, op, item_id, bytes_returned, detail FROM activity WHERE dir_id = ? AND op IN ('read','write','run','search','resume_session','transport_changed') ORDER BY id DESC LIMIT 100", s.dir_id,
-        ).map((a) => ({ ...a, detail: a.detail ? JSON.parse(a.detail) : null })),
-        merges,
-        turns,
-        };
-      }),
-    });
+      }
+      t.files = [...files].map(([path, ops]) => ({ path, ops }));
+    }
+    // Lifecycle (idle, expired) shows in place of an open status.
+    const life = s.status === 'open' || s.status === 'needs_resolution' ? sessions.lifecycle(s as never) : 'active';
+    return {
+      dir_id: s.dir_id,
+      purpose: s.purpose,
+      status: life === 'active' ? s.status : life,
+      created_at: s.created_at,
+      last_call_at: s.last_call_at,
+      agent: { declared_name: s.client_name, declared_version: s.client_version, registered_name: s.registered_name },
+      summary_claimed: s.summary_last,
+      activity: all<{ ts: string; op: string; item_id: string | null; bytes_returned: number | null; detail: string | null }>(
+        db, "SELECT ts, op, item_id, bytes_returned, detail FROM activity WHERE dir_id = ? AND op IN ('read','write','run','search','resume_session','transport_changed') ORDER BY id DESC LIMIT 100", s.dir_id,
+      ).map((a) => ({ ...a, detail: a.detail ? JSON.parse(a.detail) : null })),
+      merges,
+      turns,
+    };
+  }
+
+  r.get('/api/app/sessions', owner, (_req, res) => {
+    const rows = all<SessionRowJ>(db, `${SESSION_SQL} ORDER BY s.created_at DESC, s.rowid DESC LIMIT 100`);
+    res.json({ turn_gap_ms: TURN_GAP_MS, sessions: rows.map(sessionJson) });
+  });
+
+  r.get('/api/app/sessions/:dir_id', owner, (req, res) => {
+    const row = get<SessionRowJ>(db, `${SESSION_SQL} WHERE s.dir_id = ?`, String(req.params.dir_id));
+    if (!row) {
+      res.status(404).json({ error: 'no such session' });
+      return;
+    }
+    res.json({ turn_gap_ms: TURN_GAP_MS, session: sessionJson(row) });
+  });
+
+  r.get(['/session/:dir_id', '/held'], (req, res) => {
+    if (!isOwner(req)) {
+      res.redirect(303, '/login');
+      return;
+    }
+    res.type('html').set('Content-Security-Policy', APP_CSP).send(req.path === '/held' ? HELD_HTML : SESSION_HTML);
   });
 
   r.get('/api/app/items', owner, (_req, res) => {
@@ -135,7 +169,7 @@ export function appRouter(ctx: Context): Router {
     }
     const touched = new Set((JSON.parse(drive.pkg(pkg_id)!.operations) as Op[]).map((o) => o.item_id));
     const u = undoPackage(drive, pkg_id, { force: Array.isArray(force) ? force : [] });
-    for (const id of touched) await sessions.applyVisibility(id);
+    for (const id of touched) await sessions.syncVisibility(id);
     ctx.jobs.kick();
     res.json(u);
   });
@@ -150,7 +184,7 @@ export function appRouter(ctx: Context): Router {
     }
     const touched = new Set(pkgs.flatMap((p) => (JSON.parse(drive.pkg(p)!.operations) as Op[]).map((o) => o.item_id)));
     const u = undoTurn(drive, turn_id!);
-    for (const id of touched) await sessions.applyVisibility(id);
+    for (const id of touched) await sessions.syncVisibility(id);
     ctx.jobs.kick();
     res.json(u);
   });
@@ -159,12 +193,14 @@ export function appRouter(ctx: Context): Router {
     const { item_id } = req.body as { item_id?: string };
     try {
       const t = trashItem(drive, String(item_id));
-      await sessions.applyVisibility(String(item_id));
+      await sessions.syncVisibility(String(item_id));
       res.json(t);
     } catch (e) {
       res.status(400).json({ error: (e as Error).message });
     }
   });
+
+  r.use(heldRouter(ctx, owner));
 
   r.get('/api/debug/calls', owner, (req, res) => {
     const limit = Math.min(Number(req.query.limit ?? 200) || 200, 5000);

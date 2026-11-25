@@ -121,7 +121,8 @@ Packages one session merges close together belong to one **turn** of the convers
 
 - `GET /api/app/sessions`: each session has `turns`, newest first, each `{turn_id, packages, undone}`; `merges` stays as before.
 - `POST /api/app/undo-turn {turn_id}`: undoes the turn's packages newest first, each with the usual per-item rules of undo (an item changed since is left as it is and reported in `conflicts`); packages already undone are skipped.
-- The app's session view shows one card per turn with one *Undo turn* button; single saves keep their own *Undo*.
+- `GET /api/app/sessions/<dir_id>`: one session; each turn also lists `files` (`{path, ops}`, oldest change first).
+- The app's session page (`/session/<dir_id>`) shows one card per turn: the agent's descriptions, the files the turn changed, and one *Undo turn* button.
 
 ## Sessions over time
 
