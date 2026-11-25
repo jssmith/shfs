@@ -6,6 +6,7 @@ import { z } from 'zod';
 import type { Context } from '../context.js';
 import { get, run } from '../store/db.js';
 import { mergeSession, diffSession, type MergeResult } from '../merge/merge.js';
+import { summariseIgnored } from '../merge/ignore.js';
 import { ToolError, type SessionRow } from '../sessions/manager.js';
 import { SERVER_INSTRUCTIONS, SKILL } from './skill.js';
 
@@ -42,6 +43,7 @@ function mergeText(r: MergeResult, verb: string): string {
   if (!r.changes.length) lines.push(`Nothing to merge. Your /drive is up to date with the drive.`);
   else lines.push(`${verb}: ${r.changes.map((c) => (c.from_path ? `${c.kind} ${c.from_path} → ${c.path}` : `${c.kind} ${c.path}`)).join(', ')}.`);
   if (r.pkg_id) lines.push(`Package ${r.pkg_id}. Your /drive now shows the drive's current state, including others' changes.`);
+  if (r.ignored.length) lines.push(`Not merged (tool cache): ${summariseIgnored(r.ignored).join(', ')}. They stay in your /drive; nothing to do.`);
   if (r.withheld.length) lines.push(`Placed behind a ring by the drive's check and no longer visible to this session: ${r.withheld.map((w) => `${w.path} (${w.rings.join(', ')})`).join(', ')}.`);
   return lines.join('\n');
 }
@@ -221,7 +223,7 @@ export function buildMcpServer(ctx: Context): McpServer {
         run(db, "UPDATE sessions SET status = 'finished' WHERE dir_id = ?", row.dir_id);
         await sessions.destroySandbox(row.dir_id);
       }
-      return text(`${mergeText(r, 'Merged')}${kind === 'finish' ? '\nSession finished.' : ''}`, { pkg_id: r.pkg_id ?? null, changes: r.changes, withheld: r.withheld });
+      return text(`${mergeText(r, 'Merged')}${kind === 'finish' ? '\nSession finished.' : ''}`, { pkg_id: r.pkg_id ?? null, changes: r.changes, withheld: r.withheld, not_merged_tool_cache: r.ignored });
     });
 
   server.registerTool(

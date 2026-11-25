@@ -8,6 +8,7 @@ import { PreconditionError, type NewVersion, type Op } from '../store/drive.js';
 import type { Sessions } from '../sessions/manager.js';
 import { safeRead, walkFiles } from '../util/fsafe.js';
 import { newId } from '../util/ids.js';
+import { isToolCache } from './ignore.js';
 
 export interface Change {
   kind: 'create' | 'update' | 'move' | 'archive';
@@ -21,10 +22,24 @@ export interface Change {
 
 /** What the session changed relative to its base. Symlinks and special files are ignored. */
 export async function diffSession(s: Sessions, dir_id: string): Promise<Change[]> {
+  return (await diffWithIgnored(s, dir_id)).changes;
+}
+
+/** The diff, plus the tool-cache paths in the working copy that it leaves out (merge/ignore.ts). */
+export async function diffWithIgnored(s: Sessions, dir_id: string): Promise<{ changes: Change[]; ignored: string[] }> {
   const d = s.dirs(dir_id);
-  const base = s.base(dir_id);
+  const base = new Map([...s.base(dir_id)].filter(([p]) => !isToolCache(p)));
   const visible = s.viewPaths(dir_id);
-  const files = new Map((await walkFiles(d.upper)).map((f) => [f.path, f]));
+  const ignored: string[] = [];
+  const files = new Map(
+    (await walkFiles(d.upper))
+      .filter((f) => {
+        if (!isToolCache(f.path)) return true;
+        ignored.push(f.path);
+        return false;
+      })
+      .map((f) => [f.path, f]),
+  );
   const changes: Change[] = [];
   const deleted: { path: string; item_id: string; version: number; hash: string }[] = [];
   for (const [p, b] of base) {
@@ -48,7 +63,7 @@ export async function diffSession(s: Sessions, dir_id: string): Promise<Change[]
     }
   }
   for (const c of created) changes.push({ kind: 'create', path: c.path, hash: c.hash, size: c.size });
-  return changes;
+  return { changes, ignored };
 }
 
 export interface MergeResult {
@@ -59,6 +74,8 @@ export interface MergeResult {
   conflicts: { path: string; reason: string }[];
   /** Paths the session wrote whose new content the ring check placed behind a ring or held. */
   withheld: { path: string; rings: string[] }[];
+  /** Tool caches in the working copy that were not merged (merge/ignore.ts). */
+  ignored: string[];
 }
 
 /**
@@ -69,11 +86,11 @@ export interface MergeResult {
 export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoint' | 'finish', summary: string): Promise<MergeResult> {
   const drive = s.drive;
   const row = s.byDir(dir_id)!;
-  const changes = await diffSession(s, dir_id);
+  const { changes, ignored } = await diffWithIgnored(s, dir_id);
   const report = changes.map((c) => ({ kind: c.kind, path: c.path, ...(c.from_path ? { from_path: c.from_path } : {}) }));
   if (!changes.length) {
     await s.materialise(dir_id);
-    return { ok: true, changes: [], conflicts: [], withheld: [] };
+    return { ok: true, changes: [], conflicts: [], withheld: [], ignored };
   }
 
   // Conflicts: an item changed since the base, or a create onto a taken path.
@@ -92,7 +109,7 @@ export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoin
     const at = drive.liveItemAt(c.path);
     if (at && !freed.has(c.path)) conflicts.push({ path: c.path, reason: 'path_taken: another item is at this path in the drive' });
   }
-  if (conflicts.length) return { ok: false, changes: report, conflicts, withheld: [] };
+  if (conflicts.length) return { ok: false, changes: report, conflicts, withheld: [], ignored };
 
   // New versions: store blobs and run the ring check before the transaction.
   const d = s.dirs(dir_id);
@@ -103,7 +120,7 @@ export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoin
   for (const c of changes) {
     if (c.kind === 'create' || c.kind === 'update') {
       const got = await safeRead(d.upper, c.path);
-      if (!got) return { ok: false, changes: report, conflicts: [{ path: c.path, reason: 'file changed during checkpoint; try again' }], withheld: [] };
+      if (!got) return { ok: false, changes: report, conflicts: [{ path: c.path, reason: 'file changed during checkpoint; try again' }], withheld: [], ignored };
       const blob_hash = await drive.blobs.put(got.data);
       const mime = mimeFor(path.basename(c.path));
       const chk = await checkContent(drive, { blob_hash, mime, name: path.basename(c.path), source: 'session', batchLabels: [] });
@@ -131,11 +148,11 @@ export async function mergeSession(s: Sessions, dir_id: string, kind: 'checkpoin
       return r;
     });
   } catch (e) {
-    if (e instanceof PreconditionError) return { ok: false, changes: report, conflicts: e.conflicts.map((c) => ({ path: c.path, reason: c.reason })), withheld: [] };
+    if (e instanceof PreconditionError) return { ok: false, changes: report, conflicts: e.conflicts.map((c) => ({ path: c.path, reason: c.reason })), withheld: [], ignored };
     throw e;
   }
   await s.materialise(dir_id);
   // An item this merge placed behind a ring leaves every other session's view at once.
   for (const op of ops) await s.applyVisibility(op.item_id);
-  return { ok: true, pkg_id: applied.pkg_id, state_id: applied.state_id, changes: report, conflicts: [], withheld };
+  return { ok: true, pkg_id: applied.pkg_id, state_id: applied.state_id, changes: report, conflicts: [], withheld, ignored };
 }
