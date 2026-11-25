@@ -417,6 +417,63 @@ fn added_item_appears(e: Env) {
     assert_eq!(fs::read_to_string(e.p("notes/later.txt")).unwrap(), "buy milk\nwrite spike\n");
 }
 
+fn inode_table_stays_bounded(e: Env) {
+    // Create, write, read, rename and delete files and directories many times over: every
+    // inode the kernel was given must be forgotten again, so the table does not grow.
+    let fs_ = e.mount.as_ref().unwrap().fs.clone();
+    fs::create_dir(e.p("loop")).unwrap();
+    let base = fs_.stats();
+    let mut peak = 0;
+    for i in 0..20_000 {
+        let f = e.p(&format!("loop/f{i}"));
+        fs::write(&f, b"x").unwrap();
+        assert_eq!(fs::read(&f).unwrap(), b"x");
+        if i % 10 == 0 {
+            let d = e.p(&format!("loop/d{i}"));
+            fs::create_dir(&d).unwrap();
+            fs::rename(&f, d.join("g")).unwrap();
+            fs::remove_file(d.join("g")).unwrap();
+            fs::remove_dir(&d).unwrap();
+        } else {
+            fs::remove_file(&f).unwrap();
+        }
+        if i % 1000 == 0 {
+            peak = peak.max(fs_.stats().inodes);
+        }
+    }
+    // Forgets are asynchronous: give the kernel a moment to send the last ones.
+    let mut now = fs_.stats();
+    for _ in 0..50 {
+        if now.inodes <= base.inodes + 50 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        now = fs_.stats();
+    }
+    eprintln!("inode table: {} before, peak {peak}, {} after 20,000 create/delete rounds", base.inodes, now.inodes);
+    assert!(now.inodes <= base.inodes + 50, "inodes grew from {} to {} (peak {peak})", base.inodes, now.inodes);
+    assert!(peak <= base.inodes + 1000, "peak {peak}");
+    assert!(now.paths <= base.paths + 50, "paths grew from {} to {}", base.paths, now.paths);
+    assert_eq!(now.handles, 0);
+    assert_eq!(now.dir_handles, 0);
+    assert!(e.ls("loop").is_empty());
+
+    // A listing hands out inode numbers the kernel never counts (no lookup): those are kept
+    // only up to a cap. 20,000 names placed in upper/ directly and listed without a stat.
+    fs::create_dir_all(e.upper("big")).unwrap();
+    for i in 0..20_000 {
+        fs::write(e.upper(&format!("big/n{i:05}")), b"").unwrap();
+    }
+    assert_eq!(fs::read_dir(e.p("big")).unwrap().count(), 20_000);
+    let after = fs_.stats();
+    eprintln!("inode table after listing 20,000 unlooked-up names: {}", after.inodes);
+    assert!(after.inodes <= base.inodes + 16_384 + 100, "listing left {} inodes", after.inodes);
+    // And a name that was listed and then looked up keeps the number the listing showed.
+    use std::os::unix::fs::{DirEntryExt, MetadataExt};
+    let last = fs::read_dir(e.p("big")).unwrap().map(|d| d.unwrap()).find(|d| d.file_name() == "n19999").unwrap();
+    assert_eq!(last.ino(), fs::metadata(e.p("big/n19999")).unwrap().ino());
+}
+
 macro_rules! both_modes {
     ($($name:ident),* $(,)?) => {
         mod zero_timeouts { $( #[test] fn $name() { super::$name(super::Env::new(false)) } )* }
@@ -446,4 +503,5 @@ both_modes!(
     many_small_files,
     unannounced_change_is_picked_up,
     added_item_appears,
+    inode_table_stays_bounded,
 );

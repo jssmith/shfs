@@ -1,7 +1,9 @@
 //! The session's `/drive`: `session_view` ∪ `upper/` − `whiteouts` (docs/contracts.md §2).
 //!
 //! The file system is path based. Inode numbers are handed out per path on first lookup and
-//! follow renames. Every lookup, getattr, open and listing first checks the session's epoch and
+//! follow renames; each inode counts the lookups the kernel was given and is dropped when the
+//! kernel forgets them, so the table holds only what the kernel holds (plus a bounded number
+//! handed out by listings). Every lookup, getattr, open and listing first checks the session's epoch and
 //! reloads the view when it changed, so a trashed or ringed item is gone on the next operation.
 //! The kernel is told not to cache entries or attributes (timeouts default to zero) for the
 //! same reason.
@@ -9,7 +11,7 @@
 //! One implementation of `fuse_backend_rs::api::filesystem::FileSystem` serves both `/dev/fuse`
 //! (gVisor) and virtio-fs (microVMs); see `tests/virtio.rs`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions as StdOpen};
 use std::io::{self, Write};
@@ -100,12 +102,40 @@ struct DirItem {
     type_: u32,
 }
 
+/// One inode the kernel may hold.
+struct Inode {
+    /// `None` once the path is gone (unlinked, or replaced by a rename) while the kernel still
+    /// holds the inode.
+    path: Option<String>,
+    /// The kernel's lookup count: replies that handed this inode out (lookup, create, mkdir,
+    /// symlink, mknod) minus what `forget` returned. At zero the inode is dropped.
+    refs: u64,
+}
+
+/// How many inodes handed out only in listings (never looked up, so the kernel holds no
+/// count and will never forget them) are kept, so that a later lookup of the same name gets
+/// the inode number the listing showed. Older ones are dropped.
+const LISTED_ONLY_CAP: usize = 16384;
+
+/// Sizes of the daemon's tables, for tests and the soak.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Stats {
+    pub inodes: usize,
+    pub paths: usize,
+    pub handles: usize,
+    pub dir_handles: usize,
+    pub whiteouts: usize,
+    pub listed_only: usize,
+}
+
 struct State {
     view: Arc<View>,
     whiteouts: HashSet<String>,
     whiteout_file: File,
-    inodes: HashMap<u64, Option<String>>,
+    inodes: HashMap<u64, Inode>,
     by_path: HashMap<String, u64>,
+    /// Inodes created by listings with no lookup count yet, oldest first.
+    listed_only: VecDeque<u64>,
     next_ino: u64,
     handles: HashMap<u64, Arc<Handle>>,
     /// Directory handle to (listing, whether a readdir has served it yet).
@@ -170,7 +200,7 @@ impl DriveFs {
         let (ep, rows) = store::load_view(&mut db, &cfg.dir_id)?;
         let view = Arc::new(View::build(ep, rows));
         let mut inodes = HashMap::new();
-        inodes.insert(ROOT_INO, Some(String::new()));
+        inodes.insert(ROOT_INO, Inode { path: Some(String::new()), refs: 1 });
         let mut by_path = HashMap::new();
         by_path.insert(String::new(), ROOT_INO);
         let activity = ActivityLog::start(&cfg.data, &cfg.dir_id)?;
@@ -183,6 +213,7 @@ impl DriveFs {
                 whiteout_file,
                 inodes,
                 by_path,
+                listed_only: VecDeque::new(),
                 next_ino: ROOT_INO + 1,
                 handles: HashMap::new(),
                 dir_handles: HashMap::new(),
@@ -206,6 +237,18 @@ impl DriveFs {
 
     pub fn upper_dir(&self) -> &Path {
         self.upper.path()
+    }
+
+    pub fn stats(&self) -> Stats {
+        let st = lock(&self.st);
+        Stats {
+            inodes: st.inodes.len(),
+            paths: st.by_path.len(),
+            handles: st.handles.len(),
+            dir_handles: st.dir_handles.len(),
+            whiteouts: st.whiteouts.len(),
+            listed_only: st.listed_only.len(),
+        }
     }
 
     /// Waits until every open recorded so far is in `activity`.
@@ -308,20 +351,80 @@ impl DriveFs {
 
     fn path_of(st: &State, ino: u64) -> io::Result<String> {
         match st.inodes.get(&ino) {
-            Some(Some(p)) => Ok(p.clone()),
+            Some(Inode { path: Some(p), .. }) => Ok(p.clone()),
             _ => Err(err(libc::ENOENT)),
         }
     }
 
+    /// The inode number for `path`, allocated (with no lookup count) if it has none.
     fn ino_for(st: &mut State, path: &str) -> u64 {
         if let Some(i) = st.by_path.get(path) {
             return *i;
         }
         let i = st.next_ino;
         st.next_ino += 1;
-        st.inodes.insert(i, Some(path.to_string()));
+        st.inodes.insert(i, Inode { path: Some(path.to_string()), refs: 0 });
         st.by_path.insert(path.to_string(), i);
         i
+    }
+
+    /// The inode for `path`, counted as handed out to the kernel.
+    fn ino_counted(st: &mut State, path: &str) -> u64 {
+        let i = Self::ino_for(st, path);
+        if let Some(n) = st.inodes.get_mut(&i) {
+            n.refs += 1;
+        }
+        i
+    }
+
+    /// An inode for a listing: the kernel holds no count for it, so it is kept only while it
+    /// is among the last LISTED_ONLY_CAP of its kind.
+    fn ino_listed(st: &mut State, path: &str) -> u64 {
+        if let Some(i) = st.by_path.get(path) {
+            return *i;
+        }
+        let i = Self::ino_for(st, path);
+        st.listed_only.push_back(i);
+        while st.listed_only.len() > LISTED_ONLY_CAP {
+            let old = st.listed_only.pop_front().unwrap();
+            if st.inodes.get(&old).is_some_and(|n| n.refs == 0) {
+                Self::drop_inode(st, old);
+            }
+        }
+        i
+    }
+
+    fn drop_inode(st: &mut State, ino: u64) {
+        if ino == ROOT_INO {
+            return;
+        }
+        if let Some(Inode { path: Some(p), .. }) = st.inodes.remove(&ino) {
+            if st.by_path.get(&p) == Some(&ino) {
+                st.by_path.remove(&p);
+            }
+        }
+    }
+
+    fn forget_one(st: &mut State, ino: u64, count: u64) {
+        if ino == ROOT_INO {
+            return;
+        }
+        let Some(n) = st.inodes.get_mut(&ino) else { return };
+        n.refs = n.refs.saturating_sub(count);
+        if n.refs == 0 {
+            Self::drop_inode(st, ino);
+        }
+    }
+
+    /// The path of `ino` is gone; the inode lives on (path-less) until the kernel forgets it.
+    fn unpath(st: &mut State, ino: u64) {
+        match st.inodes.get_mut(&ino) {
+            Some(n) if n.refs == 0 => {
+                st.inodes.remove(&ino);
+            }
+            Some(n) => n.path = None,
+            None => {}
+        }
     }
 
     fn under(p: &str, dir: &str) -> bool {
@@ -331,13 +434,13 @@ impl DriveFs {
     /// Forgets the inode of `path` and of everything under it.
     fn detach(st: &mut State, path: &str) {
         if let Some(i) = st.by_path.remove(path) {
-            st.inodes.insert(i, None);
+            Self::unpath(st, i);
         }
         let below: Vec<String> =
             st.by_path.keys().filter(|p| Self::under(p, path)).cloned().collect();
         for p in below {
             if let Some(i) = st.by_path.remove(&p) {
-                st.inodes.insert(i, None);
+                Self::unpath(st, i);
             }
         }
     }
@@ -358,7 +461,9 @@ impl DriveFs {
             }
         }
         for (p, i) in moves {
-            st.inodes.insert(i, Some(p.clone()));
+            if let Some(n) = st.inodes.get_mut(&i) {
+                n.path = Some(p.clone());
+            }
             st.by_path.insert(p, i);
         }
     }
@@ -433,9 +538,11 @@ impl DriveFs {
         }
     }
 
-    fn entry_for(&self, st: &mut State, path: &str) -> io::Result<Entry> {
+    /// The entry for `path`. `counted`: the reply hands the inode to the kernel (lookup,
+    /// create, mkdir, symlink), which raises its lookup count; getattr and setattr do not.
+    fn entry_for(&self, st: &mut State, path: &str, counted: bool) -> io::Result<Entry> {
         let n = self.resolve(st, path).ok_or_else(|| err(libc::ENOENT))?;
-        let ino = Self::ino_for(st, path);
+        let ino = if counted { Self::ino_counted(st, path) } else { Self::ino_for(st, path) };
         Ok(self.entry(ino, self.attr_of(ino, &n)))
     }
 
@@ -528,14 +635,14 @@ impl DriveFs {
                 names.insert(name, kind);
             }
         }
-        let self_ino = Self::ino_for(st, dir);
-        let parent_ino = Self::ino_for(st, parent_of(dir));
+        let self_ino = Self::ino_listed(st, dir);
+        let parent_ino = Self::ino_listed(st, parent_of(dir));
         let mut out = vec![
             DirItem { name: b".".to_vec(), ino: self_ino, type_: libc::DT_DIR as u32 },
             DirItem { name: b"..".to_vec(), ino: parent_ino, type_: libc::DT_DIR as u32 },
         ];
         for (name, kind) in names {
-            let ino = Self::ino_for(st, &join(dir, &name));
+            let ino = Self::ino_listed(st, &join(dir, &name));
             out.push(DirItem { name: name.into_bytes(), ino, type_: file_type_bits(kind) });
         }
         Ok(out)
@@ -653,7 +760,7 @@ impl FileSystem for DriveFs {
         let name = name_str(name)?;
         let mut st = lock(&self.st);
         let path = join(&Self::path_of(&st, parent)?, name);
-        match self.entry_for(&mut st, &path) {
+        match self.entry_for(&mut st, &path, true) {
             // With kernel caching on, let the kernel cache the miss too; view changes
             // invalidate added paths as well as removed ones.
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) && !self.cfg.entry_timeout.is_zero() => {
@@ -664,11 +771,22 @@ impl FileSystem for DriveFs {
         }
     }
 
+    fn forget(&self, _ctx: &Context, ino: u64, count: u64) {
+        Self::forget_one(&mut lock(&self.st), ino, count);
+    }
+
+    fn batch_forget(&self, _ctx: &Context, requests: Vec<(u64, u64)>) {
+        let mut st = lock(&self.st);
+        for (ino, count) in requests {
+            Self::forget_one(&mut st, ino, count);
+        }
+    }
+
     fn getattr(&self, _ctx: &Context, ino: u64, _h: Option<u64>) -> io::Result<(stat64, Duration)> {
         self.fresh()?;
         let mut st = lock(&self.st);
         let path = Self::path_of(&st, ino)?;
-        let e = self.entry_for(&mut st, &path)?;
+        let e = self.entry_for(&mut st, &path, false)?;
         Ok((e.attr, self.cfg.attr_timeout))
     }
 
@@ -691,7 +809,7 @@ impl FileSystem for DriveFs {
         };
         self.setattr_path(&path, &attr, fh, valid)?;
         let mut st = lock(&self.st);
-        let e = self.entry_for(&mut st, &path)?;
+        let e = self.entry_for(&mut st, &path, false)?;
         Ok((e.attr, self.cfg.attr_timeout))
     }
 
@@ -717,7 +835,7 @@ impl FileSystem for DriveFs {
         }
         self.ensure_upper_dir(&dir)?;
         self.upper.symlink(linkname.to_bytes(), &path)?;
-        self.entry_for(&mut st, &path)
+        self.entry_for(&mut st, &path, true)
     }
 
     fn mknod(&self, ctx: &Context, parent: u64, name: &CStr, mode: u32, _rdev: u32, umask: u32) -> io::Result<Entry> {
@@ -744,7 +862,7 @@ impl FileSystem for DriveFs {
         self.ensure_upper_dir(&dir)?;
         self.upper.mkdir(&path, 0o700)?;
         self.upper.chmod(&path, mode & !umask & 0o7777)?;
-        self.entry_for(&mut st, &path)
+        self.entry_for(&mut st, &path, true)
     }
 
     fn unlink(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<()> {
@@ -869,7 +987,7 @@ impl FileSystem for DriveFs {
                 return Err(err(libc::EEXIST));
             }
             let fh = self.open_path(&mut st, &path, args.flags)?;
-            let e = self.entry_for(&mut st, &path)?;
+            let e = self.entry_for(&mut st, &path, true)?;
             return Ok((e, Some(fh), OpenOptions::empty(), None));
         }
         match self.resolve(&st, &dir) {
@@ -885,7 +1003,7 @@ impl FileSystem for DriveFs {
         )?;
         self.record_open(&path, None, args.flags);
         let fh = Self::new_handle(&mut st, Handle { file, path: path.clone(), lower_item: None });
-        let e = self.entry_for(&mut st, &path)?;
+        let e = self.entry_for(&mut st, &path, true)?;
         Ok((e, Some(fh), OpenOptions::empty(), None))
     }
 
