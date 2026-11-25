@@ -142,6 +142,13 @@ export class RunscSandbox implements Sandbox {
     await spawnCollect(this.o.runsc, [...this.base(), 'delete', '--force', id], { timeoutMs: 20000 }).catch(() => undefined);
   }
 
+  /** runsc leaves an nsfs mount for --network=none in its state root; release it on shutdown. */
+  async releaseRoot(): Promise<void> {
+    if (!existsSync(path.join(this.o.stateRoot, 'null-netns'))) return;
+    if ((await this.list()).length) return;
+    await spawnCollect('umount', [path.join(this.o.stateRoot, 'null-netns')], { timeoutMs: 10000 }).catch(() => undefined);
+  }
+
   async list(): Promise<string[]> {
     const r = await spawnCollect(this.o.runsc, [...this.base(), 'list', '-quiet'], { timeoutMs: 10000 }).catch(() => null);
     if (!r || r.exitCode !== 0) return [];

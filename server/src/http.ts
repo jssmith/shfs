@@ -93,6 +93,8 @@ export function buildApp(ctx: Context): { app: express.Express; provider: DriveO
       if (req.method === 'POST' && isInitializeRequest(req.body)) {
         const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
+          // Plain JSON responses: Cloudflare quick tunnels do not carry SSE.
+          enableJsonResponse: true,
           onsessioninitialized: (id) => {
             transports.set(id, { transport, grant_id, lastSeen: Date.now() });
           },
@@ -108,6 +110,12 @@ export function buildApp(ctx: Context): { app: express.Express; provider: DriveO
         await transport.handleRequest(req, res, req.body);
         return;
       }
+      // Some clients probe (e.g. server/discover) before initialize: answer as JSON-RPC so they fall back.
+      const body = req.body as { id?: unknown; method?: unknown } | undefined;
+      if (req.method === 'POST' && body && typeof body.method === 'string' && body.id !== undefined) {
+        res.status(200).json({ jsonrpc: '2.0', id: body.id, error: { code: -32601, message: `Method not found: ${body.method} (send initialize first)` } });
+        return;
+      }
       res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: no valid MCP session; send initialize first' }, id: null });
     } catch (e) {
       console.error('mcp error', e);
@@ -117,11 +125,17 @@ export function buildApp(ctx: Context): { app: express.Express; provider: DriveO
   app.post('/mcp', bearer, express.json({ limit: '8mb' }), mcpHandler);
   app.get('/mcp', bearer, mcpHandler);
   app.delete('/mcp', bearer, mcpHandler);
-  // Transports idle for a day are dropped; clients re-initialise.
+  // Clients rarely close transports and never reuse them across runs: drop
+  // ones idle for 30 minutes. Drive sessions are unaffected (the id is in the arguments).
   setInterval(() => {
-    const cutoff = Date.now() - 24 * 3600 * 1000;
-    for (const [id, e] of transports) if (e.lastSeen < cutoff) void e.transport.close();
-  }, 3600 * 1000).unref();
+    const cutoff = Date.now() - 30 * 60 * 1000;
+    for (const [id, e] of transports) {
+      if (e.lastSeen < cutoff) {
+        transports.delete(id);
+        void e.transport.close();
+      }
+    }
+  }, 5 * 60 * 1000).unref();
 
   // ---------- upload (device keys) ----------
   const device = (req: Request, res: Response, next: NextFunction) => {

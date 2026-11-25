@@ -43,7 +43,7 @@ export interface Context {
 export function createContext(config: Config, sandbox?: Sandbox): Context {
   const db = openDb(config.dataDir);
   const drive = new Drive(db, new Blobs(path.join(config.dataDir, 'blobs')));
-  const sb =
+  const sb: Sandbox =
     sandbox ??
     (config.runsc
       ? new RunscSandbox({ runsc: config.runsc, stateRoot: config.runscRoot, rootfs: config.rootfs, prefix: config.sandboxPrefix })
@@ -58,6 +58,7 @@ export function createContext(config: Config, sandbox?: Sandbox): Context {
     async close() {
       jobs.stop();
       await sessions.destroyAll();
+      await sb.releaseRoot?.();
       db.close();
     },
   };

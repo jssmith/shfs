@@ -205,7 +205,7 @@ button{padding:.5rem 1rem;font-size:1rem;margin:.75rem .5rem 0 0}</style></head>
 <p>${name} (as it describes itself) asks to work in your drive: start sessions, run commands in a sandbox, read and write files that are not in a ring.</p>${uri}
 <form method="post" action="/oauth/consent">
 <input type="hidden" name="req_id" value="${esc(req_id)}">
-${signedIn ? '<p class="m">You are signed in as the owner.</p>' : '<label>Owner password<br><input type="password" name="password" autocomplete="current-password" autofocus required></label>'}
+${signedIn ? '<p class="m">You are signed in as the owner.</p>' : '<label hidden>Username <input type="text" name="username" value="owner" autocomplete="username" hidden></label><label>Owner password<br><input type="password" name="password" autocomplete="current-password" autofocus required></label>'}
 <div><button name="action" value="allow" type="submit">Allow</button><button name="action" value="deny" type="submit" formnovalidate>Deny</button></div>
 </form></body></html>`;
 }

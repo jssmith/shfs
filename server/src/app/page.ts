@@ -10,7 +10,7 @@ h1{font-size:1.3rem}h2{font-size:1.1rem;margin-top:2rem}.card{background:#fff;bo
 export function loginPage(msg: string): string {
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Drive</title><style>${STYLE}</style></head><body>
 <h1>Agent Drive</h1>${msg ? `<p class="bad">${esc(msg)}</p>` : ''}
-<form method="post" action="/login"><label>Owner password<br><input type="password" name="password" autofocus required></label> <button type="submit">Sign in</button></form></body></html>`;
+<form method="post" action="/login"><label hidden>Username <input type="text" name="username" value="owner" autocomplete="username" hidden></label><label>Owner password<br><input type="password" name="password" autofocus required></label> <button type="submit">Sign in</button></form></body></html>`;
 }
 
 export const APP_HTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Drive</title><style>${STYLE}</style></head><body>
