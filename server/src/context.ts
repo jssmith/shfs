@@ -7,6 +7,7 @@ import { JobRunner } from './ingest/check.js';
 import { Sessions } from './sessions/manager.js';
 import { NoExecSandbox, type Sandbox } from './sessions/sandbox.js';
 import { RunscSandbox } from './sessions/runsc.js';
+import { loadImageSettings } from './sessions/image.js';
 
 export interface Config {
   dataDir: string;
@@ -46,7 +47,7 @@ export function createContext(config: Config, sandbox?: Sandbox): Context {
   const sb: Sandbox =
     sandbox ??
     (config.runsc
-      ? new RunscSandbox({ runsc: config.runsc, stateRoot: config.runscRoot, rootfs: config.rootfs, prefix: config.sandboxPrefix })
+      ? new RunscSandbox({ runsc: config.runsc, stateRoot: config.runscRoot, rootfs: config.rootfs, prefix: config.sandboxPrefix, image: loadImageSettings(config.rootfs) })
       : new NoExecSandbox());
   const sessions = new Sessions(drive, path.join(config.dataDir, 'sessions'), sb, config.sandboxPrefix);
   const jobs = new JobRunner(drive, (item_id) => sessions.applyVisibility(item_id));

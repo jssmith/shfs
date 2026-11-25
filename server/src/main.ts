@@ -6,12 +6,17 @@ import { startHttp } from './http.js';
 import { addDevice, setOwnerPassword } from './auth/owner.js';
 import { DriveOAuthProvider } from './auth/oauth.js';
 import { openDb } from './store/db.js';
+import { Blobs } from './store/blobs.js';
+import { Drive } from './store/drive.js';
+import { archiveToolCaches } from './merge/cleanup.js';
+import path from 'node:path';
 
 const USAGE = `usage:
   agent-drive serve                     start the server (AGENT_DRIVE_DATA, AGENT_DRIVE_PORT, AGENT_DRIVE_PUBLIC_URL)
   agent-drive device add <name>         create an upload-only device key for \`drive put\`
   agent-drive owner set-password        set the owner's password (read from stdin)
-  agent-drive connection add <name>     issue an MCP access token directly (test harnesses; no browser)`;
+  agent-drive connection add <name>     issue an MCP access token directly (test harnesses; no browser)
+  agent-drive archive-tool-caches       archive merged items that match the merge ignore list (one undoable package)`;
 
 async function readPassword(): Promise<string> {
   const rl = createInterface({ input: process.stdin, terminal: false });
@@ -55,6 +60,12 @@ async function main(argv: string[]): Promise<number> {
     const db = openDb(config.dataDir);
     setOwnerPassword(db, pw);
     console.log('Owner password set.');
+    return 0;
+  }
+  if (cmd === 'archive-tool-caches') {
+    const drive = new Drive(openDb(config.dataDir), new Blobs(path.join(config.dataDir, 'blobs')));
+    const r = archiveToolCaches(drive);
+    console.log(r.pkg_id ? `Archived ${r.paths.length} tool-cache items as package ${r.pkg_id} (undo it in the app):\n${r.paths.join('\n')}` : 'No live items match the merge ignore list.');
     return 0;
   }
   if (cmd === 'connection' && sub === 'add' && rest[0]) {

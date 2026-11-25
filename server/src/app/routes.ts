@@ -149,9 +149,9 @@ export function appRouter(ctx: Context): Router {
     const calls = all(db, `SELECT * FROM calls ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY id DESC LIMIT ?`, ...params, limit);
     const byClient = all(
       db,
-      `SELECT client_name, client_version, COUNT(*) AS calls, COUNT(DISTINCT transport_session_id) AS transports, SUM(session_arg = 'matched') AS matched,
+      `SELECT registered_name, client_name, client_version, COUNT(*) AS calls, COUNT(DISTINCT transport_session_id) AS transports, SUM(session_arg = 'matched') AS matched,
               SUM(session_arg IN ('none','unknown','malformed','other_connection')) AS not_matched, SUM(transport_changed) AS transport_changes,
-              MAX(gap_session_ms) AS max_gap_session_ms FROM calls GROUP BY client_name, client_version`,
+              MAX(gap_session_ms) AS max_gap_session_ms FROM calls GROUP BY registered_name, client_name, client_version`,
     );
     res.json({ summary: byClient, calls });
   });

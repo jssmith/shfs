@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS calls (
   client_id             TEXT,
   client_name           TEXT,
   client_version        TEXT,
+  registered_name       TEXT,     -- client_name from the OAuth grant's registration, as declared
   transport_session_id  TEXT,
   tool                  TEXT NOT NULL,
   dir_id                TEXT,

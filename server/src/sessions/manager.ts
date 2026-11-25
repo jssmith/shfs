@@ -10,6 +10,8 @@ import { cleanDrivePath, safeHash, safeRead, safeRemove, safeWrite, walkFiles } 
 import { newId, newSessionId, now, secretHash, SESSION_ID_RE } from '../util/ids.js';
 import { KeyedMutex } from '../util/mutex.js';
 import type { Sandbox } from './sandbox.js';
+import { isToolCache } from '../merge/ignore.js';
+import { chownTree } from './image.js';
 
 export const OUTPUT_CAP = 64 * 1024;
 export const READ_CAP = 256 * 1024;
@@ -117,7 +119,8 @@ export class Sessions {
       const h = await safeHash(d.upper, v.path);
       if (h !== v.blob_hash) await safeWrite(d.upper, v.path, await this.drive.blobs.get(v.blob_hash));
     }
-    for (const f of await walkFiles(d.upper, { hash: false })) if (!want.has(f.path)) await safeRemove(d.upper, f.path);
+    // Tool caches are never merged but stay in the working copy for the tools that made them.
+    for (const f of await walkFiles(d.upper, { hash: false })) if (!want.has(f.path) && !isToolCache(f.path)) await safeRemove(d.upper, f.path);
     tx(db, () => {
       run(db, 'DELETE FROM session_view WHERE dir_id = ?', dir_id);
       run(db, 'DELETE FROM session_base WHERE dir_id = ?', dir_id);
@@ -192,6 +195,12 @@ export class Sessions {
     return this.lock.run(dir_id, async () => {
       const d = this.dirs(dir_id);
       const id = this.sandboxId(dir_id);
+      // A non-root sandbox user must own what the host wrote into /drive and /work.
+      const u = this.sandbox.user;
+      if (u && u.uid !== 0) {
+        await chownTree(d.upper, u.uid, u.gid);
+        await chownTree(d.work, u.uid, u.gid);
+      }
       await this.sandbox.create({ id, driveDir: d.upper, workDir: d.work, stateDir: d.state });
       const t0 = Date.now();
       const r = await this.sandbox.exec(id, command, { timeoutMs: timeoutSec * 1000 });

@@ -22,6 +22,8 @@ export interface Sandbox {
   destroy(id: string): Promise<void>;
   /** Every sandbox this server started that is still around (for cleanup). */
   list(): Promise<string[]>;
+  /** The user commands run as; /drive and /work must be writable for it. */
+  readonly user?: { uid: number; gid: number };
   /** Release host state left by the runtime once no sandbox is running (optional). */
   releaseRoot?(): Promise<void>;
   // TODO(wave 2): suspend(id) and resume(id) with runsc checkpoint/restore.

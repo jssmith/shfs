@@ -27,13 +27,13 @@ Every tool except `start_session` takes `session_id`, described to the model as 
 | `search` | `session_id`, `query` | Search the text and labels of files in the drive. Also reports how many matches are hidden in rings (counts, never names). | Paths with snippets; hidden counts per ring |
 | `read` | `session_id`, `path` | Read a text file under /drive in this session (your unmerged changes included). Capped at 256 KB. | Text, or a note that the file is binary |
 | `write` | `session_id`, `path`, `content` | Write a small text file under /drive in this session (creates folders as needed). Merged at the next checkpoint. | Bytes written; a reminder to checkpoint |
-| `checkpoint` | `session_id`, `summary`: what you changed and why | Merge your changes under /drive into the shared drive (all or nothing), then bring in others' changes. | The changes merged, or `merge_conflict` with paths |
-| `finish` | `session_id`, `summary`: what you did in this session | Merge your changes and close the session. | As `checkpoint`, plus session closed |
+| `checkpoint` | `session_id`, `summary`: what you changed and why | Merge your changes under /drive into the shared drive (all or nothing), then bring in others' changes. | The changes merged, and tool caches left unmerged ("Not merged (tool cache)", see `server/src/merge/ignore.ts`); or `merge_conflict` with paths. Each conflicting file in /drive then holds the drive's current version and the session's own is saved under `/work/conflicts/`, so the next merge can succeed |
+| `finish` | `session_id`, `summary`: what you did in this session | Merge your changes and close the session. | As `checkpoint`, plus session closed. On `merge_conflict` the session stays open (status `needs_resolution`) and the text says so; call `finish` again after fixing |
 | `get_skill` | `session_id` | How to work in the drive: /drive, /work, checkpoints, rings. | The skill text |
 
 ## Errors
 
-Every error carries a machine-readable reason first: `needs_session`, `merge_conflict` (with paths and reasons), `not_found`, `finished`, `paused`, `invalid_path`, `sandbox_unavailable`, `internal_error`. A hidden or ringed item reads exactly like a missing one; only counts reveal that hidden items exist, as `in_ring: ring:finance (n items)`.
+Every error carries a machine-readable reason first: `needs_session`, `merge_conflict` (with paths and reasons), `not_found`, `finished`, `paused`, `invalid_path`, `sandbox_unavailable`, `internal_error`. A hidden or ringed item reads exactly like a missing one, in merges too (a change onto a hidden item's path goes ahead and the hidden item is moved aside, shown to the person only); only counts reveal that hidden items exist, as `in_ring: ring:finance (n items)`.
 
 ## Not yet in the thin drive
 

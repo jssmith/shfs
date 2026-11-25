@@ -6,6 +6,7 @@ import { z } from 'zod';
 import type { Context } from '../context.js';
 import { get, run } from '../store/db.js';
 import { mergeSession, diffSession, type MergeResult } from '../merge/merge.js';
+import { summariseIgnored } from '../merge/ignore.js';
 import { ToolError, type SessionRow } from '../sessions/manager.js';
 import { SERVER_INSTRUCTIONS, SKILL } from './skill.js';
 
@@ -42,6 +43,7 @@ function mergeText(r: MergeResult, verb: string): string {
   if (!r.changes.length) lines.push(`Nothing to merge. Your /drive is up to date with the drive.`);
   else lines.push(`${verb}: ${r.changes.map((c) => (c.from_path ? `${c.kind} ${c.from_path} → ${c.path}` : `${c.kind} ${c.path}`)).join(', ')}.`);
   if (r.pkg_id) lines.push(`Package ${r.pkg_id}. Your /drive now shows the drive's current state, including others' changes.`);
+  if (r.ignored.length) lines.push(`Not merged (tool cache): ${summariseIgnored(r.ignored).join(', ')}. They stay in your /drive; nothing to do.`);
   if (r.withheld.length) lines.push(`Placed behind a ring by the drive's check and no longer visible to this session: ${r.withheld.map((w) => `${w.path} (${w.rings.join(', ')})`).join(', ')}.`);
   return lines.join('\n');
 }
@@ -60,9 +62,9 @@ export function buildMcpServer(ctx: Context): McpServer {
     const reason = res.isError ? String((res.structuredContent as { error?: string } | undefined)?.error ?? 'error') : null;
     run(
       db,
-      `INSERT INTO calls (ts, grant_id, client_id, client_name, client_version, transport_session_id, tool, dir_id, session_arg, transport_changed, gap_session_ms, gap_connection_ms, duration_ms, ok, error_reason)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      new Date(t0).toISOString(), c.grant_id, c.client_id, ci?.name ?? null, ci?.version ?? null, c.transport_id ?? null, tool, dir_id, arg, transportChanged ? 1 : 0,
+      `INSERT INTO calls (ts, grant_id, client_id, client_name, client_version, registered_name, transport_session_id, tool, dir_id, session_arg, transport_changed, gap_session_ms, gap_connection_ms, duration_ms, ok, error_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      new Date(t0).toISOString(), c.grant_id, c.client_id, ci?.name ?? null, ci?.version ?? null, c.registered_name, c.transport_id ?? null, tool, dir_id, arg, transportChanged ? 1 : 0,
       gap(prevSession), gap(prevConn), Date.now() - t0, res.isError ? 0 : 1, reason,
     );
   }
@@ -214,14 +216,28 @@ export function buildMcpServer(ctx: Context): McpServer {
       const r = await sessions.lock.run(row.dir_id, () => mergeSession(sessions, row.dir_id, kind, summary));
       run(db, 'UPDATE session_meta SET summary_last = ? WHERE dir_id = ?', summary, row.dir_id);
       if (!r.ok) {
-        if (kind === 'finish') run(db, "UPDATE sessions SET status = 'needs_resolution' WHERE dir_id = ?", row.dir_id);
-        return fail('merge_conflict', `nothing was merged. ${r.conflicts.map((c) => `${c.path}: ${c.reason}`).join('; ')}`, { conflicts: r.conflicts });
+        const list = r.conflicts.map((c) => `${c.path}: ${c.reason}${c.yours ? ` (your version is saved at ${c.yours})` : ''}`).join('; ');
+        const next =
+          'Each conflicting file in /drive now holds the drive\'s current version (or is gone, if it left the drive); your version is saved under /work/conflicts/. ' +
+          'Redo your change on top of the file in /drive, then merge again.';
+        if (kind === 'finish') {
+          run(db, "UPDATE sessions SET status = 'needs_resolution' WHERE dir_id = ?", row.dir_id);
+          return fail(
+            'merge_conflict',
+            `nothing was merged and the session is NOT finished: it is still open (status needs_resolution). ${list}. ${next} ` +
+              'Then call finish(session_id, summary) again with the same session_id; your other changes are still in /drive and merge with it. ' +
+              'resume_session(session_id) shows what is unmerged.',
+            { conflicts: r.conflicts, status: 'needs_resolution' },
+          );
+        }
+        return fail('merge_conflict', `nothing was merged. ${list}. ${next} Then call checkpoint again.`, { conflicts: r.conflicts });
       }
+      if (kind === 'checkpoint' && row.status === 'needs_resolution') run(db, "UPDATE sessions SET status = 'open' WHERE dir_id = ?", row.dir_id);
       if (kind === 'finish') {
         run(db, "UPDATE sessions SET status = 'finished' WHERE dir_id = ?", row.dir_id);
         await sessions.destroySandbox(row.dir_id);
       }
-      return text(`${mergeText(r, 'Merged')}${kind === 'finish' ? '\nSession finished.' : ''}`, { pkg_id: r.pkg_id ?? null, changes: r.changes, withheld: r.withheld });
+      return text(`${mergeText(r, 'Merged')}${kind === 'finish' ? '\nSession finished.' : ''}`, { pkg_id: r.pkg_id ?? null, changes: r.changes, withheld: r.withheld, not_merged_tool_cache: r.ignored });
     });
 
   server.registerTool(

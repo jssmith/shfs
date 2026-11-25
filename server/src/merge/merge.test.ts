@@ -107,3 +107,37 @@ test('a session write that the ring check rings is merged but leaves the view', 
   expect(existsSync(path.join(up, 'pay.txt'))).toBe(false);
   expect(ctx.drive.hiddenCounts()).toEqual({ 'ring:finance': 1 });
 });
+
+test('a change onto a hidden item\'s path goes ahead; the hidden item moves aside unseen', async () => {
+  await upload(ctx, { 'docs/card.txt': `card ${CARD}` });
+  await settle(ctx); // ringed
+  const s = (await ctx.sessions.start('c', 'p', {})).row;
+  const up = ctx.sessions.dirs(s.dir_id).upper;
+  mkdirSync(path.join(up, 'docs'), { recursive: true });
+  writeFileSync(path.join(up, 'docs/card.txt'), 'my own notes');
+  // An unchecked upload lands at another path the session also writes.
+  await upload(ctx, { 'docs/pending.txt': 'not checked yet' });
+  writeFileSync(path.join(up, 'docs/pending.txt'), 'agent text');
+  const r = await mergeSession(ctx.sessions, s.dir_id, 'checkpoint', '');
+  expect(r.ok).toBe(true);
+  expect(r.conflicts).toEqual([]);
+  expect(r.changes.map((c) => `${c.kind} ${c.path}`).sort()).toEqual(['create docs/card.txt', 'create docs/pending.txt']);
+  expect(JSON.stringify(r)).not.toMatch(/\(2\)|hidden|ring/);
+  const items = ctx.drive.snapshot();
+  const paths = [...items.values()].filter((t) => t.state === 'live').map((t) => t.path).sort();
+  expect(paths).toEqual(['docs/card (2).txt', 'docs/card.txt', 'docs/pending (2).txt', 'docs/pending.txt']);
+  expect(ctx.drive.reachableView().map((v) => v.path)).toEqual(['docs/card.txt', 'docs/pending.txt']);
+  expect(ctx.drive.reconstruct()).toEqual(ctx.drive.snapshot());
+  await settle(ctx);
+  expect(ctx.drive.hiddenCounts()).toEqual({ 'ring:finance': 1 });
+});
+
+test('a create onto a visible item added since the base is still a path_taken conflict', async () => {
+  const s = (await ctx.sessions.start('c', 'p', {})).row;
+  await upload(ctx, { 'x.txt': 'from the person' });
+  await settle(ctx);
+  writeFileSync(path.join(ctx.sessions.dirs(s.dir_id).upper, 'x.txt'), 'from the agent');
+  const r = await mergeSession(ctx.sessions, s.dir_id, 'checkpoint', '');
+  expect(r.ok).toBe(false);
+  expect(r.conflicts[0]!.reason).toMatch(/^path_taken/);
+});
