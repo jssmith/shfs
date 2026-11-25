@@ -1,0 +1,3 @@
+bip39-english.txt: the BIP39 English word list (bitcoin/bips, bip-0039), as shipped in the
+MIT-licensed `mnemonic` Python package (Copyright (c) 2013-2016 Pavol Rusnak). Used to
+recognise wallet seed phrases.

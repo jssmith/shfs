@@ -17,8 +17,8 @@ export interface Signal {
 
 // BIP39 English word list (from the BIP39 specification), for seed phrases.
 const BIP39 = new Set(
-  // Resolves to server/src/reading/data from both src/ and dist/.
-  readFileSync(new URL('../../src/reading/data/bip39-english.txt', import.meta.url), 'utf8')
+  // Resolves to server/src/reading/wordlists from both src/ and dist/.
+  readFileSync(new URL('../../src/reading/wordlists/bip39-english.txt', import.meta.url), 'utf8')
     .split('\n').map((w) => w.trim()).filter(Boolean),
 );
 

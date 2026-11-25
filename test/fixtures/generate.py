@@ -29,7 +29,7 @@ from reportlab.pdfgen import canvas
 
 GENERATOR_VERSION = 1
 HERE = os.path.dirname(os.path.abspath(__file__))
-BIP39_PATH = os.path.join(HERE, '..', '..', 'server', 'src', 'reading', 'data', 'bip39-english.txt')
+BIP39_PATH = os.path.join(HERE, '..', '..', 'server', 'src', 'reading', 'wordlists', 'bip39-english.txt')
 
 FONT_CANDIDATES = [
     '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
