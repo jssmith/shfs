@@ -1,0 +1,132 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RunCommandOnDevInstancesOnly",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": { "StringEquals": { "ssm:resourceTag/agent-drive": "dev" } }
+    },
+    {
+      "Sid": "RunCommandDocument",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ssm:*:*:document/AWS-RunShellScript"
+    },
+    {
+      "Sid": "RunCommandReads",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:CancelCommand",
+        "ssm:ListCommands",
+        "ssm:ListCommandInvocations",
+        "ssm:GetCommandInvocation",
+        "ssm:DescribeInstanceInformation",
+        "ssm:DescribeInstanceProperties",
+        "ssm:GetConnectionStatus",
+        "ssm:ListDocuments",
+        "ssm:DescribeDocument"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadUbuntuImageParameters",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+      "Resource": "arn:aws:ssm:*:*:parameter/aws/service/canonical/*"
+    },
+    {
+      "Sid": "LaunchWithTheDevInstanceRoleOnly",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::*:role/agent-drive-dev-instance-*",
+      "Condition": { "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" } }
+    },
+    {
+      "Sid": "ReadStackStatus",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:DescribeStackResources",
+        "cloudformation:GetTemplate"
+      ],
+      "Resource": "arn:aws:cloudformation:*:*:stack/agent-drive-dev/*"
+    },
+    {
+      "Sid": "NoIamAdministration",
+      "Effect": "Deny",
+      "NotAction": [
+        "iam:PassRole",
+        "iam:Get*",
+        "iam:List*",
+        "iam:CreateServiceLinkedRole"
+      ],
+      "Resource": "arn:aws:iam::*:*"
+    },
+    {
+      "Sid": "NoIdentityOrAccountAdministration",
+      "Effect": "Deny",
+      "Action": [
+        "sso:*",
+        "sso-directory:*",
+        "identitystore:*",
+        "organizations:*",
+        "account:*",
+        "sts:AssumeRole"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NoBilling",
+      "Effect": "Deny",
+      "Action": [
+        "aws-portal:*",
+        "billing:*",
+        "payments:*",
+        "tax:*",
+        "invoicing:*",
+        "purchase-orders:*",
+        "ce:*",
+        "cur:*",
+        "budgets:*",
+        "freetier:*",
+        "consolidatedbilling:*",
+        "savingsplans:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NoLongTermCommitments",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:PurchaseReservedInstancesOffering",
+        "ec2:AcceptReservedInstancesExchangeQuote",
+        "ec2:PurchaseHostReservation",
+        "ec2:PurchaseScheduledInstances",
+        "ec2:PurchaseCapacityBlock",
+        "ec2:CreateCapacityReservation",
+        "ec2:AllocateHosts"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NoMovingTheDevTagOntoOtherInstances",
+      "Effect": "Deny",
+      "Action": "ec2:CreateTags",
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": {
+        "ForAnyValue:StringEquals": { "aws:TagKeys": ["agent-drive"] },
+        "StringNotEquals": { "ec2:CreateAction": "RunInstances" }
+      }
+    },
+    {
+      "Sid": "NoRemovingTheDevTag",
+      "Effect": "Deny",
+      "Action": "ec2:DeleteTags",
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": { "ForAnyValue:StringEquals": { "aws:TagKeys": ["agent-drive"] } }
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+[Unit]
+Description=Cloudflare named tunnel for Agent Drive (to http://localhost:8787)
+Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+After=network-online.target agent-drive.service
+Wants=network-online.target
+# The tunnel token is placed by hand (deploy/cloudflare/README.md); without it
+# the unit does nothing.
+ConditionPathExists=/etc/cloudflared/agent-drive.token
+
+[Service]
+Type=notify
+# The token file stays root-only (0600); systemd hands a copy to the unprivileged
+# dynamic user through the credentials directory.
+DynamicUser=true
+LoadCredential=token:/etc/cloudflared/agent-drive.token
+# Ingress (hostname -> http://localhost:8787) is set on the tunnel in the
+# Cloudflare dashboard for token-run tunnels; config.example.yml is the
+# locally managed alternative.
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:20241 run --token-file ${CREDENTIALS_DIRECTORY}/token
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

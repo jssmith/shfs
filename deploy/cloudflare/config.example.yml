@@ -1,0 +1,18 @@
+# Locally managed alternative to a token-run tunnel: ingress lives in this file
+# instead of the Cloudflare dashboard. Copy to /etc/cloudflared/config.yml and
+# replace the placeholders. The credentials file is written by
+# `cloudflared tunnel create agent-drive-dev` on a machine where you ran
+# `cloudflared tunnel login`; copy it to the VM, root-only (0600). Never commit it.
+tunnel: <TUNNEL-UUID>
+credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  # Everything the drive serves goes to one local port: /mcp, /.well-known/*,
+  # /authorize, /token, /register, the app at /, /healthz.
+  - hostname: drive-dev.<your-domain>
+    service: http://localhost:8787
+    originRequest:
+      # MCP Streamable HTTP keeps responses open (SSE); do not buffer or time out early.
+      disableChunkedEncoding: false
+      keepAliveTimeout: 90s
+  - service: http_status:404
