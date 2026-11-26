@@ -16,6 +16,7 @@
 #   ARTIFACT_BUCKET, SIGNING_KEY_ARN, DEPLOY_DOCUMENT (AgentDrive-Deploy),
 #   DEPLOY_TAG_VALUE (dev), AWS_REGION
 #   AGENT_DRIVE_ROOTFS     a ready sandbox rootfs; unset, test builds one with Docker
+#   TEST_MAX_WORKERS       cap on vitest's parallel workers (the builder sets 4)
 #   GVISOR_TESTS   run (default) | skip   skip leaves AGENT_DRIVE_RUNSC unset, so the
 #                                         gVisor e2e suites skip themselves
 #   DEPLOY_WAIT_SECONDS  how long to wait for the deploy (default 2400)
@@ -124,7 +125,10 @@ c_test() {
     log "GVISOR_TESTS=$GVISOR_TESTS: gVisor suites will skip"
   fi
   export AGENT_DRIVE_TEST_PREFIX=ci
-  npm test
+  # TEST_MAX_WORKERS: the builder MicroVM shows 16 vCPUs (its 4x peak) but is
+  # guaranteed only its 4-vCPU baseline; vitest's default of one worker per
+  # CPU then overloads it and the gVisor suites hit their timeouts.
+  if [ -n "${TEST_MAX_WORKERS:-}" ]; then npm test -- --maxWorkers="$TEST_MAX_WORKERS"; else npm test; fi
 }
 
 c_package() { # out

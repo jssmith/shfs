@@ -53,7 +53,8 @@ build_one() { # commit
   fi
   cd "$src"
   export BUILD_SOURCE_VERSION="$commit" BUILD_ID="${MICROVM_ID:-local}" SOURCE_URL="$REPO_URL" \
-         AGENT_DRIVE_ROOTFS="$rootfs" AGENT_DRIVE_TEST_IMAGE_ROOTFS="$rootfs" CI_DATA=/work/ci-data
+         AGENT_DRIVE_ROOTFS="$rootfs" AGENT_DRIVE_TEST_IMAGE_ROOTFS="$rootfs" CI_DATA=/work/ci-data \
+         TEST_MAX_WORKERS="${TEST_MAX_WORKERS:-4}"
   if ! deploy/aws/ci.sh test; then result "$commit" failed "tests failed"; return 1; fi
   if [ "$release" != true ]; then result "$commit" tested "${detail:-not released}"; return 0; fi
   rm -rf /work/release
