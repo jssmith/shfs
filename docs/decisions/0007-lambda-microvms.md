@@ -53,6 +53,28 @@ baseline 8 GB (x86) or the 2 GB default (Arm, run 1).
 The "leaked quokkasecret" assertion in run 2 is the exec error echoing the
 command, which contains the search term; no item content reached the agent.
 
+### Runs 3 to 5: the open-files limit, and speed
+
+| Run (x86) | Image | Open files | Smoke | Suite | Notes |
+| --- | --- | --- | --- | --- | --- |
+| 3 | 3.0 | 1048576 | pass, 5 s | no output for 6 min, stopped | output was buffered to the end, so where it hung is unknown |
+| 4 | 4.0, first start | 65536 | pass, 11 s | 85 pass, 9 fail, 7 skip; 266 s | all gVisor e2e suites pass except `leak` (4 × MCP request timeout at 60 s); 4 unit tests time out at 5 s; one `listen EACCES` on a session socket; invariants test 85 s (run 2: 14 s) |
+| 5 | 4.0, second start | 65536 | pass, 1 s | same unit timeouts; invariants 84 s | not a cold start: the same image started again behaves the same |
+
+The container starts with 1024 open files (soft and hard); `fs.nr_open` is
+1073741816. Locally (hard limit 20000) the limit makes no difference to 200
+process starts from bash, Node or Python (220–330 ms at each limit). The
+invariants test starts no processes and is still 6x slower than in run 2, so
+the open-files limit alone does not explain runs 4 and 5; less CPU does.
+Run 6 (image 5.0) times a CPU loop at start and end and process starts at
+1024, 8192 and 65536, then runs the suite at 8192. Locally the CPU loop is
+486 ms.
+
+The account allows 8 GB of allocated MicroVM memory per architecture
+(quotas `L-20EE1DBE` x86, `L-CD1C0CC4` Arm, adjustable): one 8 GB MicroVM at a
+time. A second `RunMicrovm` right after a terminate was refused with
+`ServiceQuotaExceededException` until the memory was released (seconds).
+
 Image builds took about 9 minutes per version; each architecture builds once
 per chipset generation (Graviton 3 and 4; Ice Lake and Sapphire Rapids), in
 parallel.

@@ -8,7 +8,9 @@ rootfs=/opt/data/images/default/rootfs
 t0=$(date +%s)
 step() { echo; echo "SPIKE ==== $* ($(( $(date +%s) - t0 ))s)"; }
 
+cpu_ms() { node -e 'let t=Date.now(),x=0;for(let i=0;i<3e8;i++)x+=i%7;console.log(Date.now()-t)'; }
 step environment
+echo "SPIKE-BENCH cpu_start_ms=$(cpu_ms)"
 echo "commit $(cat COMMIT)"
 uname -a
 nproc; free -m | head -2; df -h / /tmp | tail -n +1
@@ -47,6 +49,21 @@ ulimit -Sn "$(ulimit -Hn)"
 echo "nofile after: $(ulimit -Sn) soft, $(ulimit -Hn) hard"
 nofile=$(ulimit -Sn)
 
+step "process start cost by open-files limit"
+# Run 4 (limit 65536) was about 6x slower than run 2 (1024); run 3 (1048576) hung.
+# Time 200 process starts from bash, Node and Python, and one runsc smoke, per limit.
+for lim in 1024 8192 65536; do
+  ( ulimit -Sn "$lim"
+    a=$(date +%s%N); for i in $(seq 200); do /bin/true; done; b=$(date +%s%N)
+    n=$(node -e 'const {spawnSync}=require("child_process");const t=Date.now();for(let i=0;i<200;i++)spawnSync("/bin/true");console.log(Date.now()-t)')
+    py=$(python3 -c 'import subprocess,time;t=time.time();[subprocess.run(["/bin/true"]) for _ in range(200)];print(int((time.time()-t)*1000))')
+    c=$(date +%s); deploy/aws/ci.sh smoke "$rootfs" >/dev/null 2>&1; sm=$?; d=$(date +%s)
+    echo "SPIKE-BENCH nofile=$lim bash_ms=$(( (b-a)/1000000 )) node_ms=$n python_ms=$py smoke_exit=$sm smoke_s=$((d-c))" )
+done
+ulimit -Sn "${SPIKE_NOFILE_TESTS:-8192}"
+echo "nofile for the test suite: $(ulimit -Sn)"
+nofile=$(ulimit -Sn)
+
 step "runsc smoke"
 s0=$(date +%s)
 deploy/aws/ci.sh smoke "$rootfs"; smoke=$?
@@ -62,5 +79,6 @@ tests_s=$(( $(date +%s) - v0 ))
 summary=$(grep -E '^ +(Test Files|Tests) ' /tmp/vitest.log | tr -s ' ' | tr '\n' ';')
 
 step done
+echo "SPIKE-BENCH cpu_end_ms=$(cpu_ms)"
 printf 'SPIKE-RESULT {"kernel":"%s","nproc":%s,"fuse_open":"%s","cgroups":"%s","nofile":"%s","smoke_exit":%s,"smoke_s":%s,"tests_exit":%s,"tests_s":%s,"summary":"%s","total_s":%s}\n' \
   "$(uname -r)" "$(nproc)" "$fuse_open" "$cgroups_ok" "$nofile" "$smoke" "$smoke_s" "$tests" "$tests_s" "$summary" "$(( $(date +%s) - t0 ))"
