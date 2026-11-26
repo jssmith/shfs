@@ -7,7 +7,7 @@
 # a lone runsc binary fails with: sidecar "gvisor_sentry" not usable.
 #
 #   sandbox/install-runsc.sh [dest-dir]     (default /usr/local/bin)
-#   GVISOR_RELEASE=release-20261123.0 sandbox/install-runsc.sh   (pin a release)
+#   GVISOR_RELEASE=20261123.0 sandbox/install-runsc.sh   (pin a release)
 set -euo pipefail
 
 dest="${1:-/usr/local/bin}"

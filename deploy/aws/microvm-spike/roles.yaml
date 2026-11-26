@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Agent Drive Lambda MicroVM spike (decision 0007): the build and execution
+  roles and the log group. The image and MicroVMs are made with the Lambda
+  MicroVMs API, not here. Delete the stack when the spike is over.
+
+Parameters:
+  ArtifactBucket:
+    Type: String
+    Default: agent-drive-artifacts-277611628110-us-east-2
+  ArtifactPrefix:
+    Type: String
+    Default: microvm-spike/
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda-microvms/agent-drive-spike
+      RetentionInDays: 14
+      Tags: [{ Key: agent-drive, Value: microvm-spike }]
+
+  # Reads the code artifact and writes build logs. Nothing else.
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agent-drive-microvm-spike-build
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:*" }
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadCodeArtifact
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/${ArtifactPrefix}*"
+              - Sid: WriteBuildLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda-microvms/*"
+      Tags: [{ Key: agent-drive, Value: microvm-spike }]
+
+  # Ships the MicroVM's stdout to CloudWatch. No other AWS access from inside.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: agent-drive-microvm-spike-exec
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm*" }
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda-microvms/*"
+      Tags: [{ Key: agent-drive, Value: microvm-spike }]
+
+Outputs:
+  BuildRoleArn: { Value: !GetAtt BuildRole.Arn }
+  ExecutionRoleArn: { Value: !GetAtt ExecutionRole.Arn }
+  LogGroupName: { Value: !Ref LogGroup }

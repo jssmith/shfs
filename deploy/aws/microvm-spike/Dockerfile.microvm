@@ -1,0 +1,25 @@
+
+# ---- The MicroVM image (Amazon Linux 2023, Lambda-managed base) -------------
+FROM public.ecr.aws/lambda/microvms:al2023-minimal
+RUN dnf install -y tar bzip2 gzip findutils util-linux procps-ng git python3 \
+      libstdc++ shadow-utils which zip poppler-utils \
+ && dnf clean all
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+ && node -v && npm -v
+COPY install-runsc.sh /tmp/install-runsc.sh
+RUN GVISOR_RELEASE=20261123.0 bash /tmp/install-runsc.sh /usr/local/bin \
+ && /usr/local/bin/runsc --version
+# The sandbox rootfs, laid out as sandbox/build.sh leaves it.
+COPY --from=sandbox / /opt/data/images/default/rootfs/
+COPY image.json /opt/data/images/default/image.json
+RUN cd /opt/data/images/default/rootfs && rm -f .dockerenv \
+ && printf '127.0.0.1 localhost\n::1 localhost\n' > etc/hosts \
+ && : > etc/resolv.conf && echo sandbox > etc/hostname
+COPY src/ /opt/agent-drive/
+RUN cd /opt/agent-drive && npm ci --no-fund --no-audit && npm run build
+COPY runner.mjs spike.sh /opt/spike/
+EXPOSE 8080 9000
+CMD ["node", "/opt/spike/runner.mjs"]
