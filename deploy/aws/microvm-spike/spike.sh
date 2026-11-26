@@ -37,6 +37,16 @@ for c in $(cat $cg/cgroup.controllers); do echo "+$c" > $cg/cgroup.subtree_contr
 echo "subtree after: $(cat $cg/cgroup.subtree_control)"
 cgroups_ok=$([ -n "$(cat $cg/cgroup.subtree_control)" ] && echo yes || echo no)
 
+step limits
+# The container starts with a low open-files limit; parallel gVisor suites hit
+# "creating fd map: duplicating payload files: too many open files" (run 2).
+echo "nofile before: $(ulimit -Sn) soft, $(ulimit -Hn) hard; fs.nr_open $(cat /proc/sys/fs/nr_open)"
+# 1048576 hung the suite in run 3 (no output for 6 minutes); 65536 is enough.
+ulimit -Hn "${SPIKE_NOFILE:-65536}" 2>/dev/null || true
+ulimit -Sn "$(ulimit -Hn)"
+echo "nofile after: $(ulimit -Sn) soft, $(ulimit -Hn) hard"
+nofile=$(ulimit -Sn)
+
 step "runsc smoke"
 s0=$(date +%s)
 deploy/aws/ci.sh smoke "$rootfs"; smoke=$?
@@ -46,11 +56,11 @@ step "full test suite with gVisor"
 export AGENT_DRIVE_RUNSC=/usr/local/bin/runsc AGENT_DRIVE_ROOTFS="$rootfs" \
        AGENT_DRIVE_TEST_IMAGE_ROOTFS="$rootfs" AGENT_DRIVE_TEST_PREFIX=mv
 v0=$(date +%s)
-npx vitest run --reporter=default > /tmp/vitest.log 2>&1; tests=$?
+# Stream progress (one line per file) so a hang shows where it is.
+npx vitest run --reporter=default 2>&1 | grep --line-buffered -v -E 'ExperimentalWarning|trace-warnings' | tee /tmp/vitest.log; tests=${PIPESTATUS[0]}
 tests_s=$(( $(date +%s) - v0 ))
-grep -v -E 'ExperimentalWarning|trace-warnings' /tmp/vitest.log | tail -n 60
 summary=$(grep -E '^ +(Test Files|Tests) ' /tmp/vitest.log | tr -s ' ' | tr '\n' ';')
 
 step done
-printf 'SPIKE-RESULT {"kernel":"%s","nproc":%s,"fuse_open":"%s","cgroups":"%s","smoke_exit":%s,"smoke_s":%s,"tests_exit":%s,"tests_s":%s,"summary":"%s","total_s":%s}\n' \
-  "$(uname -r)" "$(nproc)" "$fuse_open" "$cgroups_ok" "$smoke" "$smoke_s" "$tests" "$tests_s" "$summary" "$(( $(date +%s) - t0 ))"
+printf 'SPIKE-RESULT {"kernel":"%s","nproc":%s,"fuse_open":"%s","cgroups":"%s","nofile":"%s","smoke_exit":%s,"smoke_s":%s,"tests_exit":%s,"tests_s":%s,"summary":"%s","total_s":%s}\n' \
+  "$(uname -r)" "$(nproc)" "$fuse_open" "$cgroups_ok" "$nofile" "$smoke" "$smoke_s" "$tests" "$tests_s" "$summary" "$(( $(date +%s) - t0 ))"
