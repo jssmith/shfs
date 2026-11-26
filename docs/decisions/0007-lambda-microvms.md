@@ -162,8 +162,10 @@ the follow-up spike no longer needs them.
 - Fixed: the open-files limit (`ci.sh test` raises the hard limit), the PDF test's timeout.
 - Capping workers at the 4-vCPU baseline did not help: a single CPU-bound test
   is still 3.5–4x slower on most starts. The slowness is the host, per start.
-- The leak suite does not just run slower: on a fast start its four tests take
-  16 s in all; on a slow one each waits the full 60 s and fails. A 4x slower
-  machine would need about 16 s each. That points to a wait that never ends
-  when the server is slow (a race), not to a short timeout. To reproduce
-  locally with a CPU quota on the test process.
+- The leak suite is slow, not stuck. Reproduced locally in the builder image
+  with `docker run --cpus=0.25` (CPU loop 1996 ms, against 2218 ms on the slow
+  MicroVM start and 486 ms unthrottled): v2 and v3 pass in 50–70 s each, v0
+  and v1 fail because one MCP request takes over the client's 60 s. The
+  sandbox, the server and the test share the slow CPU, so the suite slows by
+  much more than the single-thread factor. (An earlier reading here, a wait
+  that never ends, was wrong.)
