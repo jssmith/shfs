@@ -1,25 +1,55 @@
 name: ci
+# Every push to main and every pull request: the full TypeScript suite with
+# the gVisor suites (deploy/aws/ci.sh test, the same steps every build host
+# runs), and the Rust daemon's tests. Hosted Ubuntu runners are free for a
+# public repository and give root, Docker and a current kernel, which gVisor
+# and FUSE need. No secrets are used.
 on:
   push:
     branches: [main]
   pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  typescript:
-    runs-on: ubuntu-latest
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm ci
-      - run: npx tsc -b
-      - run: npm test
+      - name: Machine
+        run: |
+          uname -r; nproc; free -m | head -2
+          # Same loop as decision 0007's benchmark: 486 ms on the build workspace.
+          node -e 'let t=Date.now(),x=0;for(let i=0;i<3e8;i++)x+=i%7;console.log("cpu_ms", Date.now()-t)'
+      - name: System packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            jq zstd tesseract-ocr tesseract-ocr-eng poppler-utils imagemagick fuse3
+      - name: gVisor
+        run: sudo sandbox/install-runsc.sh /usr/local/bin && runsc --version
+      - name: Test (gVisor suites included)
+        # As root: runsc and the sandbox image build need it. ci.sh test runs
+        # npm ci, the build, the sandbox rootfs (Docker), a runsc smoke check
+        # and the whole suite.
+        run: sudo -E env "PATH=$PATH" CI_DATA="$RUNNER_TEMP/ci-data" deploy/aws/ci.sh test
+
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: fs
     steps:
       - uses: actions/checkout@v4
-      - run: cargo build --locked
-      - run: cargo test --locked
+      - run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends fuse3
+      - run: cargo build --locked --tests
+      # The kernel-cache tests mount FUSE, which needs root.
+      - run: sudo -E env "PATH=$PATH" cargo test --locked
