@@ -163,7 +163,7 @@ test('a PDF previews as a PNG rendered on the server', async () => {
   expect(r.status).toBe(200);
   expect(r.headers.get('content-type')).toBe('image/png');
   expect(sniffImage(Buffer.from(await r.arrayBuffer()))).toBe('image/png');
-});
+}, 20_000); // pdftoppm renders the page; 5.7 s on a cold build machine
 
 test('the held page and the session page are served to the owner only, with a CSP', async () => {
   const { e, dir, app } = await heldDrive();

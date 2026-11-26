@@ -100,6 +100,12 @@ JSON
 c_test() {
   node_path
   cd "$repo"
+  # Parallel gVisor suites need more than a container's usual 1024 open files
+  # ("creating fd map: ... too many open files" otherwise; decision 0007).
+  # Raising the hard limit needs CAP_SYS_RESOURCE, which build machines have.
+  ulimit -Hn 65536 2>/dev/null || true
+  ulimit -Sn "$(( $(ulimit -Hn) < 8192 ? $(ulimit -Hn) : 8192 ))" 2>/dev/null || true
+  log "open files: $(ulimit -Sn) soft, $(ulimit -Hn) hard"
   npm ci --no-fund --no-audit
   npm run build
   if [ "${GVISOR_TESTS:-run}" = run ]; then

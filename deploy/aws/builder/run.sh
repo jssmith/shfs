@@ -15,7 +15,7 @@ rootfs=/opt/data/images/default/rootfs
 log() { printf '[build %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
 bash /opt/builder/prepare.sh
-ulimit -Sn 8192 2>/dev/null || true
+ulimit -Hn 65536 2>/dev/null || true; ulimit -Sn 8192 2>/dev/null || true
 
 result() { # commit status detail
   local f; f=$(mktemp)
