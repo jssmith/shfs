@@ -2,6 +2,7 @@
 # The build server's steps (AWS CodeBuild runs them from buildspec.yml).
 #
 #   deploy/aws/ci.sh install            Node 22, system packages, runsc, Docker daemon
+#   deploy/aws/ci.sh smoke ROOTFS       start one gVisor sandbox with debug logs
 #   deploy/aws/ci.sh test               npm ci, build, sandbox rootfs, npm test (gVisor tests included)
 #   deploy/aws/ci.sh package <out>      release.tar.zst + manifest.json in <out>
 #   deploy/aws/ci.sh archive <stage> <out>   (the second half of package: archive a staged tree)
@@ -61,6 +62,39 @@ c_install() {
 
 node_path() { [ -x /opt/node/bin/node ] && export PATH="/opt/node/bin:$PATH"; node -v; }
 
+# Start one sandbox the way the server does (runsc.ts), bounded and with debug
+# logs, so a CI host where gVisor hangs says why instead of timing out tests.
+c_smoke() { # rootfs
+  local rootfs="$1" dir platform ok=0
+  dir="$(mktemp -d)"
+  for platform in systrap ptrace; do
+    rm -rf "$dir/$platform"; mkdir -p "$dir/$platform/bundle" "$dir/$platform/state" "$dir/$platform/log"
+    cat > "$dir/$platform/bundle/config.json" <<JSON
+{"ociVersion":"1.0.0","process":{"args":["/bin/echo","sandbox-ok"],"cwd":"/","env":["PATH=/usr/bin:/bin"],"user":{"uid":0,"gid":0}},
+ "root":{"path":"$rootfs","readonly":true},"hostname":"ci-smoke",
+ "mounts":[{"destination":"/proc","type":"proc","source":"proc"},{"destination":"/tmp","type":"tmpfs","source":"tmpfs"}],
+ "linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"ipc"},{"type":"uts"}]}}
+JSON
+    log "runsc smoke ($platform)"
+    local t0=$SECONDS out rc=0
+    out="$(timeout -s KILL 30 runsc --root "$dir/$platform/state" --debug --debug-log="$dir/$platform/log/" \
+      --network=none --platform="$platform" --file-access-mounts=shared \
+      run -bundle "$dir/$platform/bundle" "ci-smoke-$platform" 2>&1)" || rc=$?
+    log "runsc smoke ($platform): exit $rc in $((SECONDS - t0))s: ${out:0:200}"
+    if [ "$rc" = 0 ] && [[ "$out" == *sandbox-ok* ]]; then
+      [ "$platform" = systrap ] && ok=1
+    else
+      log "runsc debug logs ($platform), last lines of each:"
+      for f in "$dir/$platform/log/"*; do [ -f "$f" ] && { echo "--- $(basename "$f")"; tail -n 25 "$f"; }; done
+    fi
+    timeout 10 runsc --root "$dir/$platform/state" delete --force "ci-smoke-$platform" >/dev/null 2>&1 || true
+    umount "$dir/$platform/state/null-netns" 2>/dev/null || true
+    [ "$ok" = 1 ] && break
+  done
+  rm -rf "$dir"
+  [ "$ok" = 1 ]
+}
+
 c_test() {
   node_path
   cd "$repo"
@@ -72,6 +106,7 @@ c_test() {
     export AGENT_DRIVE_RUNSC=/usr/local/bin/runsc
     export AGENT_DRIVE_ROOTFS="$CI_DATA/images/default/rootfs"
     export AGENT_DRIVE_TEST_IMAGE_ROOTFS="$AGENT_DRIVE_ROOTFS"
+    c_smoke "$AGENT_DRIVE_ROOTFS" || { log "runsc smoke failed with systrap: see the logs above"; exit 1; }
   else
     log "GVISOR_TESTS=$GVISOR_TESTS: gVisor suites will skip"
   fi
@@ -177,6 +212,7 @@ deploy() { # version document tag
 case "${1:-}" in
   install) c_install ;;
   test) c_test ;;
+  smoke) c_smoke "${2:?rootfs dir}" ;;
   package) c_package "${2:?out dir}" ;;
   archive) c_archive "${2:?stage dir}" "${3:?out dir}" ;;
   publish) c_publish "${2:?out dir}" ;;
