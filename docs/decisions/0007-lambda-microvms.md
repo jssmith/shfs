@@ -147,3 +147,23 @@ images `agent-drive-spike` (Arm, versions 1.0 and 2.0) and
 `agent-drive-spike-x86` (1.0 to 5.0), artifacts under `microvm-spike/` in the
 artifact bucket. No MicroVM is running. Delete the images and the stack when
 the follow-up spike no longer needs them.
+
+## Follow-up: the first builds on the builder MicroVM (2026-11-26)
+
+`deploy/aws/builder`, image `agent-drive-builder` with the `/validate` warm-up
+(13–19 s per chipset build). Invariants test time is the speed marker.
+
+| Build | Image | Workers | Invariants | Result |
+| --- | --- | --- | --- | --- |
+| `39a2a91` | 1.0 | 16 | 20 s | 97 pass, 3 fail: "too many open files" (hard limit 1024) ×2, PDF preview 5.7 s > 5 s |
+| `07ade66` | 1.0 | 16 | 69 s | 96 pass, 4 fail: leak suite, every test at the MCP client's 60 s timeout |
+| `5f0cfab` | 2.0 | 4 | 76 s | 95 pass, 5 fail: leak suite ×4 at 60 s, one socket test at 7.2 s > 5 s |
+
+- Fixed: the open-files limit (`ci.sh test` raises the hard limit), the PDF test's timeout.
+- Capping workers at the 4-vCPU baseline did not help: a single CPU-bound test
+  is still 3.5–4x slower on most starts. The slowness is the host, per start.
+- The leak suite does not just run slower: on a fast start its four tests take
+  16 s in all; on a slow one each waits the full 60 s and fails. A 4x slower
+  machine would need about 16 s each. That points to a wait that never ends
+  when the server is slow (a race), not to a short timeout. To reproduce
+  locally with a CPU quota on the test process.
