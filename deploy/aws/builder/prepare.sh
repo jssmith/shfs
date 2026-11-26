@@ -2,6 +2,7 @@
 # Make the MicroVM's container able to run gVisor sandboxes (decision 0007).
 set -u
 cg=/sys/fs/cgroup
+if [ ! -f $cg/cgroup.controllers ]; then echo "[prepare] no cgroup v2 here; nothing to do"; exit 0; fi
 # cgroup v2: a cgroup holding processes cannot give controllers to children, so
 # runsc fails with "write cgroup.subtree_control: device or resource busy".
 # Move every process into a child cgroup first, as Docker-in-Docker does.
