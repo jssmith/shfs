@@ -330,10 +330,12 @@ fn hide_on_epoch_is_immediate(e: Env) {
     // The symlink view pointing at it now dangles.
     assert_eq!(errno(fs::read(e.p("_by/project/acme/plan.md"))), libc::ENOENT);
     // An open handle gets errors: ENOENT when the kernel refreshes attributes first, EACCES
-    // from the read itself.
+    // from the read itself, EIO where the kernel marks the inode bad once the lookup no
+    // longer matches it (seen on GitHub's Ubuntu 24.04 runners). All three refuse the read.
     let mut rest = Vec::new();
     let code = errno(open.read_to_end(&mut rest));
-    assert!(code == libc::ENOENT || code == libc::EACCES, "errno {code}");
+    assert!(code == libc::ENOENT || code == libc::EACCES || code == libc::EIO, "errno {code}");
+    assert!(rest.is_empty(), "no bytes after the hide");
 
     // A ring label hides a whole directory the same way.
     conn.execute("DELETE FROM session_view WHERE dir_id = ?1 AND path LIKE 'code/%'", params![DIR]).unwrap();
