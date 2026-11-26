@@ -7,7 +7,7 @@
   on-demand hosts cannot run gVisor (below).
 - **Measured:** below, each with how. Region us-east-2, account 277611628110
   (development, synthetic data only), 2026-11-25/26.
-- **Decision:** feasible; not the CI host now; a sandbox-backend candidate. Below.
+- **Decision:** feasible; the build server is to be a MicroVM; as a sandbox backend, only for a hosted service. Below.
 - **Would change it:** below.
 
 ## Why: CodeBuild's hosts cannot run gVisor
@@ -117,28 +117,28 @@ charge while nothing runs.
    adjustments are needed in the container and are ours to keep: move
    processes into a child cgroup before `runsc` sets up cgroups, and raise the
    open-files limit (1024 is too low for parallel sandboxes; 8192 is enough).
-2. **Not the CI build host now.** Speed is not predictable yet (run 2 fast,
-   runs 4 to 6 about 4.5x slower for minutes after start), and CodeBuild cannot
-   run builds on a MicroVM, so using one for CI means writing and running our
-   own build orchestration. For CI, a CodeBuild reserved capacity fleet on our
-   own machine image keeps one part, CodeBuild, doing all building and testing.
-3. **A candidate sandbox backend (Q22, Q24), to evaluate in its own spike.** A
-   MicroVM per session is a Firecracker boundary that starts in about 1.3 s and
-   can suspend while idle, which fits sessions that idle for an hour and live
-   for 30 days. Open: whether gVisor is still needed inside it, and how `/drive`
-   reaches a MicroVM that is not on the drive VM (data leaves the machine that
-   holds it, which changes the threat model).
+2. **The build server is a MicroVM [Johann].** CodeBuild's hosts cannot run
+   gVisor, and the build server must run every test. Before it carries CI:
+   - make the CPU fast from the start: implement the `/validate` hook so
+     Lambda prefetches what a run touches, and measure again over several
+     starts;
+   - decide how a push starts a build and how the MicroVM gets the source,
+     with GitHub access kept in an AWS-managed connection (no token in the
+     MicroVM image).
+3. **Sandbox backend: a hosted-service question only.** The open-source drive
+   must run on one Linux server anywhere, with no cloud-specific services
+   (design repository, tech spec §1). A MicroVM per session may suit a hosted
+   service we run; it is not part of the open-source project.
 4. Quota request `085b77d4…` raises x86 MicroVM memory to 32 GB (submitted as
    32768; the API's units are inconsistent, see the request).
 
 ## Would change it
 
-- Implementing `/validate` (prefetch) makes the CPU fast from the start, on
-  repeated starts: then MicroVMs are a reasonable CI test host, if we accept
-  running the orchestration ourselves.
-- CodeBuild offering MicroVM compute, or a current kernel on its on-demand hosts.
-- The sandbox-backend spike showing `/drive` over the network is too slow or
-  too exposed: then MicroVMs stay out of the product.
+- `/validate` does not remove the slow start, or speed varies between starts
+  by more than the test timeouts allow: then the build server moves to a
+  CodeBuild reserved capacity fleet on our own machine image.
+- AWS changing the container's cgroup or capability defaults, which the two
+  adjustments rely on.
 
 ## Resources left
 
