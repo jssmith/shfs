@@ -7,7 +7,7 @@
   on-demand hosts cannot run gVisor (below).
 - **Measured:** below, each with how. Region us-east-2, account 277611628110
   (development, synthetic data only), 2026-11-25/26.
-- **Decision:** below.
+- **Decision:** feasible; not the CI host now; a sandbox-backend candidate. Below.
 - **Would change it:** below.
 
 ## Why: CodeBuild's hosts cannot run gVisor
@@ -70,6 +70,28 @@ Run 6 (image 5.0) times a CPU loop at start and end and process starts at
 1024, 8192 and 65536, then runs the suite at 8192. Locally the CPU loop is
 486 ms.
 
+### Run 6: the MicroVM starts slow and speeds up
+
+Image 5.0, x86, open files 8192 for the suite. `SPIKE-BENCH` lines:
+
+| Measure | Local | MicroVM |
+| --- | --- | --- |
+| CPU loop (Node, 3×10⁸ iterations), at start | 486 ms | **2218 ms** |
+| CPU loop, at the end (about 4.5 min later) | — | **457 ms** |
+| 200 process starts, bash / Node / Python, at 1024 | 222 / 294 / 272 ms | 205 / 218 / 186 ms |
+| same at 8192 | 226 / 295 / 247 ms | 152 / 207 / 183 ms |
+| same at 65536 | (capped at 20000) | 151 / 212 / 185 ms |
+| Suite | 93 pass, 1 fail, 33 s | 84 pass, 10 fail, 260 s |
+
+The open-files limit does not change process start cost. The CPU does: about
+4.5x slower at start, full speed by the end. All ten failures are timeouts
+(vitest's 5 s per test, the MCP client's 60 s per request) in the slow stretch;
+the gVisor suites `e2e`, `held`, `image` and `shell` pass, `leak` times out.
+The likely cause, not yet shown: the image's memory snapshot is loaded on first
+touch, and the spike did not implement the `/validate` hook that lets Lambda
+prefetch what a run uses. Run 2, fast throughout, may have started on a host
+that already held the snapshot.
+
 The account allows 8 GB of allocated MicroVM memory per architecture
 (quotas `L-20EE1DBE` x86, `L-CD1C0CC4` Arm, adjustable): one 8 GB MicroVM at a
 time. A second `RunMicrovm` right after a terminate was refused with
@@ -87,3 +109,41 @@ baseline billed per second of use. A 4 vCPU / 8 GB MicroVM is about $0.50 an
 hour, so a three-minute test run is about 2.5 cents. Image storage $0.08 per
 GB-month, one-week minimum; snapshot reads $0.00155 per GB per start. No
 charge while nothing runs.
+
+## Decision
+
+1. **Feasible.** A Lambda MicroVM runs gVisor (systrap, both architectures),
+   opens FUSE, and passes every gVisor end-to-end suite at least once. Two
+   adjustments are needed in the container and are ours to keep: move
+   processes into a child cgroup before `runsc` sets up cgroups, and raise the
+   open-files limit (1024 is too low for parallel sandboxes; 8192 is enough).
+2. **Not the CI build host now.** Speed is not predictable yet (run 2 fast,
+   runs 4 to 6 about 4.5x slower for minutes after start), and CodeBuild cannot
+   run builds on a MicroVM, so using one for CI means writing and running our
+   own build orchestration. For CI, a CodeBuild reserved capacity fleet on our
+   own machine image keeps one part, CodeBuild, doing all building and testing.
+3. **A candidate sandbox backend (Q22, Q24), to evaluate in its own spike.** A
+   MicroVM per session is a Firecracker boundary that starts in about 1.3 s and
+   can suspend while idle, which fits sessions that idle for an hour and live
+   for 30 days. Open: whether gVisor is still needed inside it, and how `/drive`
+   reaches a MicroVM that is not on the drive VM (data leaves the machine that
+   holds it, which changes the threat model).
+4. Quota request `085b77d4…` raises x86 MicroVM memory to 32 GB (submitted as
+   32768; the API's units are inconsistent, see the request).
+
+## Would change it
+
+- Implementing `/validate` (prefetch) makes the CPU fast from the start, on
+  repeated starts: then MicroVMs are a reasonable CI test host, if we accept
+  running the orchestration ourselves.
+- CodeBuild offering MicroVM compute, or a current kernel on its on-demand hosts.
+- The sandbox-backend spike showing `/drive` over the network is too slow or
+  too exposed: then MicroVMs stay out of the product.
+
+## Resources left
+
+Stack `agent-drive-microvm-spike` (roles, log group with 14-day retention),
+images `agent-drive-spike` (Arm, versions 1.0 and 2.0) and
+`agent-drive-spike-x86` (1.0 to 5.0), artifacts under `microvm-spike/` in the
+artifact bucket. No MicroVM is running. Delete the images and the stack when
+the follow-up spike no longer needs them.
