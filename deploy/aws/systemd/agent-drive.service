@@ -1,6 +1,6 @@
 [Unit]
 Description=Agent Drive server (MCP, OAuth, app) on localhost
-Documentation=https://github.com/jssmith/agent-drive
+Documentation=https://github.com/jssmith/shfs
 After=network-online.target local-fs.target
 Wants=network-online.target ollama.service
 RequiresMountsFor=@AGENT_DRIVE_DATA@

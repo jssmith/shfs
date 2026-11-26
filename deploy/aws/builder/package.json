@@ -1,0 +1,8 @@
+{
+  "name": "agent-drive-builder-runner",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-lambda-microvms": "3.1178.0"
+  }
+}

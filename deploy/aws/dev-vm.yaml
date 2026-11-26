@@ -35,7 +35,7 @@ Parameters:
     Default: 10.42.1.0/24
   RepoUrl:
     Type: String
-    Default: https://github.com/jssmith/agent-drive.git
+    Default: https://github.com/jssmith/shfs.git
   RepoRef:
     Type: String
     Default: main

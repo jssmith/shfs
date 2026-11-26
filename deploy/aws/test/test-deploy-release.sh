@@ -107,7 +107,7 @@ echo "\$AGENT_DRIVE_HOME \$(jq -r .version "\$(dirname "\$0")/../../RELEASE")" >
 EOF
   echo "unit" > "$stage/deploy/aws/systemd/agent-drive.service"
   echo "FROM scratch ${4:-}" > "$stage/sandbox/Dockerfile"
-  CODEBUILD_RESOLVED_SOURCE_VERSION="$v" CODEBUILD_BUILD_ID="a9-test:$1" "$aws_dir/ci.sh" archive "$stage" "$out" >/dev/null
+  BUILD_SOURCE_VERSION="$v" BUILD_ID="a9-test:$1" "$aws_dir/ci.sh" archive "$stage" "$out" >/dev/null
   echo Success > "$work/ssm-status"
   "$aws_dir/ci.sh" publish "$out" > "$work/publish-$1.log" 2>&1
 }
@@ -214,7 +214,7 @@ check "first deploy failed: no current" test "$(current)" = none
 # 15. publish fails the build when the deploy fails
 make_release 17 || true
 echo Failed > "$work/ssm-status"
-CODEBUILD_RESOLVED_SOURCE_VERSION=$(sha_for 18) "$aws_dir/ci.sh" archive "$work/stage-17" "$work/out-18" >/dev/null
+BUILD_SOURCE_VERSION=$(sha_for 18) "$aws_dir/ci.sh" archive "$work/stage-17" "$work/out-18" >/dev/null
 check "publish fails when the deploy failed" quiet_fails "$aws_dir/ci.sh" publish "$work/out-18"
 
 echo

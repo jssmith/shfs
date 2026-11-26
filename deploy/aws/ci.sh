@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The build server's steps (AWS CodeBuild runs them from buildspec.yml).
+# The build steps. The builder MicroVM runs them from the commit it builds
+# (deploy/aws/builder/run.sh); they also run on any Linux machine with the tools.
 #
 #   deploy/aws/ci.sh install            Node 22, system packages, runsc, Docker daemon
 #   deploy/aws/ci.sh smoke ROOTFS       start one gVisor sandbox with debug logs
@@ -9,20 +10,21 @@
 #   deploy/aws/ci.sh publish <out>      sign the manifest with KMS, upload to S3 (never
 #                                       overwriting), run AgentDrive-Deploy on the dev VM, wait
 #
-# Environment (CodeBuild sets the first ones; the project sets the rest):
-#   CODEBUILD_RESOLVED_SOURCE_VERSION   the commit; it is the release version
-#   CODEBUILD_BUILD_ID, CODEBUILD_BUILD_ARN, CODEBUILD_SRC_DIR
+# Environment (the builder MicroVM sets these; deploy/aws/builder/run.sh):
+#   BUILD_SOURCE_VERSION   the commit; it is the release version
+#   BUILD_ID, BUILD_ARN    recorded in the manifest; SOURCE_URL (default github.com/jssmith/shfs)
 #   ARTIFACT_BUCKET, SIGNING_KEY_ARN, DEPLOY_DOCUMENT (AgentDrive-Deploy),
 #   DEPLOY_TAG_VALUE (dev), AWS_REGION
+#   AGENT_DRIVE_ROOTFS     a ready sandbox rootfs; unset, test builds one with Docker
 #   GVISOR_TESTS   run (default) | skip   skip leaves AGENT_DRIVE_RUNSC unset, so the
 #                                         gVisor e2e suites skip themselves
 #   DEPLOY_WAIT_SECONDS  how long to wait for the deploy (default 2400)
-# No secrets: AWS access is the CodeBuild service role's, inside the AWS CLI.
+# No secrets: AWS access is the build machine's role, inside the AWS CLI.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 : "${NODE_MAJOR:=22}"
-: "${CI_DATA:=${CODEBUILD_SRC_DIR:-$repo}/../ci-data}"
+: "${CI_DATA:=$repo/../ci-data}"
 log() { printf '\n[ci] %s\n' "$*"; }
 
 sha256() { sha256sum "$1" | cut -d' ' -f1; }
@@ -101,10 +103,15 @@ c_test() {
   npm ci --no-fund --no-audit
   npm run build
   if [ "${GVISOR_TESTS:-run}" = run ]; then
-    log "building the sandbox rootfs for the gVisor tests"
-    AGENT_DRIVE_DATA="$CI_DATA" NAME_PREFIX=ci- "$repo/sandbox/build.sh"
-    export AGENT_DRIVE_RUNSC=/usr/local/bin/runsc
-    export AGENT_DRIVE_ROOTFS="$CI_DATA/images/default/rootfs"
+    export AGENT_DRIVE_RUNSC="${AGENT_DRIVE_RUNSC:-/usr/local/bin/runsc}"
+    if [ -n "${AGENT_DRIVE_ROOTFS:-}" ] && [ -d "$AGENT_DRIVE_ROOTFS" ]; then
+      # The builder image holds a rootfs built from sandbox/ (deploy/aws/builder).
+      log "using the sandbox rootfs at $AGENT_DRIVE_ROOTFS"
+    else
+      log "building the sandbox rootfs for the gVisor tests"
+      AGENT_DRIVE_DATA="$CI_DATA" NAME_PREFIX=ci- "$repo/sandbox/build.sh"
+      export AGENT_DRIVE_ROOTFS="$CI_DATA/images/default/rootfs"
+    fi
     export AGENT_DRIVE_TEST_IMAGE_ROOTFS="$AGENT_DRIVE_ROOTFS"
     c_smoke "$AGENT_DRIVE_ROOTFS" || { log "runsc smoke failed with systrap: see the logs above"; exit 1; }
   else
@@ -135,18 +142,18 @@ c_package() { # out
 }
 
 c_archive() { # stage out
-  local stage="$1" out="$2" version="${CODEBUILD_RESOLVED_SOURCE_VERSION:-}"
-  [[ "$version" =~ ^[0-9a-f]{40}$ ]] || { echo "CODEBUILD_RESOLVED_SOURCE_VERSION is not a git sha: '$version'" >&2; exit 1; }
+  local stage="$1" out="$2" version="${BUILD_SOURCE_VERSION:-}"
+  [[ "$version" =~ ^[0-9a-f]{40}$ ]] || { echo "BUILD_SOURCE_VERSION is not a git sha: '$version'" >&2; exit 1; }
   mkdir -p "$out"
   local built; built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   jq -n --arg v "$version" --arg b "$built" '{version: $v, built_at: $b}' > "$stage/RELEASE"
   tar -C "$stage" --sort=name --owner=0 --group=0 --numeric-owner -cf - . | zstd -q -10 -T0 -o "$out/release.tar.zst"
   local nodev=""; command -v node >/dev/null && nodev=$(node -v)
-  jq -n --arg v "$version" --arg id "${CODEBUILD_BUILD_ID:-local}" --arg arn "${CODEBUILD_BUILD_ARN:-}" \
+  jq -n --arg v "$version" --arg id "${BUILD_ID:-local}" --arg arn "${BUILD_ARN:-}" --arg src "${SOURCE_URL:-https://github.com/jssmith/shfs}" \
     --arg b "$built" --arg node "$nodev" --arg a "$(sha256 "$out/release.tar.zst")" \
     --argjson size "$(stat -c %s "$out/release.tar.zst")" \
     --arg setup "$(sha256 "$stage/deploy/aws/setup.sh")" --arg prov "$(provision_hash "$stage")" \
-    '{format: 1, version: $v, source: "https://github.com/jssmith/agent-drive", build_id: $id, build_arn: $arn,
+    '{format: 1, version: $v, source: $src, build_id: $id, build_arn: $arn,
       built_at: $b, node_version: $node, archive: {name: "release.tar.zst", sha256: $a, size: $size},
       setup_sha256: $setup, provision_sha256: $prov}' > "$out/manifest.json"
   log "release $version: $(du -h "$out/release.tar.zst" | cut -f1)"
@@ -189,7 +196,7 @@ deploy() { # version document tag
   log "running $document Version=$version on instances tagged agent-drive=$tag"
   cmd=$(aws ssm send-command --document-name "$document" --targets "Key=tag:agent-drive,Values=$tag" \
     --parameters "Version=$version" --max-concurrency 1 --max-errors 0 --timeout-seconds 600 \
-    --comment "build ${CODEBUILD_BUILD_ID:-manual}" --query Command.CommandId --output text)
+    --comment "build ${BUILD_ID:-manual}" --query Command.CommandId --output text)
   log "command $cmd"
   local deadline=$((SECONDS + ${DEPLOY_WAIT_SECONDS:-2400})) statuses="" n
   while [ "$SECONDS" -lt "$deadline" ]; do

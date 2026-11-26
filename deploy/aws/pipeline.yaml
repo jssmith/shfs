@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  Agent Drive deployment pipeline (stack agent-drive-pipeline). CodeBuild builds
-  and tests every push to main through a CodeConnections GitHub connection,
+  Agent Drive build and deploy pipeline (stack agent-drive-pipeline). GitHub's
+  push webhook calls a small trigger function, which starts a builder Lambda
+  MicroVM for the commit; the builder clones the public repository, tests,
   signs a versioned release with a KMS key, stores it in S3 and deploys it to
   instances tagged agent-drive=dev through the fixed SSM document
   AgentDrive-Deploy. See deploy/aws/PIPELINE.md.
@@ -9,28 +10,24 @@ Description: >-
 Parameters:
   RepositoryUrl:
     Type: String
-    Default: https://github.com/jssmith/agent-drive
+    Default: https://github.com/jssmith/shfs
+    Description: The public repository the builder clones (no credentials).
+  RepositoryFullName:
+    Type: String
+    Default: jssmith/shfs
+    Description: owner/name as GitHub's push events give it; other repositories are ignored.
   Branch:
     Type: String
     Default: main
     AllowedPattern: "^[A-Za-z0-9._/-]+$"
-  Webhook:
+  BuilderImageVersion:
     Type: String
-    Default: "false"
-    AllowedValues: ["true", "false"]
-    Description: >-
-      Build on every push to the branch. Leave false until the connection is
-      AVAILABLE (CodeBuild cannot create the webhook through a PENDING
-      connection), then update the stack with true.
-  ComputeType:
+    Default: "1.0"
+    AllowedPattern: "^[0-9]+\\.[0-9]+$"
+    Description: The version of the agent-drive-builder MicroVM image that builds run on.
+  TriggerCodeKey:
     Type: String
-    Default: BUILD_GENERAL1_LARGE
-    AllowedValues: [BUILD_GENERAL1_MEDIUM, BUILD_GENERAL1_LARGE, BUILD_GENERAL1_XLARGE]
-    Description: LARGE is 8 vCPU / 15 GB; the suite, the sandbox image build and the gVisor tests fit in it.
-  BuildImage:
-    Type: String
-    Default: aws/codebuild/standard:7.0
-    Description: The current CodeBuild standard Ubuntu image (x86_64). Node 22 is installed by the build itself.
+    Description: S3 key, in the artifact bucket, of the trigger function's zip (deploy/aws/trigger/make-zip.sh).
   DeployTagValue:
     Type: String
     Default: dev
@@ -44,21 +41,9 @@ Parameters:
       Empty means agent-drive-dev-instance-<region>, the role the agent-drive-dev stack creates.
 
 Conditions:
-  WebhookOn: !Equals [!Ref Webhook, "true"]
   DefaultVmRole: !Equals [!Ref VmInstanceRoleName, ""]
 
 Resources:
-  # --- GitHub access. Created PENDING; completed once by hand in the console
-  # (Developer Tools > Settings > Connections > agent-drive-github-personal > Update
-  # pending connection), which installs the AWS Connector GitHub App on
-  # jssmith/agent-drive only. AWS holds the access; no token is stored here.
-  GitHubConnection:
-    Type: AWS::CodeConnections::Connection
-    Properties:
-      ConnectionName: agent-drive-github-personal
-      ProviderType: GitHub
-      Tags: [{ Key: agent-drive, Value: pipeline }]
-
   # --- Releases: releases/<version>/{release.tar.zst,manifest.json,manifest.sig}.
   # SSE-S3: releases are built from a public repository and hold no secrets;
   # integrity comes from the KMS signature, not from the bucket's encryption, and
@@ -101,7 +86,7 @@ Resources:
             Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
             Condition: { Bool: { "aws:SecureTransport": "false" } }
 
-  # --- Release signing. The private key never leaves KMS; only the build role
+  # --- Release signing. The private key never leaves KMS; only the builder role
   # may sign (the explicit Deny keeps even account administrators from signing).
   SigningKey:
     Type: AWS::KMS::Key
@@ -120,23 +105,23 @@ Resources:
             Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
             Action: "kms:*"
             Resource: "*"
-          - Sid: BuildRoleSigns
+          - Sid: BuilderRoleSigns
             Effect: Allow
-            Principal: { AWS: !GetAtt BuildRole.Arn }
+            Principal: { AWS: !GetAtt BuilderRole.Arn }
             Action: kms:Sign
             Resource: "*"
             Condition: { StringEquals: { "kms:SigningAlgorithm": ECDSA_SHA_256 } }
-          - Sid: OnlyTheBuildRoleSigns
+          - Sid: OnlyTheBuilderRoleSigns
             Effect: Deny
             Principal: "*"
             Action: kms:Sign
             Resource: "*"
-            Condition: { ArnNotEquals: { "aws:PrincipalArn": !GetAtt BuildRole.Arn } }
+            Condition: { ArnNotEquals: { "aws:PrincipalArn": !GetAtt BuilderRole.Arn } }
           - Sid: VerifyReleases
             Effect: Allow
             Principal:
               AWS:
-                - !GetAtt BuildRole.Arn
+                - !GetAtt BuilderRole.Arn
                 - !If
                   - DefaultVmRole
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agent-drive-dev-instance-${AWS::Region}"
@@ -150,53 +135,77 @@ Resources:
       AliasName: alias/agent-drive-release-signing
       TargetKeyId: !Ref SigningKey
 
-  # --- Build.
-  BuildLogGroup:
+  # --- The builder: a Lambda MicroVM per build (deploy/aws/builder). The image
+  # itself is made with the Lambda MicroVMs API from make-image.sh's zip (see
+  # PIPELINE.md); this stack holds its roles, logs and trigger.
+  BuilderLogGroup:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      LogGroupName: /aws/codebuild/agent-drive-build
+      LogGroupName: /aws/lambda-microvms/agent-drive-builder
       RetentionInDays: 30
       Tags: [{ Key: agent-drive, Value: pipeline }]
 
-  BuildRole:
+  # Used by Lambda while it builds the MicroVM image: reads the zip, writes logs.
+  BuilderImageBuildRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub agent-drive-build-${AWS::Region}
-      Description: CodeBuild service role for agent-drive-build. Its permissions are in BuildPolicy.
+      RoleName: !Sub agent-drive-builder-image-${AWS::Region}
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: { Service: codebuild.amazonaws.com }
+            Principal: { Service: lambda.amazonaws.com }
             Action: sts:AssumeRole
             Condition:
               StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
-              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/agent-drive-build" }
+              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:*" }
+      Policies:
+        - PolicyName: build-image
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${ArtifactBucket.Arn}/builder/*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda-microvms/*"
+      Tags: [{ Key: agent-drive, Value: pipeline }]
+
+  # The running builder's role (the MicroVM's execution role). No GitHub access:
+  # the repository is public.
+  BuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub agent-drive-builder-${AWS::Region}
+      Description: The builder MicroVM's execution role. Its permissions are in BuilderPolicy.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+              ArnLike: { "aws:SourceArn": !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm*" }
       Tags: [{ Key: agent-drive, Value: pipeline }]
 
   # A separate policy resource: it names the signing key, whose key policy
   # names the role, so the role itself cannot hold it without a cycle.
-  BuildPolicy:
+  BuilderPolicy:
     Type: AWS::IAM::RolePolicy
     Properties:
-      RoleName: !Ref BuildRole
-      PolicyName: agent-drive-build
+      RoleName: !Ref BuilderRole
+      PolicyName: agent-drive-builder
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
-          - Sid: UseTheGitHubConnection
-            Effect: Allow
-            Action:
-              - codeconnections:UseConnection
-              - codeconnections:GetConnection
-              - codeconnections:GetConnectionToken
-            Resource: !GetAtt GitHubConnection.ConnectionArn
           - Sid: WriteBuildLogs
             Effect: Allow
-            Action: [logs:CreateLogStream, logs:PutLogEvents]
-            Resource: !GetAtt BuildLogGroup.Arn
+            Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda-microvms/*"
           - Sid: WriteNewReleasesOnly
             Effect: Allow
             Action: s3:PutObject
@@ -207,6 +216,10 @@ Resources:
             Effect: Allow
             Action: s3:GetObject
             Resource: !Sub "${ArtifactBucket.Arn}/releases/*"
+          - Sid: RecordBuildResults
+            Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub "${ArtifactBucket.Arn}/builds/*"
           - Sid: SignAndCheckReleases
             Effect: Allow
             Action: [kms:Sign, kms:GetPublicKey, kms:Verify]
@@ -225,51 +238,121 @@ Resources:
             # These two have no resource-level permissions.
             Action: [ssm:GetCommandInvocation, ssm:ListCommandInvocations]
             Resource: "*"
+          - Sid: StopItself
+            Effect: Allow
+            Action: lambda:TerminateMicrovm
+            Resource: "*"
 
-  BuildProject:
-    Type: AWS::CodeBuild::Project
-    DependsOn: BuildPolicy
+  # --- The trigger: GitHub's push webhook -> one builder MicroVM.
+  WebhookSecret:
+    Type: AWS::SecretsManager::Secret
     Properties:
-      Name: agent-drive-build
-      Description: Test, package, sign and deploy Agent Drive (buildspec.yml in the repository)
-      ServiceRole: !GetAtt BuildRole.Arn
-      Source:
-        Type: GITHUB
-        Location: !Ref RepositoryUrl
-        BuildSpec: buildspec.yml
-        GitCloneDepth: 1
-        ReportBuildStatus: true
-        Auth:
-          Type: CODECONNECTIONS
-          Resource: !GetAtt GitHubConnection.ConnectionArn
-      SourceVersion: !Sub refs/heads/${Branch}
-      Triggers: !If
-        - WebhookOn
-        - Webhook: true
-          FilterGroups:
-            - - { Type: EVENT, Pattern: PUSH }
-              - { Type: HEAD_REF, Pattern: !Sub "^refs/heads/${Branch}$" }
-        - Webhook: false
-      Artifacts: { Type: NO_ARTIFACTS }
-      Environment:
-        Type: LINUX_CONTAINER
-        ComputeType: !Ref ComputeType
-        Image: !Ref BuildImage
-        ImagePullCredentialsType: CODEBUILD
-        PrivilegedMode: true
-        EnvironmentVariables:
-          - { Name: ARTIFACT_BUCKET, Value: !Ref ArtifactBucket }
-          - { Name: SIGNING_KEY_ARN, Value: !GetAtt SigningKey.Arn }
-          - { Name: DEPLOY_DOCUMENT, Value: !Ref DeployDocument }
-          - { Name: DEPLOY_TAG_VALUE, Value: !Ref DeployTagValue }
-          - { Name: RELEASE_BRANCH, Value: !Ref Branch }
-      LogsConfig:
-        CloudWatchLogs: { Status: ENABLED, GroupName: !Ref BuildLogGroup }
-      TimeoutInMinutes: 60
-      QueuedTimeoutInMinutes: 120
-      # One build at a time, so deploys never overlap.
-      ConcurrentBuildLimit: 1
+      Name: agent-drive/github-webhook
+      Description: >-
+        Shared secret of the GitHub push webhook (X-Hub-Signature-256). Not a
+        GitHub token: it grants no access to the repository. Paste it into the
+        webhook's settings on GitHub (PIPELINE.md).
+      GenerateSecretString: { PasswordLength: 48, ExcludePunctuation: true }
       Tags: [{ Key: agent-drive, Value: pipeline }]
+
+  TriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: /aws/lambda/agent-drive-build-trigger
+      RetentionInDays: 30
+      Tags: [{ Key: agent-drive, Value: pipeline }]
+
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub agent-drive-build-trigger-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId } }
+      Policies:
+        - PolicyName: trigger
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt TriggerLogGroup.Arn
+              - Sid: ReadTheWebhookSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref WebhookSecret
+              - Sid: StartBuilders
+                Effect: Allow
+                Action: [lambda:RunMicrovm, lambda:ListMicrovms]
+                Resource: "*"
+              - Sid: DefaultNetwork
+                Effect: Allow
+                Action: lambda:PassNetworkConnector
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:aws:network-connector:aws-network-connector:*"
+              - Sid: PassTheBuilderRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt BuilderRole.Arn
+                Condition: { StringEquals: { "iam:PassedToService": lambda.amazonaws.com } }
+      Tags: [{ Key: agent-drive, Value: pipeline }]
+
+  TriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: agent-drive-build-trigger
+      Description: GitHub push webhook -> one builder MicroVM (deploy/aws/trigger)
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      Handler: index.handler
+      Role: !GetAtt TriggerRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Code: { S3Bucket: !Ref ArtifactBucket, S3Key: !Ref TriggerCodeKey }
+      LoggingConfig: { LogGroup: !Ref TriggerLogGroup, LogFormat: Text }
+      Environment:
+        Variables:
+          REPO_URL: !Ref RepositoryUrl
+          REPO_FULL_NAME: !Ref RepositoryFullName
+          BRANCH: !Ref Branch
+          WEBHOOK_SECRET_ARN: !Ref WebhookSecret
+          BUILDER_IMAGE_ARN: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:agent-drive-builder"
+          BUILDER_IMAGE_VERSION: !Ref BuilderImageVersion
+          BUILDER_ROLE_ARN: !GetAtt BuilderRole.Arn
+          BUILDER_LOG_GROUP: !Ref BuilderLogGroup
+          ARTIFACT_BUCKET: !Ref ArtifactBucket
+          SIGNING_KEY_ARN: !GetAtt SigningKey.Arn
+          DEPLOY_DOCUMENT: !Ref DeployDocument
+          DEPLOY_TAG_VALUE: !Ref DeployTagValue
+      Tags: [{ Key: agent-drive, Value: pipeline }]
+
+  # Public URL for GitHub; every request must carry a valid signature (the
+  # function checks it before doing anything).
+  TriggerUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt TriggerFunction.Arn
+      AuthType: NONE
+  TriggerUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+  TriggerUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
 
   # --- The deploy. The caller passes only Version, a git sha; the steps are
   # fixed here. The script below is deploy/aws/deploy-release.sh, embedded
@@ -552,14 +635,12 @@ Resources:
       Tags: [{ Key: agent-drive, Value: pipeline }]
 
 Outputs:
-  ConnectionArn:
-    Value: !GetAtt GitHubConnection.ConnectionArn
-  CompleteTheConnection:
-    Description: The connection starts PENDING; complete it once, by hand.
-    Value: !Sub >-
-      Console: Developer Tools > Settings > Connections (${AWS::Region}) > agent-drive-github-personal >
-      Update pending connection > install the AWS Connector for GitHub app on jssmith/agent-drive only
-      (Only select repositories) > Connect. Then update this stack with Webhook=true.
+  WebhookUrl:
+    Description: GitHub webhook Payload URL (content type application/json, push events only).
+    Value: !GetAtt TriggerUrl.FunctionUrl
+  WebhookSecretArn:
+    Description: The webhook's secret; copy its value into the webhook's Secret field on GitHub.
+    Value: !Ref WebhookSecret
   ArtifactBucketName:
     Value: !Ref ArtifactBucket
     Export: { Name: !Sub "${AWS::StackName}-ArtifactBucketName" }
@@ -572,15 +653,15 @@ Outputs:
   DeployDocumentName:
     Value: !Ref DeployDocument
     Export: { Name: !Sub "${AWS::StackName}-DeployDocumentName" }
-  BuildProjectName:
-    Value: !Ref BuildProject
-  BuildRoleArn:
-    Value: !GetAtt BuildRole.Arn
-  StartBuild:
-    Description: Build, release and deploy the head of the branch by hand.
+  BuilderRoleArn:
+    Value: !GetAtt BuilderRole.Arn
+  BuilderImageBuildRoleArn:
+    Value: !GetAtt BuilderImageBuildRole.Arn
+  BuildCommit:
+    Description: Build a commit by hand (released only if it is on the branch and release is true).
     Value: !Sub >-
-      aws codebuild start-build --project-name ${BuildProject} --region ${AWS::Region}
-      --environment-variables-override name=RELEASE,value=true,type=PLAINTEXT
+      aws lambda invoke --function-name ${TriggerFunction} --region ${AWS::Region}
+      --cli-binary-format raw-in-base64-out --payload '{"commit":"<sha>","release":true}' /dev/stdout
   DeployVersion:
     Description: Deploy (or roll back to) a release that is already in the bucket.
     Value: !Sub >-

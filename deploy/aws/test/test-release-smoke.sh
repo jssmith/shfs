@@ -19,7 +19,7 @@ mkdir -p "$w/bin" "$w/data"
 v=$(printf 'a9%038d' 1)
 
 [ -f "$repo/server/dist/main.js" ] || { echo "build first: npm ci && npm run build" >&2; exit 1; }
-CODEBUILD_RESOLVED_SOURCE_VERSION="$v" "$repo/deploy/aws/ci.sh" package "$w/out" > "$w/package.log" 2>&1 \
+BUILD_SOURCE_VERSION="$v" "$repo/deploy/aws/ci.sh" package "$w/out" > "$w/package.log" 2>&1 \
   || { cat "$w/package.log"; exit 1; }
 # A key pair standing in for KMS; sign the manifest's digest as KMS does.
 openssl ecparam -name prime256v1 -genkey -noout -out "$w/k.pem" 2>/dev/null

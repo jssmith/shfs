@@ -16,7 +16,7 @@ script = sub[0]
 sample = {
     "DataVolume": "vol-0123456789abcdef0",
     "PublicUrl": "https://drive-dev.example.com",
-    "RepoUrl": "https://github.com/jssmith/agent-drive.git",
+    "RepoUrl": "https://github.com/jssmith/shfs.git",
     "RepoRef": "main",
     "RunSetup": "true",
 }
