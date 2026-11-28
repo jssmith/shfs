@@ -9,7 +9,10 @@
 //! - the per-operation epoch check, for requests that reach the daemon anyway.
 //!
 //! The control socket also answers `stats` with `ok {json}`: the sizes of the daemon's tables
-//! (inodes, paths, open handles, whiteouts), for monitoring.
+//! (inodes, paths, open handles, whiteouts), for monitoring; and `rebase {json}` with
+//! `ok <epoch> {json}`: the server's changes to `upper/` and `whiteouts` after a merge, a hide or
+//! a conflict (`maintain::Rebase`), applied in the daemon so its state and the kernel's caches
+//! follow.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
@@ -164,7 +167,16 @@ impl Mount {
                     };
                     for line in BufReader::new(conn).lines() {
                         let Ok(line) = line else { break };
-                        let reply = match line.trim() {
+                        let line = line.trim();
+                        let (cmd, arg) = line.split_once(' ').unwrap_or((line, ""));
+                        let reply = match cmd {
+                            "rebase" => match crate::maintain::Rebase::parse(arg).and_then(|req| fs.rebase(&req)) {
+                                Ok((ep, invals, removed)) => {
+                                    notify(&server, fd, &invals);
+                                    format!("ok {ep} {}\n", serde_json::json!({ "removed": removed }))
+                                }
+                                Err(e) => format!("error {e}\n"),
+                            },
                             "refresh" => match refresh_and_notify(&fs, &server, fd) {
                                 Ok(ep) => format!("ok {ep}\n"),
                                 Err(e) => format!("error {e}\n"),
@@ -213,6 +225,30 @@ impl Mount {
 impl Drop for Mount {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Sends a rebase request (one JSON line) to a running daemon. Returns its reply after `ok `
+/// (`<epoch> {json}`), or `None` when no daemon is listening.
+pub fn request_rebase(data: &Path, dir_id: &str, json: &str) -> std::io::Result<Option<String>> {
+    if json.contains('\n') {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let path = store::session_dir(data, dir_id).join("control.sock");
+    let mut s = match UnixStream::connect(&path) {
+        Ok(s) => s,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    s.set_read_timeout(Some(Duration::from_secs(30)))?;
+    s.write_all(format!("rebase {json}\n").as_bytes())?;
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line)?;
+    match line.trim().strip_prefix("ok ") {
+        Some(rest) => Ok(Some(rest.to_string())),
+        None => Err(std::io::Error::other(line)),
     }
 }
 

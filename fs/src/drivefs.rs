@@ -61,6 +61,10 @@ pub struct Config {
     pub skip_epoch_check: bool,
     /// Measurement only: always run the epoch query instead of probing for writes first.
     pub no_change_probe: bool,
+    /// The owner (uid, gid) reported for store items and given to everything the daemon
+    /// creates in `upper/`; `None`: the daemon's own euid and egid. gVisor checks permissions
+    /// itself, so a non-root sandbox user can write only what it owns.
+    pub owner: Option<(u32, u32)>,
 }
 
 impl Config {
@@ -72,6 +76,7 @@ impl Config {
             attr_timeout: Duration::ZERO,
             skip_epoch_check: false,
             no_change_probe: false,
+            owner: None,
         }
     }
 }
@@ -204,7 +209,7 @@ impl DriveFs {
     pub fn new(cfg: Config) -> anyhow::Result<DriveFs> {
         let sess = store::session_dir(&cfg.data, &cfg.dir_id);
         fs::create_dir_all(sess.join("upper"))?;
-        let upper = Upper::open(&sess.join("upper"))?;
+        let upper = Upper::open(&sess.join("upper"))?.with_owner(cfg.owner);
         let (whiteouts, whiteout_file) = open_whiteouts(&sess.join("whiteouts"))?;
         let mut db = store::open(&cfg.data)?;
         let (ep, rows) = store::load_view(&mut db, &cfg.dir_id)?;
@@ -231,8 +236,8 @@ impl DriveFs {
             }),
             activity,
             inval_sink: Mutex::new(None),
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid: cfg.owner.map(|o| o.0).unwrap_or_else(|| unsafe { libc::geteuid() }),
+            gid: cfg.owner.map(|o| o.1).unwrap_or_else(|| unsafe { libc::getegid() }),
             mount_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -307,6 +312,46 @@ impl DriveFs {
             }
         }
         Ok((ep, out))
+    }
+
+    /// Applies the server's rebase request (`maintain::Rebase`) under the state lock: drops the
+    /// session's copies the view now serves, rewrites `whiteouts`, and returns the kernel cache
+    /// entries to drop. The view is reloaded first, so the request sees the rows the server just
+    /// wrote. Lock order: db, then state.
+    pub fn rebase(&self, req: &crate::maintain::Rebase) -> io::Result<(i64, Vec<Inval>, usize)> {
+        let (ep, mut out) = self.refresh()?;
+        let mut st = lock(&self.st);
+        let mut touched = req.apply_upper(&self.upper)?;
+        let removed = touched.len();
+        let view = st.view.clone();
+        let new = req.whiteouts_after(&st.whiteouts, &view);
+        if new != st.whiteouts {
+            let path = store::session_dir(&self.cfg.data, &self.cfg.dir_id).join("whiteouts");
+            for p in st.whiteouts.symmetric_difference(&new) {
+                touched.push(p.clone());
+                // Everything under a whiteout that changed may change too.
+                let prefix = format!("{p}/");
+                touched.extend(view.entries.keys().chain(view.dirs.keys()).filter(|q| q.starts_with(&prefix)).cloned());
+            }
+            st.whiteout_file = crate::maintain::rewrite_whiteouts(&path, &new)?;
+            st.whiteouts = new;
+        }
+        for p in touched {
+            if let Some(&parent) = st.by_path.get(parent_of(&p)) {
+                let name = p.rsplit('/').next().unwrap_or(&p);
+                if let Ok(c) = CString::new(name) {
+                    out.push(Inval::Entry { parent, name: c });
+                }
+            }
+            if let Some(&ino) = st.by_path.get(&p) {
+                out.push(Inval::Inode { ino });
+            }
+            // The parent's listing changes too.
+            if let Some(&ino) = st.by_path.get(parent_of(&p)) {
+                out.push(Inval::Inode { ino });
+            }
+        }
+        Ok((ep, out, removed))
     }
 
     /// The per-operation epoch check, called before every lookup, getattr, open, read of an

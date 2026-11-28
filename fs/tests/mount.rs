@@ -20,6 +20,7 @@ struct Env {
     // Fields drop in order: unmount before the temporary directory goes.
     mount: Option<Mount>,
     cached: bool,
+    owner: Option<(u32, u32)>,
     data: PathBuf,
     mnt: PathBuf,
     _tmp: tempfile::TempDir,
@@ -43,7 +44,7 @@ impl Env {
             )
             .unwrap();
         drop(s);
-        let mut e = Env { cached, mnt: store::session_dir(&data, DIR).join("mnt"), data, _tmp: tmp, mount: None };
+        let mut e = Env { cached, owner: None, mnt: store::session_dir(&data, DIR).join("mnt"), data, _tmp: tmp, mount: None };
         e.remount();
         e
     }
@@ -57,6 +58,7 @@ impl Env {
             cfg.entry_timeout = std::time::Duration::from_secs(60);
             cfg.attr_timeout = std::time::Duration::from_secs(60);
         }
+        cfg.owner = self.owner;
         let fs = DriveFs::new(cfg).unwrap();
         let opts = Options { threads: 2, ..Default::default() };
         self.mount = Some(Mount::start(fs, &self.mnt, opts).unwrap());
@@ -579,6 +581,96 @@ fn modes_and_empty_directories(e: Env) {
     assert_eq!(mode("code/moved/lib.rs"), 0o700);
 }
 
+/// With `--uid/--gid` (the sandbox's user), store items are reported as that user's, and
+/// everything the daemon creates in upper/ is given to it, so a sandbox that checks permissions
+/// itself (gVisor) lets that user write them.
+fn owner_is_the_sandbox_user(mut e: Env) {
+    use std::os::unix::fs::MetadataExt;
+    e.owner = Some((1000, 1001));
+    e.remount();
+    let own = |p: &Path| {
+        let m = fs::symlink_metadata(p).unwrap();
+        (m.uid(), m.gid())
+    };
+    assert_eq!(own(&e.p("notes/todo.txt")), (1000, 1001));
+    assert_eq!(own(&e.p("notes")), (1000, 1001));
+    assert_eq!(own(&e.p("_by/project/acme/plan.md")), (1000, 1001));
+    // Copy-up (and the directory it needs), create, mkdir, symlink.
+    fs::OpenOptions::new().append(true).open(e.p("projects/acme/plan.md")).unwrap().write_all(b"more\n").unwrap();
+    fs::write(e.p("notes/new.txt"), b"n").unwrap();
+    fs::create_dir(e.p("made")).unwrap();
+    std::os::unix::fs::symlink("../notes/new.txt", e.p("made/link")).unwrap();
+    for p in ["projects", "projects/acme", "projects/acme/plan.md", "notes/new.txt", "made", "made/link"] {
+        assert_eq!(own(&e.upper(p)), (1000, 1001), "{p} on the host");
+        assert_eq!(own(&e.p(p)), (1000, 1001), "{p} in the mount");
+    }
+}
+
+fn sha(b: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(b))
+}
+
+/// The server's rebase request on the control socket: copies that the view serves again leave
+/// upper/, merged whiteouts go, and a path can be made visible again; the kernel sees each at
+/// once.
+fn rebase_on_the_control_socket(e: Env) {
+    let rebase = |j: String| daemon::request_rebase(&e.data, DIR, &j).unwrap().expect("daemon answers");
+    // A copy-up with unchanged content (chmod forces one), and a real edit.
+    let todo = fs::read(e.p("notes/todo.txt")).unwrap();
+    fs::set_permissions(e.p("notes/todo.txt"), std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    fs::write(e.p("notes/readme.md"), b"edited\n").unwrap();
+    assert!(e.upper("notes/todo.txt").exists());
+    rebase(format!(
+        r#"{{"remove":[{{"path":"notes/todo.txt","sha256":"{}"}},{{"path":"notes/readme.md","sha256":"{}"}}]}}"#,
+        sha(&todo),
+        sha(b"not what is there")
+    ));
+    assert!(!e.upper("notes/todo.txt").exists());
+    assert_eq!(fs::read(e.p("notes/todo.txt")).unwrap(), todo, "served from the store again");
+    assert_eq!(fs::read(e.p("notes/readme.md")).unwrap(), b"edited\n", "a newer write is kept");
+
+    // Whiteouts: a deleted file and a deleted directory.
+    fs::remove_file(e.p("projects/acme/budget.csv")).unwrap();
+    fs::remove_file(e.p("code/src/main.rs")).unwrap();
+    fs::remove_file(e.p("code/src/lib.rs")).unwrap();
+    fs::remove_dir(e.p("code/src")).unwrap();
+    assert!(fs::metadata(e.p("code/src/lib.rs")).is_err());
+    assert_eq!(e.whiteouts().len(), 4);
+    // Make one file under the deleted directory visible: its sibling stays hidden.
+    rebase(r#"{"unwhite":["code/src/lib.rs"]}"#.into());
+    assert_eq!(e.ls("code/src"), ["lib.rs"]);
+    assert_eq!(fs::read_to_string(e.p("code/src/lib.rs")).unwrap(), "pub fn f() {}\n");
+    assert!(fs::metadata(e.p("code/src/main.rs")).is_err());
+    // Drop a whiteout: the item is back.
+    rebase(r#"{"drop_whiteouts":["projects/acme/budget.csv"]}"#.into());
+    assert_eq!(e.ls("projects/acme"), ["budget.csv", "plan.md"]);
+    let w = e.whiteouts();
+    assert!(w.contains("code/src/main.rs") && !w.contains("code/src") && !w.contains("projects/acme/budget.csv"), "{w:?}");
+    // The daemon keeps the new whiteouts across a remount.
+    let mut e = e;
+    e.remount();
+    assert_eq!(e.ls("code/src"), ["lib.rs"]);
+    // A bad request changes nothing.
+    assert!(daemon::request_rebase(&e.data, DIR, r#"{"unwhite":["../etc"]}"#).is_err());
+}
+
+/// Repeated opens of one path in one mode share a row (with a count) for a minute.
+fn opens_are_aggregated(e: Env) {
+    for _ in 0..50 {
+        fs::read(e.p("notes/todo.txt")).unwrap();
+    }
+    e.mount.as_ref().unwrap().fs.flush_activity();
+    let (n, detail): (i64, String) = e
+        .conn()
+        .query_row("SELECT count(*), max(detail) FROM activity WHERE op = 'open'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(n, 1);
+    let d: serde_json::Value = serde_json::from_str(&detail).unwrap();
+    assert_eq!(d["count"], 50);
+    assert_eq!(d["path"], "notes/todo.txt");
+}
+
 macro_rules! both_modes {
     ($($name:ident),* $(,)?) => {
         mod zero_timeouts { $( #[test] fn $name() { super::$name(super::Env::new(false)) } )* }
@@ -610,5 +702,8 @@ both_modes!(
     added_item_appears,
     inode_table_stays_bounded,
     hard_links_are_refused,
+    owner_is_the_sandbox_user,
+    rebase_on_the_control_socket,
+    opens_are_aggregated,
     modes_and_empty_directories,
 );
