@@ -1,7 +1,8 @@
 name: ci
 # Every push to main and every pull request: the full TypeScript suite with
 # the gVisor suites (deploy/aws/ci.sh test, the same steps every build host
-# runs), and the Rust daemon's tests. Hosted Ubuntu runners are free for a
+# runs), the same with /drive served by the Rust daemon (AGENT_DRIVE_FS=daemon),
+# and the Rust daemon's tests. Hosted Ubuntu runners are free for a
 # public repository and give root, Docker and a current kernel, which gVisor
 # and FUSE need. No secrets are used.
 on:
@@ -74,6 +75,54 @@ jobs:
         run: |
           rootfs="$RUNNER_TEMP/ci-data/images/default/rootfs"
           sudo -E env "PATH=$PATH" CI_DATA="$RUNNER_TEMP/ci-data" \
+            AGENT_DRIVE_ROOTFS="$rootfs" AGENT_DRIVE_TEST_IMAGE_ROOTFS="$rootfs" deploy/aws/ci.sh test
+
+  # The same suite with /drive served by fs/'s daemon (AGENT_DRIVE_FS=daemon):
+  # every session gets an agent-drive-fs mount, in the unit suites and in gVisor.
+  test-daemon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: System packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            jq zstd tesseract-ocr tesseract-ocr-eng poppler-utils imagemagick fuse3
+          ls -l /dev/fuse
+      - name: gVisor
+        run: sudo sandbox/install-runsc.sh /usr/local/bin && runsc --version
+      - name: Build the daemon
+        working-directory: fs
+        run: cargo build --release --locked
+      - name: Sandbox cache key
+        id: sandbox
+        run: echo "key=sandbox-${{ hashFiles('sandbox/**') }}-$(date -u +%G-w%V)" >> "$GITHUB_OUTPUT"
+      - name: Restore the sandbox rootfs
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/sandbox-rootfs.tar.zst
+          key: ${{ steps.sandbox.outputs.key }}
+      - name: Unpack or build the sandbox rootfs
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+        run: |
+          data="$RUNNER_TEMP/ci-data"; tarball="$RUNNER_TEMP/sandbox-rootfs.tar.zst"
+          if [ "$HIT" = true ]; then
+            sudo mkdir -p "$data" && sudo tar -I zstd -xf "$tarball" -C "$data"
+          else
+            sudo -E env "PATH=$PATH" AGENT_DRIVE_DATA="$data" NAME_PREFIX=ci- sandbox/build.sh
+          fi
+      - name: Test in daemon mode (gVisor suites included)
+        # As root, for runsc and FUSE.
+        run: |
+          rootfs="$RUNNER_TEMP/ci-data/images/default/rootfs"
+          sudo -E env "PATH=$PATH" CI_DATA="$RUNNER_TEMP/ci-data" \
+            AGENT_DRIVE_TEST_FS=daemon AGENT_DRIVE_FS_BIN="$PWD/fs/target/release/agent-drive-fs" \
             AGENT_DRIVE_ROOTFS="$rootfs" AGENT_DRIVE_TEST_IMAGE_ROOTFS="$rootfs" deploy/aws/ci.sh test
 
   rust:
