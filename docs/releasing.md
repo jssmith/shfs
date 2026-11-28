@@ -27,8 +27,10 @@ VM. The mechanics (roles, signing, the VM side) are in
 1. **Prepare** in a pull request:
    - `CHANGELOG.md`: a section for the version, with what changed for people
      running a drive (features, fixes, anything that breaks or needs action).
-   - Versions: `package.json` (root, `server/`, `cli/`) and `fs/Cargo.toml`, all
-     the same version.
+   - Versions: `package.json` (root, `server/`, `cli/`, `test/`) and
+     `fs/Cargo.toml`, all the same: the version being prepared. Pre-release tags
+     (`v0.1.0-dev.1`, `v0.1.0-rc.1`) release that version early and do not
+     change these files.
    - Merge it once CI passes.
 2. **Tag** the merge commit on `main` and push the tag:
    ```bash
