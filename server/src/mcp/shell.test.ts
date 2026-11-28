@@ -5,7 +5,7 @@ import { afterEach, expect, test } from 'vitest';
 import net from 'node:net';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { upload, settle } from '../testing.js';
+import { upload, settle, sessionDrive } from '../testing.js';
 import { mcpEnv, type McpEnv } from './test-env.js';
 import type { Surface } from '../context.js';
 import { SHELL_SKILL } from './skill.js';
@@ -202,7 +202,7 @@ test('the drive command over the session socket: search, --all, save, help, and 
 
   // A request on A's socket acts on A only, whatever it claims.
   // B's command changed a file and has not ended yet (what bash's drive save sees).
-  await safeWrite(e.ctx.sessions.dirs(b.dir).upper, 'notes/b.md', 'from b\n');
+  await safeWrite(await sessionDrive(e.ctx, b.dir), 'notes/b.md', 'from b\n');
   const stA = await driveCmd(sockA, { argv: ['status'], session_id: b.sid, dir_id: b.dir });
   expect(stA.stdout).toContain('Purpose: count my receipts');
   expect(stA.stdout).toContain('Unsaved changes: none.');

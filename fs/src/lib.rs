@@ -2,6 +2,7 @@
 
 pub mod daemon;
 pub mod drivefs;
+pub mod maintain;
 pub mod store;
 pub mod stub;
 pub mod time;

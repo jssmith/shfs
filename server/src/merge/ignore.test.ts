@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from 'vitest';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { tempContext, upload, settle } from '../testing.js';
+import { tempContext, upload, settle, sessionDrive } from '../testing.js';
 import { mergeSession } from './merge.js';
 import { isToolCache, summariseIgnored } from './ignore.js';
 import { archiveToolCaches } from './cleanup.js';
@@ -27,7 +27,7 @@ test('checkpoint skips tool caches, reports them, and leaves them in the working
   await upload(ctx, { 'proj/m.py': 'x = 1\n' });
   await settle(ctx);
   const { row } = await ctx.sessions.start('c', 'p', {});
-  const up = ctx.sessions.dirs(row.dir_id).upper;
+  const up = await sessionDrive(ctx, row.dir_id);
   mkdirSync(path.join(up, 'proj/__pycache__'));
   writeFileSync(path.join(up, 'proj/__pycache__/m.cpython-312.pyc'), Buffer.from([0, 1, 2]));
   mkdirSync(path.join(up, 'proj/.pytest_cache/v'), { recursive: true });

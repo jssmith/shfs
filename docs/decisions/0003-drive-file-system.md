@@ -2,7 +2,7 @@
 
 - **Question:** Can a host daemon serve each session's `/drive` from the store and the session's policy (docs/contracts.md §2) correctly and fast enough to replace the copied session folders? Does fuse-backend-rs give us one implementation for gVisor (`/dev/fuse`) and microVMs (virtio-fs)?
 - **Measured:** correctness at the host mount and inside gVisor; speed inside gVisor against a plain bind mount of the same files; whether the same code serves virtio-fs. Details below.
-- **Decision:** Keep the daemon and finish it. Do not swap it in yet: five items of work come first (below). Do not fall back to copied directories as the long-term design. **Follow-up 2026-11-25:** the daemon's items are done (see the end); swap it in behind a switch once the server's side is in.
+- **Decision:** Keep the daemon and finish it. Do not swap it in yet: five items of work come first (below). Do not fall back to copied directories as the long-term design. **Follow-up 2026-11-25:** the daemon's items are done (see the end); swap it in behind a switch once the server's side is in. **Follow-up 2026-11-28:** the server's side is in, behind `AGENT_DRIVE_FS=daemon` (default `copy`); both modes pass the whole suite.
 - **Would change it:** a fix for the path-safety item that costs more than about 20% in the benchmarks below; agent sessions finding 3x on `git status` and `rg` too slow in practice; virtio-fs needing a second implementation after all.
 
 ## What was built
@@ -241,3 +241,59 @@ Memory and tables over time (samples every 30 s, about every fourth shown):
 ### Recommendation
 
 Swap the daemon in for gVisor sessions, behind a per-environment switch that keeps the copied folders as the default until server items 1 to 4 and 7 are in. The blocking item is fixed at no measurable cost, memory is bounded, deletes are durable, and the soak found no correctness failure under concurrent Git, tests, small-file churn, renames and 1,124 epoch changes. Items 5 and 6 can follow: the daemon reads the current schema, and until then modes and empty directories behave as they do today. Still open: gVisor checkpoint and restore with the FUSE mount (not tried), several sessions with one daemon each under load (one at a time here), and the virtio-fs invalidation question for microVMs.
+
+
+## Follow-up, 2026-11-28 (fs-daemon-switch): the server's side, behind `AGENT_DRIVE_FS=daemon`
+
+Server items 1 to 4 and 7 above are in. `AGENT_DRIVE_FS=copy` (the default) is unchanged; `daemon` serves each session's `/drive` with this daemon. Two `contract:` commits record the changes in `docs/contracts.md` for the lead session's review.
+
+| Item | What the server does now | Shown by |
+| --- | --- | --- |
+| Refresh | After every epoch bump, once its transaction commits, writes `refresh` to `control.sock` and waits for `ok <epoch>` (5 s; no socket: nothing to do), in both modes | `fsd.test.ts`, the gVisor hide tests (`held`, `leak`) in daemon mode |
+| Lifecycle | One `agent-drive-fs mount` per session (60 s timeouts, `--exit-with-parent`) when its sandbox starts, or for the server's own write to `/drive`; the sandbox gets `sessions/<dir_id>/mnt` at `/drive`; stopped (with a lazy `fusermount3 -u` if needed) when the sandbox goes and on shutdown | every suite in daemon mode; no mount left after the runs (`/proc/mounts`) |
+| Ownership | `mount --uid --gid`: store items are reported as the sandbox user's, and everything the daemon creates in `upper/` (and `upper/` itself, the root of `/drive`) is given to it | `tests/mount.rs` `owner_is_the_sandbox_user`; `e2e/image.test.ts` (uid 1000 appends, mkdirs, appends again after a merge) |
+| The view | `materialise` writes rows only; after a merge the merged copies leave `upper/` and the merged whiteouts go, through `rebase` on the control socket (or on disk when no daemon runs). Tool caches stay | `fsd.test.ts`, `tests/mount.rs` `rebase_on_the_control_socket` |
+| Diff and merge | `upper/` against `session_base`, plus whiteouts (a path or a folder above it) as deletes, with the move detection; a path in both is a replacement (an update) | `fsd.test.ts`, the merge and invariant suites in daemon mode |
+| Path safety (R14) | The server never opens anything in `upper/` itself. `agent-drive-fs export` copies its regular files into the session's `state/` (which no sandbox mounts) with a manifest; diff and merge read only that copy. `read` serves the host tools; writes go through the mount with `write` (`openat2`, `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS`) | `maintain.rs` `planted_symlinks_are_never_followed`; `fsd.test.ts` and `manager.test.ts` (symlinks planted through the mount) |
+| Conflicts | The session's version (from the copy) goes to `/work/conflicts/…` and leaves `upper/` if unchanged since; whiteouts over the drive's version go (`unwhite` keeps the rest of a deleted folder hidden) | `fsd.test.ts`, `shell.test.ts` in daemon mode |
+| Accounting | One `activity` row per (path, mode, item) per minute, `detail.count` the opens | `store.rs` unit test, `tests/mount.rs` `opens_are_aggregated`, the benchmark below |
+
+### Tests
+
+| Suite | copy | daemon |
+| --- | ---: | ---: |
+| `npm test` with the gVisor suites (`AGENT_DRIVE_RUNSC`, `AGENT_DRIVE_ROOTFS`, Debian 13 rootfs from `sandbox/build.sh`) | 107/107 | 107/107 (`AGENT_DRIVE_TEST_FS=daemon`) |
+| invariants, 500 random runs (`INVARIANT_RUNS=500`) | | 500 runs, 6,040 steps, 329 merges: pass (106 s) |
+| `cargo test` in `fs/` | 11 unit, 54 mount (27 in each cache mode), 5 path safety, 1 virtio | |
+
+The 107 include six new daemon-mode tests (`server/src/sessions/fsd.test.ts`), which run whenever root, `/dev/fuse` and a built `agent-drive-fs` are there. The existing tests that played the sandbox by writing into `upper/` now write into the session's `/drive` on the host (`sessionDrive`: `upper/` in copy mode, the mount in daemon mode); none was weakened or skipped. CI runs the whole suite a second time in daemon mode (job `test-daemon`).
+
+### Speed through the server
+
+`node fs/bench/server-modes.mjs 7`: two server contexts, one per mode, the same synthetic tree of 2,000 Python-like files (1.4 MB) uploaded to each, commands run through `Sessions.run` in gVisor (`--file-access-mounts=shared` in both, as `runsc.ts` always passes), interleaved, timed inside the sandbox; medians of 7 after a warm-up, ms. Same machine as above (4 CPUs, shared, load 0.6 to 2).
+
+| Benchmark | copy | daemon | daemon / copy |
+| --- | ---: | ---: | ---: |
+| `git status` (a repository the session made: 2,000 files, in `upper/` in both modes) | 63 | 211 | 3.4x |
+| `rg -c 'def '` (the store's 2,000 files) | 169 | 535 | 3.2x |
+| `find -type f` (the store's files) | 30 | 38 | 1.3x |
+| `cat` of every file (the store's files) | 641 | 1306 | 2.0x |
+| 1,000 files x 1 KiB, created with `cp` (mostly process start-up in gVisor) | 10552 | 11705 | 1.1x |
+| The diff before a checkpoint, on the host (about 5,000 files the session wrote; copy mode also hashes the view's 2,000) | 1935 | 93 | 0.05x |
+
+- Inside the sandbox the ratios match the spike's (2.9x on `git status`, 3.0x on `rg` against a shared-mode copy): the cost is the FUSE round trips, not the server's side.
+- The diff before a checkpoint is much faster in daemon mode: one Rust process hashes `upper/`, where copy mode hashes every file of the view in Node. A merge adds the copy of the changed files.
+- Accounting: 116,854 opens in 18,164 `activity` rows over the 4.5 minutes of the run (6.4 opens per row), against one row per open before.
+
+### Chosen differently from the brief, and why
+
+- **Host writes go through the mount**, not into `upper/` directly: a direct write would leave the kernel's cached size and times stale for 60 s and would not apply copy-up and whiteout rules (a write onto a deleted folder's path). If no sandbox runs, the server starts the session's daemon for the write; it stops with the next sandbox teardown (idle sweep, shutdown). The daemon counts these as `fs` opens.
+- **A `rebase` command on the control socket** (not in the brief): resetting `upper/` and `whiteouts` behind a running daemon would leave its in-memory whiteouts and the kernel's caches wrong. The server asks the daemon (or `agent-drive-fs rebase` when none runs, serialised with daemon start) to drop a copy only if it still has the exported content, so a write after the export survives, and to drop only the whiteout lines it merged, so a delete after the export survives.
+- **Copies with a mode other than 0644 stay in `upper/`** after a merge when their content is what the view now serves: the server does not store modes yet (item 5), and removing the copy would lose an executable bit that copy mode keeps.
+
+### Still open
+
+- Items 5 and 6 (modes and empty directories in the server's rows).
+- gVisor checkpoint and restore with the FUSE mount; several sessions under load (the invariant suite runs three sessions' daemons at once, without load).
+- `/work` is still bind-mounted and written by the server with `fsafe.ts` (`/work/conflicts`, run output): the R14 race applies there in both modes.
+- A daemon that dies under a running sandbox is noticed at the next command, which replaces the sandbox; nothing restarts it sooner.

@@ -105,6 +105,9 @@ pub struct Name {
 pub struct Upper {
     root: OwnedFd,
     path: PathBuf,
+    /// Owner given to everything created here (files, directories, symlinks); `None` keeps
+    /// the creating process's own.
+    owner: Option<(u32, u32)>,
 }
 
 impl Upper {
@@ -116,7 +119,34 @@ impl Upper {
         if fd < 0 {
             return Err(last());
         }
-        Ok(Upper { root: unsafe { OwnedFd::from_raw_fd(fd) }, path: path.to_path_buf() })
+        Ok(Upper { root: unsafe { OwnedFd::from_raw_fd(fd) }, path: path.to_path_buf(), owner: None })
+    }
+
+    /// Everything created from now on is owned by `uid:gid` (the sandbox's user, so that it can
+    /// write what it created and what was copied up for it).
+    pub fn with_owner(mut self, owner: Option<(u32, u32)>) -> Upper {
+        self.owner = owner;
+        self
+    }
+
+    /// Gives `upper/` itself (the session's `/drive`) to the owner (no-op without one).
+    pub fn own_root(&self) -> io::Result<()> {
+        if let Some((uid, gid)) = self.owner {
+            if unsafe { libc::fchown(self.fd(), uid, gid) } < 0 {
+                return Err(last());
+            }
+        }
+        Ok(())
+    }
+
+    /// Gives a name just created in `dir` to the owner (no-op without one).
+    fn own_at(&self, dir: RawFd, name: &CStr) -> io::Result<()> {
+        if let Some((uid, gid)) = self.owner {
+            if unsafe { libc::fchownat(dir, name.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW) } < 0 {
+                return Err(last());
+            }
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -128,8 +158,17 @@ impl Upper {
     }
 
     /// Opens a path in `upper/` (never following a symlink anywhere in it).
+    /// A file created here (`O_CREAT | O_EXCL`) is given to the owner.
     pub fn open_file(&self, path: &str, flags: i32, mode: u32) -> io::Result<File> {
-        Ok(File::from(openat2(self.fd(), &rel(path)?, flags, mode)?))
+        let fd = openat2(self.fd(), &rel(path)?, flags, mode)?;
+        if let Some((uid, gid)) = self.owner {
+            if flags & (libc::O_CREAT | libc::O_EXCL) == libc::O_CREAT | libc::O_EXCL
+                && unsafe { libc::fchown(fd.as_raw_fd(), uid, gid) } < 0
+            {
+                return Err(last());
+            }
+        }
+        Ok(File::from(fd))
     }
 
     /// The parent directory of `path` (an `O_PATH` fd) and the last name.
@@ -157,7 +196,7 @@ impl Upper {
         if unsafe { libc::mkdirat(p.as_raw_fd(), n.as_ptr(), mode) } < 0 {
             return Err(last());
         }
-        Ok(())
+        self.own_at(p.as_raw_fd(), &n)
     }
 
     /// `mkdir -p` inside `upper/`: each component is created if missing (with the mode
@@ -188,6 +227,7 @@ impl Upper {
             } else {
                 // Exactly this mode, whatever the daemon's umask.
                 chmod_at(at, &c, mode_of(&prefix))?;
+                self.own_at(at, &c)?;
             }
             let next = openat2(at, &c, libc::O_PATH | libc::O_DIRECTORY, 0).map_err(|e| {
                 // A symlink or a file where a directory should be.
@@ -204,7 +244,7 @@ impl Upper {
         if unsafe { libc::symlinkat(t.as_ptr(), p.as_raw_fd(), n.as_ptr()) } < 0 {
             return Err(last());
         }
-        Ok(())
+        self.own_at(p.as_raw_fd(), &n)
     }
 
     pub fn readlink(&self, path: &str) -> io::Result<Vec<u8>> {

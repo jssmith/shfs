@@ -139,6 +139,10 @@ pub fn load_view(conn: &mut Connection, dir_id: &str) -> rusqlite::Result<(i64, 
 /// How long opens are collected before they are written to `activity`.
 const BATCH: Duration = Duration::from_millis(20);
 
+/// Opens of one (path, mode, item) within this long of the first share one `activity` row,
+/// whose `detail.count` says how many there were (docs/contracts.md §2, Accounting).
+pub const AGGREGATE: Duration = Duration::from_secs(60);
+
 /// One file open, for `activity`.
 #[derive(Debug, Clone)]
 pub struct OpenRecord {
@@ -149,7 +153,10 @@ pub struct OpenRecord {
 }
 
 /// Appends `activity` rows on a background thread, batching whatever is queued into one
-/// transaction, so an open never waits for SQLite to commit.
+/// transaction, so an open never waits for SQLite to commit. Repeated opens of the same path
+/// in the same mode are counted into the row of the first one for [`AGGREGATE`]: at most one
+/// row per (path, mode) per minute, instead of one per open (4.8 million rows in a 25-minute
+/// soak, decision 0003).
 pub struct ActivityLog {
     tx: Option<mpsc::Sender<Msg>>,
     handle: Option<thread::JoinHandle<()>>,
@@ -160,14 +167,35 @@ enum Msg {
     Flush(mpsc::Sender<()>),
 }
 
+type Key = (String, &'static str, Option<String>);
+
+/// The row of one key: its id, when it started, how many opens it counts, and whether the
+/// count changed since it was last written.
+struct Window {
+    row: i64,
+    started: std::time::Instant,
+    count: u64,
+    dirty: bool,
+}
+
+fn detail(path: &str, mode: &str, count: u64) -> String {
+    serde_json::json!({ "path": path, "mode": mode, "count": count }).to_string()
+}
+
 impl ActivityLog {
     pub fn start(data: &Path, dir_id: &str) -> rusqlite::Result<ActivityLog> {
+        Self::start_with(data, dir_id, AGGREGATE)
+    }
+
+    /// `window`: how long opens of one key share a row (zero: one row per open).
+    pub fn start_with(data: &Path, dir_id: &str, window: Duration) -> rusqlite::Result<ActivityLog> {
         let mut conn = open(data)?;
         let dir_id = dir_id.to_string();
         let (tx, rx) = mpsc::channel::<Msg>();
         let handle = thread::Builder::new()
             .name("a2-fs-activity".into())
             .spawn(move || {
+                let mut windows: std::collections::HashMap<Key, Window> = std::collections::HashMap::new();
                 while let Ok(first) = rx.recv() {
                     // Collect for up to BATCH, so a burst of opens is one transaction (each
                     // write also makes the daemon's change probe fall through to a query).
@@ -184,20 +212,35 @@ impl ActivityLog {
                             Err(_) => break,
                         }
                     }
+                    let now = std::time::Instant::now();
+                    windows.retain(|_, w| now.duration_since(w.started) < window);
                     let mut waiters = Vec::new();
                     let res: rusqlite::Result<()> = (|| {
                         let t = conn.transaction()?;
                         {
-                            let mut st = t.prepare_cached(
+                            let mut ins = t.prepare_cached(
                                 "INSERT INTO activity (ts, dir_id, actor, op, item_id, detail)
                                  VALUES (?1, ?2, 'fs', 'open', ?3, ?4)",
                             )?;
                             for m in &batch {
-                                if let Msg::Open(r) = m {
-                                    let detail =
-                                        serde_json::json!({ "path": r.path, "mode": r.mode })
-                                            .to_string();
-                                    st.execute(params![r.ts, dir_id, r.item_id, detail])?;
+                                let Msg::Open(r) = m else { continue };
+                                let key: Key = (r.path.clone(), r.mode, r.item_id.clone());
+                                if let Some(w) = windows.get_mut(&key) {
+                                    w.count += 1;
+                                    w.dirty = true;
+                                    continue;
+                                }
+                                ins.execute(params![r.ts, dir_id, r.item_id, detail(&r.path, r.mode, 1)])?;
+                                if !window.is_zero() {
+                                    let row = t.last_insert_rowid();
+                                    windows.insert(key, Window { row, started: now, count: 1, dirty: false });
+                                }
+                            }
+                            let mut upd = t.prepare_cached("UPDATE activity SET detail = ?1 WHERE id = ?2")?;
+                            for ((path, mode, _), w) in windows.iter_mut() {
+                                if w.dirty {
+                                    upd.execute(params![detail(path, mode, w.count), w.row])?;
+                                    w.dirty = false;
                                 }
                             }
                         }
@@ -316,5 +359,38 @@ mod tests {
         bump_epoch(&writer, "a2-p").unwrap();
         assert!(probe.changed());
         assert_eq!(epoch(&reader, "a2-p").unwrap(), 3);
+    }
+
+    #[test]
+    fn repeated_opens_share_one_row_per_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = crate::stub::StubStore::create(tmp.path(), "a2-agg").unwrap();
+        s.add_synthetic().unwrap();
+        let rec = |p: &str, mode: &'static str| OpenRecord { ts: crate::time::now_iso(), item_id: None, path: p.into(), mode };
+        let rows = || -> Vec<String> {
+            let c = open(tmp.path()).unwrap();
+            let mut st = c.prepare("SELECT detail FROM activity WHERE op = 'open' ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+        };
+        let log = ActivityLog::start_with(tmp.path(), "a2-agg", Duration::from_millis(400)).unwrap();
+        for _ in 0..1000 {
+            log.record(rec("a.txt", "r"));
+        }
+        log.record(rec("a.txt", "w"));
+        log.record(rec("b.txt", "r"));
+        log.flush();
+        for _ in 0..5 {
+            log.record(rec("a.txt", "r"));
+        }
+        log.flush();
+        let got = rows();
+        assert_eq!(got.len(), 3, "{got:?}");
+        let d: serde_json::Value = serde_json::from_str(&got[0]).unwrap();
+        assert_eq!((d["path"].as_str(), d["mode"].as_str(), d["count"].as_u64()), (Some("a.txt"), Some("r"), Some(1005)));
+        // After the window, a new row.
+        std::thread::sleep(Duration::from_millis(500));
+        log.record(rec("a.txt", "r"));
+        log.flush();
+        assert_eq!(rows().len(), 4);
     }
 }

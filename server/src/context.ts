@@ -10,6 +10,7 @@ import { RunscSandbox } from './sessions/runsc.js';
 import { loadImageSettings } from './sessions/image.js';
 import { AutoMerge } from './merge/auto.js';
 import { driveCommands } from './sessions/drive-command.js';
+import { FsDaemons, fsBinFromEnv, parseFsMode, type FsMode } from './sessions/fsd.js';
 
 export interface Config {
   dataDir: string;
@@ -25,6 +26,13 @@ export interface Config {
   idleAfterMs?: number;
   /** A session with no calls for this long is expired for good (AGENT_DRIVE_EXPIRE_AFTER_S). */
   expireAfterMs?: number;
+  /**
+   * The session file system (AGENT_DRIVE_FS): 'copy' (default) copies the session's view into
+   * sessions/<dir_id>/upper/ and mounts that; 'daemon' serves it with fs/'s daemon
+   * (docs/contracts.md §2), found at AGENT_DRIVE_FS_BIN or as agent-drive-fs on PATH.
+   */
+  fs?: FsMode;
+  fsBin?: string;
 }
 
 /** Defaults for session expiry: idle after 1 hour, expired after 30 days (the security design's re-approval period). */
@@ -54,6 +62,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     surface: parseSurface(env.AGENT_DRIVE_SURFACE),
     idleAfterMs: env.AGENT_DRIVE_IDLE_AFTER_S ? Number(env.AGENT_DRIVE_IDLE_AFTER_S) * 1000 : IDLE_AFTER_MS,
     expireAfterMs: env.AGENT_DRIVE_EXPIRE_AFTER_S ? Number(env.AGENT_DRIVE_EXPIRE_AFTER_S) * 1000 : EXPIRE_AFTER_MS,
+    fs: parseFsMode(env.AGENT_DRIVE_FS),
+    fsBin: fsBinFromEnv(env),
   };
 }
 
@@ -75,7 +85,8 @@ export function createContext(config: Config, sandbox?: Sandbox): Context {
     (config.runsc
       ? new RunscSandbox({ runsc: config.runsc, stateRoot: config.runscRoot, rootfs: config.rootfs, prefix: config.sandboxPrefix, image: loadImageSettings(config.rootfs) })
       : new NoExecSandbox());
-  const sessions = new Sessions(drive, path.join(config.dataDir, 'sessions'), sb, config.sandboxPrefix);
+  const fsd = config.fs === 'daemon' ? new FsDaemons(config.fsBin ?? fsBinFromEnv(), config.dataDir, config.sandboxPrefix) : undefined;
+  const sessions = new Sessions(drive, path.join(config.dataDir, 'sessions'), sb, config.sandboxPrefix, fsd);
   sessions.idleAfterMs = config.idleAfterMs ?? IDLE_AFTER_MS;
   sessions.expireAfterMs = config.expireAfterMs ?? EXPIRE_AFTER_MS;
   // Idle and expired sessions lose their sandboxes (sessions/manager.ts, sweep).
