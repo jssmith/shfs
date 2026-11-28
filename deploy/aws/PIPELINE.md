@@ -1,14 +1,17 @@
 # Deployment pipeline
 
-GitHub Actions tests every push and pull request. A pushed version tag on a
-commit of `main` reruns the tests, then makes a signed, versioned release in
-S3 and deploys it to the dev VM, which has no GitHub access and no long-lived
+GitHub Actions tests every push and pull request. Every commit on `main` that
+passes CI is deployed to the dev VM (`deploy-dev.yml`); a version tag, approved
+in the `release` environment, makes a release (`release.yml`). Both make a
+signed, versioned release in S3 and deploy it to the dev VM, which has no GitHub access and no long-lived
 secrets, through one fixed SSM document. The release process for people:
 `docs/releasing.md`. History: decision 0007 (CodeBuild could not run gVisor; a
 Lambda MicroVM builder worked but its speed varied 4x between starts).
 
 ```
 push / pull request ──▶ .github/workflows/ci.yml: ci.sh test (gVisor suites included), Rust tests
+ci passed on main ──▶ .github/workflows/deploy-dev.yml (GitHub OIDC token: ref:refs/heads/main)
+                   ci.sh package → ci.sh publish → the steps below
 tag v* on main ──▶ .github/workflows/release.yml
                    ci.yml again → tag on main? → npm ci, build → ci.sh package
                    │ environment "release": Johann approves the job
@@ -29,6 +32,7 @@ tag v* on main ──▶ .github/workflows/release.yml
 | File | What |
 | --- | --- |
 | `../../.github/workflows/ci.yml` | Tests on every push to `main` and every pull request; reused by `release.yml` |
+| `../../.github/workflows/deploy-dev.yml` | After CI passes on `main`: package, sign, upload, deploy to dev |
 | `../../.github/workflows/release.yml` | On a `v*` tag: CI, then package, sign, upload, deploy |
 | `pipeline.yaml` | Stack `agent-drive-pipeline`: bucket, signing key, GitHub OIDC provider, release role, SSM document |
 | `dev-vm.yaml` | The VM stack (Debian 13); `ReleaseReadPolicy` lets its instance role read releases and the public key |
@@ -130,8 +134,9 @@ statement.
 
 **Release role** `agent-drive-release-us-east-2`, assumable only with GitHub's
 OIDC token for a job in the `release` environment of `jssmith/shfs`
-(`sub` = `repo:jssmith/shfs:environment:release`, `aud` = `sts.amazonaws.com`),
-for at most an hour:
+(`sub` = `repo:jssmith/shfs:environment:release`) or a workflow running on
+`main` (`sub` = `repo:jssmith/shfs:ref:refs/heads/main`), with `aud` =
+`sts.amazonaws.com`, for at most an hour:
 
 | Can | Resource |
 | --- | --- |
@@ -143,7 +148,8 @@ for at most an hour:
 
 It cannot: overwrite or delete a release, list the bucket, run any other SSM
 document or any shell of its choosing on the VM, reach untagged instances,
-change IAM, KMS or the stack. A job outside the `release` environment cannot assume it.
+change IAM, KMS or the stack. A branch push, a pull request or a tag outside the
+`release` environment cannot assume it.
 
 **VM instance role** `agent-drive-dev-instance-us-east-2`:
 
@@ -177,6 +183,13 @@ tokens for that environment (`sub` = `repo:jssmith/shfs:environment:release`).
 A workflow that leaves the environment out gets no credentials; one that keeps
 it waits for the approval. The workflow's own checks (CI, "the tag is on
 `main`") guard against mistakes.
+
+Deploys to dev from `main` rest on the `main` ruleset: `main` changes only
+through pull requests that pass `test` and `rust`, and cannot be force-pushed.
+`deploy-dev.yml` runs on `workflow_run`, so GitHub takes it from `main`, never
+from a branch. The ruleset requires no approvals today, so anyone with write
+access can merge a green pull request of their own and have it deployed to dev
+(synthetic data only); requiring one approval closes that.
 
 The VM accepts only a manifest signed by the KMS key, for the version it was
 asked for (a manifest copied from another version's path is refused), and
