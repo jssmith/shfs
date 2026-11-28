@@ -134,8 +134,9 @@ statement.
 
 **Release role** `agent-drive-release-us-east-2`, assumable only with GitHub's
 OIDC token for a job in the `release` environment of `jssmith/shfs`
-(`sub` = `repo:jssmith/shfs:environment:release`) or a workflow running on
-`main` (`sub` = `repo:jssmith/shfs:ref:refs/heads/main`), with `aud` =
+(`sub` = `repo:jssmith@782994/shfs@1470850220:environment:release`) or a
+workflow running on `main` (`sub` =
+`repo:jssmith@782994/shfs@1470850220:ref:refs/heads/main`), with `aud` =
 `sts.amazonaws.com`, for at most an hour:
 
 | Can | Resource |
@@ -179,7 +180,8 @@ the workflow can be a security boundary: someone with push access could tag a
 commit whose workflow skips the checks. The boundary is GitHub's environment
 gate. The release job runs in the environment `release`, which requires
 Johann's approval (and is limited to `v*` tags), and `ReleaseRole` trusts only
-tokens for that environment (`sub` = `repo:jssmith/shfs:environment:release`).
+tokens for that environment (`sub` = `repo:jssmith@782994/shfs@1470850220:environment:release`;
+GitHub names the repository by owner and repository ids as well as names).
 A workflow that leaves the environment out gets no credentials; one that keeps
 it waits for the approval. The workflow's own checks (CI, "the tag is on
 `main`") guard against mistakes.
