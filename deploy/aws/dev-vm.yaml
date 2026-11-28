@@ -17,8 +17,8 @@ Parameters:
     AllowedValues: [enabled, disabled]
   ImageId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
-    Description: Ubuntu 24.04 LTS, resolved from Canonical's public SSM parameter at deploy time.
+    Default: /aws/service/debian/release/13/latest/amd64
+    Description: Debian 13 (trixie), resolved from Debian's public SSM parameter at deploy time.
   RootVolumeSize:
     Type: Number
     Default: 40
@@ -169,7 +169,7 @@ Resources:
           HttpPutResponseHopLimit: 1
           HttpEndpoint: enabled
         BlockDeviceMappings:
-          - DeviceName: /dev/sda1
+          - DeviceName: /dev/xvda   # the Debian image's root device
             Ebs: { VolumeSize: !Ref RootVolumeSize, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
         TagSpecifications:
           - ResourceType: instance
@@ -190,9 +190,20 @@ Resources:
         Fn::Base64: !Sub
           - |
             #!/bin/bash
-            # First boot: write setup.env, check out the repository, run setup.sh.
+            # First boot: the SSM agent and the AWS CLI (Debian's image has
+            # neither; the deploy document needs both), setup.env, and with
+            # RunSetup a checkout and setup.sh. Releases do the rest.
             set -euo pipefail
             exec > >(tee -a /var/log/agent-drive-setup.log) 2>&1
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -q
+            apt-get install -y -q --no-install-recommends ca-certificates curl awscli
+            if ! systemctl is-active --quiet amazon-ssm-agent; then
+              curl -fsSL --retry 5 -o /tmp/amazon-ssm-agent.deb \
+                "https://s3.${AWS::Region}.amazonaws.com/amazon-ssm-${AWS::Region}/latest/debian_amd64/amazon-ssm-agent.deb"
+              dpkg -i /tmp/amazon-ssm-agent.deb && rm -f /tmp/amazon-ssm-agent.deb
+              systemctl enable --now amazon-ssm-agent
+            fi
             mkdir -p /etc/agent-drive
             cat > /etc/agent-drive/setup.env <<'EOF'
             DATA_VOLUME_ID=${DataVolume}
@@ -201,7 +212,7 @@ Resources:
             AGENT_DRIVE_PUBLIC_URL=${PublicUrl}
             EOF
             [ "${RunSetup}" = "true" ] || exit 0
-            apt-get update -q && apt-get install -y -q git
+            apt-get install -y -q git
             if [ ! -d /opt/agent-drive/.git ]; then git clone ${RepoUrl} /opt/agent-drive; fi
             git -C /opt/agent-drive fetch -q origin ${RepoRef} && git -C /opt/agent-drive checkout -q FETCH_HEAD
             /opt/agent-drive/deploy/aws/setup.sh

@@ -19,6 +19,7 @@ sample = {
     "RepoUrl": "https://github.com/jssmith/shfs.git",
     "RepoRef": "main",
     "RunSetup": "true",
+    "AWS::Region": "us-east-2",
 }
 unknown = set(re.findall(r"\$\{([A-Za-z0-9:]+)\}", script)) - set(sample)
 if unknown:
