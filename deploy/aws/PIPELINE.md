@@ -11,6 +11,7 @@ Lambda MicroVM builder worked but its speed varied 4x between starts).
 push / pull request ──▶ .github/workflows/ci.yml: ci.sh test (gVisor suites included), Rust tests
 tag v* on main ──▶ .github/workflows/release.yml
                    ci.yml again → tag on main? → npm ci, build → ci.sh package
+                   │ environment "release": Johann approves the job
                    │ GitHub OIDC token → sts:AssumeRoleWithWebIdentity agent-drive-release-us-east-2
                    │ ci.sh publish: kms:Sign the manifest's digest → manifest.sig
                    ▼
@@ -128,8 +129,8 @@ statement.
 ## What each role can and cannot do
 
 **Release role** `agent-drive-release-us-east-2`, assumable only with GitHub's
-OIDC token for a workflow running on a `v*` tag of `jssmith/shfs`
-(`sub` = `repo:jssmith/shfs:ref:refs/tags/v*`, `aud` = `sts.amazonaws.com`),
+OIDC token for a job in the `release` environment of `jssmith/shfs`
+(`sub` = `repo:jssmith/shfs:environment:release`, `aud` = `sts.amazonaws.com`),
 for at most an hour:
 
 | Can | Resource |
@@ -142,7 +143,7 @@ for at most an hour:
 
 It cannot: overwrite or delete a release, list the bucket, run any other SSM
 document or any shell of its choosing on the VM, reach untagged instances,
-change IAM, KMS or the stack. A branch push or pull request cannot assume it.
+change IAM, KMS or the stack. A job outside the `release` environment cannot assume it.
 
 **VM instance role** `agent-drive-dev-instance-us-east-2`:
 
@@ -167,14 +168,21 @@ signature provides integrity, and readers need no extra KMS permissions.
 
 ## Trust
 
-Whoever can push a version tag can deploy to dev; `main` itself only changes
-through pull requests that pass CI (the `main` ruleset). A tag on a commit not
-on `main` is refused by the workflow. The VM accepts only a manifest signed by
-the KMS key, for the version it was asked for (a manifest copied from another
-version's path is refused), and only an archive whose sha256 is in that
-manifest. A compromised bucket can withhold releases but not change one. A
-compromised VM can read releases (public code) and verify signatures, nothing
-more.
+A tag runs `release.yml` as it is in the tagged commit, so nothing written in
+the workflow can be a security boundary: someone with push access could tag a
+commit whose workflow skips the checks. The boundary is GitHub's environment
+gate. The release job runs in the environment `release`, which requires
+Johann's approval (and is limited to `v*` tags), and `ReleaseRole` trusts only
+tokens for that environment (`sub` = `repo:jssmith/shfs:environment:release`).
+A workflow that leaves the environment out gets no credentials; one that keeps
+it waits for the approval. The workflow's own checks (CI, "the tag is on
+`main`") guard against mistakes.
+
+The VM accepts only a manifest signed by the KMS key, for the version it was
+asked for (a manifest copied from another version's path is refused), and
+only an archive whose sha256 is in that manifest. A compromised bucket can
+withhold releases but not change one. A compromised VM can read releases
+(public code) and verify signatures, nothing more.
 
 ## Not covered yet
 

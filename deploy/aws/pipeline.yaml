@@ -12,10 +12,13 @@ Parameters:
     Type: String
     Default: jssmith/shfs
     Description: owner/name of the GitHub repository whose tag workflows may release.
-  TagPattern:
+  ReleaseEnvironment:
     Type: String
-    Default: "v*"
-    Description: Only workflows running for tags matching this pattern may assume ReleaseRole.
+    Default: release
+    Description: >-
+      The GitHub environment whose jobs may assume ReleaseRole. It must require
+      a reviewer's approval: a tag runs the workflow file of the tagged commit,
+      so only GitHub's environment gate, not the workflow, can hold a release.
   DeployTagValue:
     Type: String
     Default: dev
@@ -112,7 +115,8 @@ Resources:
 
   # --- Releases from GitHub Actions. GitHub's OIDC token is exchanged for
   # ReleaseRole's short-lived credentials; no AWS keys are stored on GitHub.
-  # Only a workflow running for a v* tag of the repository may assume it.
+  # Only a job in the repository's "release" environment may assume it; that
+  # environment requires an approval (docs/releasing.md).
   GitHubOidcProvider:
     Type: AWS::IAM::OIDCProvider
     Properties:
@@ -133,8 +137,9 @@ Resources:
             Principal: { Federated: !Ref GitHubOidcProvider }
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
-              StringEquals: { "token.actions.githubusercontent.com:aud": sts.amazonaws.com }
-              StringLike: { "token.actions.githubusercontent.com:sub": !Sub "repo:${RepositoryFullName}:ref:refs/tags/${TagPattern}" }
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${RepositoryFullName}:environment:${ReleaseEnvironment}"
       Tags: [{ Key: agent-drive, Value: pipeline }]
 
   # A separate policy resource: it names the signing key, whose key policy
