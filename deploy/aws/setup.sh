@@ -62,7 +62,7 @@ s_packages() {
     ca-certificates curl gnupg git jq xfsprogs zstd xz-utils unzip sqlite3 \
     build-essential python3 \
     tesseract-ocr tesseract-ocr-eng poppler-utils imagemagick \
-    docker.io docker-buildx
+    docker.io docker-cli docker-buildx
 }
 
 s_data_volume() {
