@@ -26,7 +26,7 @@ Everything lives under `$AGENT_DRIVE_DATA` (default `./data`, never inside the c
   - writes and creates: into `upper/` (copy-up on first write); deletes and renames add to `whiteouts` and move within `upper/`;
   - `_index.db` and `_text/`: synthesised read-only (later; not needed for the first version).
 - **Freshness:** the daemon checks the epoch on every lookup and listing and drops any cache when it changes. A trashed item must disappear on the next operation.
-- **Accounting:** every open appends `activity(actor='fs', op='open', dir_id, item_id, detail={path, mode})`.
+- **Accounting:** opens are recorded as `activity(actor='fs', op='open', dir_id, item_id, detail={path, mode, count})`, at most one row per (path, mode, item) per minute: the first open of a minute adds the row (its `ts`), later opens in that minute raise `count`. One row per open was 4.8 million rows in a 25-minute soak (decision 0003).
 - Into gVisor the mount is passed with `--file-access-mounts=shared`.
 - The first thin drive does not use the daemon: the server materialises `upper/` from `session_view` itself and mounts that. The daemon replaces it behind the same paths once it passes A9.
 
