@@ -592,6 +592,7 @@ fn owner_is_the_sandbox_user(mut e: Env) {
         let m = fs::symlink_metadata(p).unwrap();
         (m.uid(), m.gid())
     };
+    assert_eq!(own(&e.mnt), (1000, 1001), "the root of /drive");
     assert_eq!(own(&e.p("notes/todo.txt")), (1000, 1001));
     assert_eq!(own(&e.p("notes")), (1000, 1001));
     assert_eq!(own(&e.p("_by/project/acme/plan.md")), (1000, 1001));

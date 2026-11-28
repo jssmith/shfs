@@ -129,6 +129,16 @@ impl Upper {
         self
     }
 
+    /// Gives `upper/` itself (the session's `/drive`) to the owner (no-op without one).
+    pub fn own_root(&self) -> io::Result<()> {
+        if let Some((uid, gid)) = self.owner {
+            if unsafe { libc::fchown(self.fd(), uid, gid) } < 0 {
+                return Err(last());
+            }
+        }
+        Ok(())
+    }
+
     /// Gives a name just created in `dir` to the owner (no-op without one).
     fn own_at(&self, dir: RawFd, name: &CStr) -> io::Result<()> {
         if let Some((uid, gid)) = self.owner {

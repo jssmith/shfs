@@ -210,6 +210,8 @@ impl DriveFs {
         let sess = store::session_dir(&cfg.data, &cfg.dir_id);
         fs::create_dir_all(sess.join("upper"))?;
         let upper = Upper::open(&sess.join("upper"))?.with_owner(cfg.owner);
+        // The root of /drive is upper/ itself, which the server made.
+        upper.own_root()?;
         let (whiteouts, whiteout_file) = open_whiteouts(&sess.join("whiteouts"))?;
         let mut db = store::open(&cfg.data)?;
         let (ep, rows) = store::load_view(&mut db, &cfg.dir_id)?;
