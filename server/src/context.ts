@@ -48,13 +48,30 @@ export function parseSurface(v: string | undefined): Surface {
   return s as Surface;
 }
 
+/**
+ * The drive's public address (the tunnel's HTTPS URL), used in OAuth metadata.
+ * Unset or empty (an env file may say `AGENT_DRIVE_PUBLIC_URL=` before the
+ * tunnel exists) means http://localhost:<port>.
+ */
+export function parsePublicUrl(v: string | undefined, port: number): string {
+  const s = (v ?? '').trim() || `http://localhost:${port}`;
+  let u: URL;
+  try {
+    u = new URL(s);
+  } catch {
+    throw new Error(`AGENT_DRIVE_PUBLIC_URL must be an http(s) URL; got "${s}"`);
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error(`AGENT_DRIVE_PUBLIC_URL must be an http(s) URL; got "${s}"`);
+  return s.replace(/\/+$/, '');
+}
+
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
   const dataDir = path.resolve(env.AGENT_DRIVE_DATA ?? './data');
   const port = Number(env.AGENT_DRIVE_PORT ?? 8787);
   return {
     dataDir,
     port,
-    publicUrl: (env.AGENT_DRIVE_PUBLIC_URL ?? `http://localhost:${port}`).replace(/\/+$/, ''),
+    publicUrl: parsePublicUrl(env.AGENT_DRIVE_PUBLIC_URL, port),
     runsc: env.AGENT_DRIVE_RUNSC === 'none' ? null : env.AGENT_DRIVE_RUNSC ?? 'runsc',
     runscRoot: env.AGENT_DRIVE_RUNSC_ROOT ?? path.join(dataDir, 'runsc'),
     rootfs: env.AGENT_DRIVE_ROOTFS ?? path.join(dataDir, 'images', 'default', 'rootfs'),
