@@ -8,10 +8,14 @@ Description: >-
   AgentDrive-Deploy. See deploy/aws/PIPELINE.md.
 
 Parameters:
-  RepositoryFullName:
+  RepositorySubject:
     Type: String
-    Default: jssmith/shfs
-    Description: owner/name of the GitHub repository whose tag workflows may release.
+    Default: jssmith@782994/shfs@1470850220
+    AllowedPattern: "^[^/@:]+@[0-9]+/[^/@:]+@[0-9]+$"
+    Description: >-
+      The repository as GitHub's OIDC tokens name it in `sub`: owner@owner-id/name@repo-id
+      (GitHub's subject format with immutable ids; seen in CloudTrail for this repository).
+      A repository later given the same name has other ids and does not match.
   ReleaseEnvironment:
     Type: String
     Default: release
@@ -148,8 +152,8 @@ Resources:
               StringEquals:
                 "token.actions.githubusercontent.com:aud": sts.amazonaws.com
                 "token.actions.githubusercontent.com:sub":
-                  - !Sub "repo:${RepositoryFullName}:environment:${ReleaseEnvironment}"
-                  - !Sub "repo:${RepositoryFullName}:ref:refs/heads/${DeployBranch}"
+                  - !Sub "repo:${RepositorySubject}:environment:${ReleaseEnvironment}"
+                  - !Sub "repo:${RepositorySubject}:ref:refs/heads/${DeployBranch}"
       Tags: [{ Key: agent-drive, Value: pipeline }]
 
   # A separate policy resource: it names the signing key, whose key policy
