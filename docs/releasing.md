@@ -14,7 +14,9 @@ VM. The mechanics (roles, signing, the VM side) are in
   `vMAJOR.MINOR.PATCH`. Before 1.0, a MINOR bump may break things; say so in
   the changelog. Pre-releases are `vX.Y.Z-dev.N` (for the dev VM) and
   `vX.Y.Z-rc.N` (release candidates).
-- **Who tags:** Johann. Agent sessions prepare releases (changelog, version
+- **Who releases:** Johann. The release job runs in the GitHub environment
+  `release`, which waits for his approval; the AWS release role accepts only
+  that environment's jobs. Agent sessions prepare releases (changelog, version
   bumps) in pull requests; they do not push tags.
 - **Every release is signed and traceable:** its manifest names the commit, the
   tag and the workflow run, and is signed by a KMS key that only the release
@@ -40,13 +42,17 @@ VM. The mechanics (roles, signing, the VM side) are in
    ```
 3. **The release workflow** (`.github/workflows/release.yml`) then:
    1. runs the full CI again on the tagged commit;
-   2. refuses the tag if its commit is not on `main`;
-   3. builds and packages the release (`deploy/aws/ci.sh package`);
-   4. takes short-lived AWS credentials through GitHub's OIDC token (no stored
+   2. waits for Johann's approval of the `release` environment (Actions > the
+      run > *Review deployments*);
+   3. checks that the tagged commit is on `main` (a guard against mistakes;
+      the approval is the security boundary, because a tag runs the workflow
+      as it is in the tagged commit);
+   4. builds and packages the release (`deploy/aws/ci.sh package`);
+   5. takes short-lived AWS credentials through GitHub's OIDC token (no stored
       keys), signs the manifest with KMS, and uploads
       `releases/<commit>/{release.tar.zst,manifest.json,manifest.sig}`; an
       existing release is never overwritten;
-   5. deploys it to the dev VM through the `AgentDrive-Deploy` document and
+   6. deploys it to the dev VM through the `AgentDrive-Deploy` document and
       waits: the VM verifies the signature and checksum, switches, restarts and
       checks health, and rolls back by itself if any step fails.
 4. **Check** the run on GitHub (Actions > release) and the drive's health
@@ -76,9 +82,19 @@ never overwritten); fix forward with a new version.
 Registries are published with trusted publishing from the release workflow
 (short-lived tokens issued per run), not with stored tokens.
 
+## Set up once
+
+- **The `release` environment** (Settings > Environments > New environment,
+  named `release`): *Required reviewers*: Johann; *Prevent self-review* off (he
+  tags and approves); *Deployment branches and tags*: selected, tag rule `v*`.
+  **Do this before the first tag:** GitHub creates a missing environment on
+  first use with no protection rules, and the release role would accept its
+  jobs. Only repository admins can change an environment's rules.
+- **A ruleset on `v*` tags** (Settings > Rules > New tag ruleset): only Johann
+  creates them (bypass list); tags cannot be updated or deleted.
+
 ## Before the first public release
 
-- A ruleset on `v*` tags: only Johann creates them; tags cannot be moved or deleted.
 - Production: its own VM tagged `agent-drive=prod`, deployed only from
   non-pre-release tags, after an approval in a GitHub environment.
 - `CHANGELOG.md`, and a security policy page (`SECURITY.md`).
