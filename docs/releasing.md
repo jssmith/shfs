@@ -87,8 +87,9 @@ Registries are published with trusted publishing from the release workflow
 - **The `release` environment** (Settings > Environments > New environment,
   named `release`): *Required reviewers*: Johann; *Prevent self-review* off (he
   tags and approves); *Deployment branches and tags*: selected, tag rule `v*`.
-  Without it the release job has no environment to wait in and gets no AWS
-  credentials.
+  **Do this before the first tag:** GitHub creates a missing environment on
+  first use with no protection rules, and the release role would accept its
+  jobs. Only repository admins can change an environment's rules.
 - **A ruleset on `v*` tags** (Settings > Rules > New tag ruleset): only Johann
   creates them (bypass list); tags cannot be updated or deleted.
 
