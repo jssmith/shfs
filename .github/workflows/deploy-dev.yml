@@ -1,0 +1,64 @@
+name: deploy-dev
+# Every commit on main that passed CI is deployed to the dev VM: packaged,
+# signed, uploaded and deployed as releases/<commit> (deploy/aws/PIPELINE.md).
+# Releases for other people come from version tags (release.yml).
+#
+# Runs after the "ci" workflow completes for a push to main. GitHub runs a
+# workflow_run workflow from the default branch, so a branch cannot change
+# this file, and its OIDC token says ref:refs/heads/main, which ReleaseRole
+# trusts. main itself changes only through pull requests that pass CI.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: deploy-dev   # one deploy at a time; later commits wait their turn
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  RELEASE_ROLE_ARN: arn:aws:iam::277611628110:role/agent-drive-release-us-east-2
+  ARTIFACT_BUCKET: agent-drive-artifacts-277611628110-us-east-2
+  SIGNING_KEY_ARN: arn:aws:kms:us-east-2:277611628110:key/90e2a770-c860-4ec5-811e-ba5bc95fb091
+  DEPLOY_DOCUMENT: AgentDrive-Deploy
+  DEPLOY_TAG_VALUE: dev
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write   # GitHub's OIDC token, exchanged for ReleaseRole
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: System packages
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends jq zstd
+      - name: Build
+        run: npm ci --no-fund --no-audit && npm run build
+      - name: Package
+        env:
+          BUILD_SOURCE_VERSION: ${{ github.event.workflow_run.head_sha }}
+          BUILD_ID: ${{ github.run_id }}
+          BUILD_ARN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RELEASE_TAG: main
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: deploy/aws/ci.sh package "$RUNNER_TEMP/release"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.RELEASE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: deploy-dev-${{ github.run_id }}
+      - name: Sign, upload and deploy
+        env:
+          BUILD_ID: ${{ github.run_id }}
+        run: deploy/aws/ci.sh publish "$RUNNER_TEMP/release"

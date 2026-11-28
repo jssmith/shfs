@@ -4,6 +4,13 @@ How a version of Agent Drive gets from `main` to a release, and to the drive
 VM. The mechanics (roles, signing, the VM side) are in
 [`deploy/aws/PIPELINE.md`](../deploy/aws/PIPELINE.md).
 
+## Dev and releases
+
+- **The dev VM tracks `main`.** Every commit on `main` that passes CI is
+  packaged, signed and deployed to it (`.github/workflows/deploy-dev.yml`). No
+  tag is needed; nothing below applies to dev.
+- **Releases are for other people:** a version tag, as below.
+
 ## Rules
 
 - **`main` is always releasable.** It changes only through pull requests that

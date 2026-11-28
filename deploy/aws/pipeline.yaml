@@ -19,6 +19,13 @@ Parameters:
       The GitHub environment whose jobs may assume ReleaseRole. It must require
       a reviewer's approval: a tag runs the workflow file of the tagged commit,
       so only GitHub's environment gate, not the workflow, can hold a release.
+  DeployBranch:
+    Type: String
+    Default: main
+    Description: >-
+      Workflows running on this branch (deploy-dev.yml, after CI) may assume
+      ReleaseRole to deploy to dev. It must change only through reviewed pull
+      requests that pass CI (the branch ruleset).
   DeployTagValue:
     Type: String
     Default: dev
@@ -115,8 +122,9 @@ Resources:
 
   # --- Releases from GitHub Actions. GitHub's OIDC token is exchanged for
   # ReleaseRole's short-lived credentials; no AWS keys are stored on GitHub.
-  # Only a job in the repository's "release" environment may assume it; that
-  # environment requires an approval (docs/releasing.md).
+  # Only a job in the repository's "release" environment (which requires an
+  # approval, docs/releasing.md) or a workflow running on main (deploy-dev.yml;
+  # main changes only through pull requests that pass CI) may assume it.
   GitHubOidcProvider:
     Type: AWS::IAM::OIDCProvider
     Properties:
@@ -139,7 +147,9 @@ Resources:
             Condition:
               StringEquals:
                 "token.actions.githubusercontent.com:aud": sts.amazonaws.com
-                "token.actions.githubusercontent.com:sub": !Sub "repo:${RepositoryFullName}:environment:${ReleaseEnvironment}"
+                "token.actions.githubusercontent.com:sub":
+                  - !Sub "repo:${RepositoryFullName}:environment:${ReleaseEnvironment}"
+                  - !Sub "repo:${RepositoryFullName}:ref:refs/heads/${DeployBranch}"
       Tags: [{ Key: agent-drive, Value: pipeline }]
 
   # A separate policy resource: it names the signing key, whose key policy
