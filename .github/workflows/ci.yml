@@ -35,11 +35,45 @@ jobs:
             jq zstd tesseract-ocr tesseract-ocr-eng poppler-utils imagemagick fuse3
       - name: gVisor
         run: sudo sandbox/install-runsc.sh /usr/local/bin && runsc --version
+      # The sandbox rootfs (sandbox/build.sh, about 2-6 minutes of apt and pip)
+      # is rebuilt only when sandbox/ changes, and weekly for security updates;
+      # otherwise it comes from the cache. It is root-owned, so it is cached as
+      # a tarball made with sudo.
+      - name: Sandbox cache key
+        id: sandbox
+        run: echo "key=sandbox-${{ hashFiles('sandbox/**') }}-$(date -u +%G-w%V)" >> "$GITHUB_OUTPUT"
+      - name: Restore the sandbox rootfs
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/sandbox-rootfs.tar.zst
+          key: ${{ steps.sandbox.outputs.key }}
+      - name: Unpack or build the sandbox rootfs
+        env:
+          HIT: ${{ steps.restore.outputs.cache-hit }}
+        run: |
+          data="$RUNNER_TEMP/ci-data"; tarball="$RUNNER_TEMP/sandbox-rootfs.tar.zst"
+          if [ "$HIT" = true ]; then
+            sudo mkdir -p "$data" && sudo tar -I zstd -xf "$tarball" -C "$data"
+            echo "restored $(du -sh "$data/images/default/rootfs" | cut -f1) from the cache"
+          else
+            sudo -E env "PATH=$PATH" AGENT_DRIVE_DATA="$data" NAME_PREFIX=ci- sandbox/build.sh
+            sudo tar -I 'zstd -T0 -3' -cf "$tarball" -C "$data" images
+            sudo chown "$(id -u):$(id -g)" "$tarball"
+          fi
+      - name: Save the sandbox rootfs
+        if: steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/sandbox-rootfs.tar.zst
+          key: ${{ steps.sandbox.outputs.key }}
       - name: Test (gVisor suites included)
-        # As root: runsc and the sandbox image build need it. ci.sh test runs
-        # npm ci, the build, the sandbox rootfs (Docker), a runsc smoke check
-        # and the whole suite.
-        run: sudo -E env "PATH=$PATH" CI_DATA="$RUNNER_TEMP/ci-data" deploy/aws/ci.sh test
+        # As root, for runsc. ci.sh test runs npm ci, the build, a runsc smoke
+        # check and the whole suite against the rootfs above.
+        run: |
+          rootfs="$RUNNER_TEMP/ci-data/images/default/rootfs"
+          sudo -E env "PATH=$PATH" CI_DATA="$RUNNER_TEMP/ci-data" \
+            AGENT_DRIVE_ROOTFS="$rootfs" AGENT_DRIVE_TEST_IMAGE_ROOTFS="$rootfs" deploy/aws/ci.sh test
 
   rust:
     runs-on: ubuntu-24.04
