@@ -7,7 +7,7 @@ import { expect, test } from 'vitest';
 import fc from 'fast-check';
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { tempContext, upload, settle } from '../testing.js';
+import { tempContext, upload, settle, sessionDrive } from '../testing.js';
 import { mergeSession } from './merge.js';
 import { trashItem, undoPackage } from './undo.js';
 import { all } from '../store/db.js';
@@ -96,7 +96,8 @@ test('merge and undo invariants hold under random interleavings', async () => {
         const dirs: string[] = [];
         for (let i = 0; i < SESSIONS; i++) dirs.push((await ctx.sessions.start('conn', `session ${i}`, {})).row.dir_id);
         const merged: { item_id: string; version: number }[] = [];
-        const upper = (s: number) => ctx.sessions.dirs(dirs[s]!).upper;
+        const drives = await Promise.all(dirs.map((d) => sessionDrive(ctx, d)));
+        const upper = (s: number) => drives[s]!;
         const touchAll = async (ids: string[]) => {
           for (const id of ids) await ctx.sessions.applyVisibility(id);
         };

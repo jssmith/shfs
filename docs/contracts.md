@@ -11,7 +11,8 @@ Everything lives under `$AGENT_DRIVE_DATA` (default `./data`, never inside the c
 | `drive.db` | server | SQLite store, schema in `server/src/store/schema.sql` |
 | `blobs/<h[0:2]>/<h>` | server | Content by SHA-256 (hex), immutable |
 | `sessions/<dir_id>/upper/` | fs daemon writes, server reads | The session's writes under `/drive`, as a plain directory tree |
-| `sessions/<dir_id>/whiteouts` | fs daemon writes, server reads | One path per line: items the session deleted or renamed away |
+| `sessions/<dir_id>/whiteouts` | fs daemon writes, server reads | One path per line: items the session deleted or renamed away. A path in both `whiteouts` and `upper/` is a replacement. Rewritten only by `rebase` (§2) |
+| `sessions/<dir_id>/control.sock` | fs daemon listens, server connects | The daemon's control socket: `refresh`, `rebase`, `stats` (§2) |
 | `sessions/<dir_id>/work/` | sandbox | Mounted at `/work`; never merged |
 | `sessions/<dir_id>/mnt/` | fs daemon | Where the daemon mounts the session's `/drive` on the host |
 | `sessions/<dir_id>/sock/` | server | `drive.sock`, the Unix socket the session's `drive` command talks to (v2, v3). Mounted read-only at `/run/drive` into that session's sandbox only; never merged, never shown to another session |
@@ -25,10 +26,14 @@ Everything lives under `$AGENT_DRIVE_DATA` (default `./data`, never inside the c
   - reads: from `upper/` if the path is there, else the blob of the item version;
   - writes and creates: into `upper/` (copy-up on first write); deletes and renames add to `whiteouts` and move within `upper/`;
   - `_index.db` and `_text/`: synthesised read-only (later; not needed for the first version).
-- **Freshness:** the daemon checks the epoch on every lookup and listing and drops any cache when it changes. A trashed item must disappear on the next operation.
+- **Freshness:** the daemon applies an epoch change before it acknowledges `refresh`, and checks the epoch on every request that reaches it (and every 50 ms). A trashed item must disappear on the next operation.
+- **Refresh:** after every increment of the epoch, once its transaction has committed, the server writes `refresh\n` to `sessions/<dir_id>/control.sock` and waits for `ok <epoch>` (5 s timeout). No socket or no listener means no daemon runs for the session: nothing to do. With kernel caching only this synchronous call keeps "gone on the next operation".
+- **Rebase:** the server changes `upper/` and `whiteouts` only through `rebase {json}` on the control socket (answered `ok <epoch> {json}`), or with `agent-drive-fs rebase` when no daemon runs. The request: `remove: [{path, sha256}]` (drop the session's copy if it still has exactly that content), `drop_whiteouts: [path]` (exact lines), `unwhite: [path]` (show a path again; whatever else a whiteout above it hid stays hidden). The server uses it after a merge (merged copies and whiteouts go), a hide (an unchanged copy of a hidden item goes) and a conflict.
+- **Ownership:** `agent-drive-fs mount --uid U --gid G` reports store items as owned by U:G and gives everything it creates in `upper/` (and `upper/` itself) to U:G; the server passes the sandbox's user, since gVisor checks permissions itself.
+- **The server's reads of `upper/`** go through `agent-drive-fs export` (a copy of every regular file into a directory only the server can reach, with a manifest of path, size, mode and sha256) and `agent-drive-fs read`; its writes to `/drive` go through the mount (`agent-drive-fs write`). These use `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, so nothing the session put in `upper/` is followed on the host.
 - **Accounting:** opens are recorded as `activity(actor='fs', op='open', dir_id, item_id, detail={path, mode, count})`, at most one row per (path, mode, item) per minute: the first open of a minute adds the row (its `ts`), later opens in that minute raise `count`. One row per open was 4.8 million rows in a 25-minute soak (decision 0003).
 - Into gVisor the mount is passed with `--file-access-mounts=shared`.
-- The first thin drive does not use the daemon: the server materialises `upper/` from `session_view` itself and mounts that. The daemon replaces it behind the same paths once it passes A9.
+- `AGENT_DRIVE_FS` picks the session file system. `copy` (the default): the server materialises `upper/` from `session_view` itself and mounts that, as the first thin drive did. `daemon`: one `agent-drive-fs mount` per session while its sandbox runs (binary from `AGENT_DRIVE_FS_BIN`, else `agent-drive-fs` on `PATH`), with 60 s kernel timeouts; the sandbox gets `sessions/<dir_id>/mnt/` at `/drive`, and `upper/` holds only what the session wrote.
 
 ## 3. Reading (server ↔ `server/src/reading/`)
 

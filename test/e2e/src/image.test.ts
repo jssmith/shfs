@@ -10,6 +10,7 @@ import { ingestUpload } from '../../../server/src/ingest/upload.js';
 import { mergeSession } from '../../../server/src/merge/merge.js';
 import { loadImageSettings } from '../../../server/src/sessions/image.js';
 import { RUNSC, PREFIX } from './harness.js';
+import { TEST_FS_CONFIG } from '../../../server/src/testing.js';
 
 const ROOTFS = process.env.AGENT_DRIVE_TEST_IMAGE_ROOTFS;
 
@@ -18,7 +19,7 @@ describe.skipIf(!(RUNSC && ROOTFS))('sandbox image settings (needs AGENT_DRIVE_R
   let dir: string;
   beforeAll(() => {
     dir = mkdtempSync(path.join(os.tmpdir(), 'a4-img-'));
-    ctx = createContext({ dataDir: dir, port: 0, publicUrl: 'http://127.0.0.1', runsc: RUNSC!, runscRoot: path.join('/run', `${PREFIX}-img`), rootfs: ROOTFS!, sandboxPrefix: `${PREFIX}-img-`, surface: 'v0' });
+    ctx = createContext({ dataDir: dir, port: 0, publicUrl: 'http://127.0.0.1', runsc: RUNSC!, runscRoot: path.join('/run', `${PREFIX}-img`), rootfs: ROOTFS!, sandboxPrefix: `${PREFIX}-img-`, surface: 'v0', ...TEST_FS_CONFIG });
   });
   afterAll(async () => {
     await ctx.close();

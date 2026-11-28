@@ -1,7 +1,11 @@
 // Sessions: the secret id, the working space and its view, and the tools
-// that act inside it. The working space is the materialised fallback of
-// docs/contracts.md §2: the server writes `sessions/<dir_id>/upper/` from the
-// session's view itself and mounts it at /drive.
+// that act inside it. Two ways to serve /drive (AGENT_DRIVE_FS):
+//   copy (default): the materialised fallback of docs/contracts.md §2: the
+//     server writes `sessions/<dir_id>/upper/` from the session's view itself
+//     and mounts it at /drive;
+//   daemon: fs/'s daemon serves session_view ∪ upper/ − whiteouts at
+//     `sessions/<dir_id>/mnt/` (sessions/fsd.ts); upper/ holds only what the
+//     session wrote, and the server reaches it only through agent-drive-fs.
 import { mkdirSync, promises as fsp } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
@@ -16,6 +20,7 @@ import { isToolCache } from '../merge/ignore.js';
 import { chownTree } from './image.js';
 import { SessionSocket } from './socket.js';
 import { fileURLToPath } from 'node:url';
+import { requestRefresh, type FsDaemons, type UpperManifest } from './fsd.js';
 
 export const OUTPUT_CAP = 64 * 1024;
 export const READ_CAP = 256 * 1024;
@@ -40,7 +45,7 @@ export interface SessionRow {
   last_call_at: string;
 }
 
-export interface SessionDirs { root: string; upper: string; work: string; state: string; sock: string }
+export interface SessionDirs { root: string; upper: string; work: string; state: string; sock: string; mnt: string; control: string }
 
 /** Handles one `drive` command from inside a session's sandbox (v2, v3; sessions/drive-command.ts). */
 export type DriveCommandHandler = (dir_id: string, argv: string[]) => Promise<{ stdout: string; stderr?: string; exit: number }>;
@@ -66,6 +71,8 @@ export class Sessions {
     readonly sessionsDir: string,
     readonly sandbox: Sandbox,
     readonly sandboxPrefix: string,
+    /** Set in daemon mode (AGENT_DRIVE_FS=daemon). */
+    readonly fsd?: FsDaemons,
   ) {
     mkdirSync(sessionsDir, { recursive: true });
   }
@@ -73,7 +80,10 @@ export class Sessions {
   dirs(dir_id: string): SessionDirs {
     if (!/^sd_[a-z2-7]+$/.test(dir_id)) throw new Error('bad dir id');
     const root = path.join(this.sessionsDir, dir_id);
-    return { root, upper: path.join(root, 'upper'), work: path.join(root, 'work'), state: path.join(root, 'state'), sock: path.join(root, 'sock') };
+    return {
+      root, upper: path.join(root, 'upper'), work: path.join(root, 'work'), state: path.join(root, 'state'), sock: path.join(root, 'sock'),
+      mnt: path.join(root, 'mnt'), control: path.join(root, 'control.sock'),
+    };
   }
 
   /**
@@ -122,7 +132,7 @@ export class Sessions {
     const dir_id = newId('sd');
     const ts = now();
     const d = this.dirs(dir_id);
-    for (const p of [d.upper, d.work, d.state]) mkdirSync(p, { recursive: true });
+    for (const p of [d.upper, d.work, d.state, ...(this.fsd ? [d.mnt] : [])]) mkdirSync(p, { recursive: true });
     tx(this.drive.db, () => {
       run(
         this.drive.db,
@@ -218,19 +228,21 @@ export class Sessions {
    * upper/ match it exactly. Called at start and after every merge (rebase).
    * The caller holds the session lock.
    */
-  async materialise(dir_id: string): Promise<void> {
+  async materialise(dir_id: string, seen?: UpperManifest): Promise<void> {
     const db = this.drive.db;
     const view = this.drive.reachableView();
     const state = this.drive.currentState();
     const d = this.dirs(dir_id);
     mkdirSync(d.upper, { recursive: true });
-    const want = new Map(view.map((v) => [v.path, v]));
-    for (const v of view) {
-      const h = await safeHash(d.upper, v.path);
-      if (h !== v.blob_hash) await safeWrite(d.upper, v.path, await this.drive.blobs.get(v.blob_hash));
+    if (!this.fsd) {
+      const want = new Map(view.map((v) => [v.path, v]));
+      for (const v of view) {
+        const h = await safeHash(d.upper, v.path);
+        if (h !== v.blob_hash) await safeWrite(d.upper, v.path, await this.drive.blobs.get(v.blob_hash));
+      }
+      // Tool caches are never merged but stay in the working copy for the tools that made them.
+      for (const f of await walkFiles(d.upper, { hash: false })) if (!want.has(f.path) && !isToolCache(f.path)) await safeRemove(d.upper, f.path);
     }
-    // Tool caches are never merged but stay in the working copy for the tools that made them.
-    for (const f of await walkFiles(d.upper, { hash: false })) if (!want.has(f.path) && !isToolCache(f.path)) await safeRemove(d.upper, f.path);
     tx(db, () => {
       run(db, 'DELETE FROM session_view WHERE dir_id = ?', dir_id);
       run(db, 'DELETE FROM session_base WHERE dir_id = ?', dir_id);
@@ -241,10 +253,37 @@ export class Sessions {
       run(db, 'UPDATE sessions SET base_state = ? WHERE dir_id = ?', state, dir_id);
       this.bumpEpoch(dir_id);
     });
+    await this.refreshView(dir_id);
+    if (this.fsd) {
+      // The view now serves what was merged: the session's copies leave upper/ (unless a
+      // newer write replaced them, or they carry a mode the view cannot give yet), and the
+      // whiteouts that were merged go. Tool caches stay, as in copy mode.
+      const m = seen ?? (await this.fsd.manifest(dir_id, { hash: true }));
+      const blob = new Map(view.map((v) => [v.path, v.blob_hash]));
+      const remove = m.entries
+        .filter((e) => e.type === 'f' && !e.ignored && e.sha256)
+        .filter((e) => !(blob.get(e.path) === e.sha256 && (e.mode & 0o7777) !== 0o644))
+        .map((e) => ({ path: e.path, sha256: e.sha256! }));
+      await this.fsd.rebase(dir_id, { remove, drop_whiteouts: m.whiteouts });
+    }
   }
 
   bumpEpoch(dir_id: string): void {
     run(this.drive.db, 'INSERT INTO session_view_epoch (dir_id, epoch) VALUES (?, 1) ON CONFLICT(dir_id) DO UPDATE SET epoch = epoch + 1', dir_id);
+  }
+
+  /**
+   * After an epoch bump (and its transaction): a running daemon applies the view before this
+   * returns, so the change holds from the session's next operation (docs/contracts.md §2).
+   * No daemon (copy mode, or no sandbox yet): nothing to do.
+   */
+  async refreshView(dir_id: string): Promise<void> {
+    try {
+      await requestRefresh(this.dirs(dir_id).control);
+    } catch (e) {
+      // The change is committed; the daemon's own epoch poll applies it within 50 ms.
+      console.error(`refresh of ${dir_id} failed: ${(e as Error).message}`);
+    }
   }
 
   base(dir_id: string): Map<string, { item_id: string; version: number; blob_hash: string }> {
@@ -275,6 +314,12 @@ export class Sessions {
         run(this.drive.db, 'DELETE FROM session_view WHERE dir_id = ? AND path = ?', r.dir_id, r.path);
         this.bumpEpoch(r.dir_id);
       });
+      await this.refreshView(r.dir_id);
+      if (this.fsd) {
+        // An unchanged copy of the item in upper/ (a copy-up) would keep showing it.
+        if (baseHash) await this.fsd.rebase(r.dir_id, { remove: [{ path: r.path, sha256: baseHash }] });
+        continue;
+      }
       const h = await safeHash(d.upper, r.path);
       if (h !== null && h === baseHash) await safeRemove(d.upper, r.path);
     }
@@ -301,13 +346,20 @@ export class Sessions {
         if (get(db, 'SELECT 1 FROM session_view WHERE dir_id = ? AND (item_id = ? OR path = ?)', row.dir_id, item_id, v.path)) return;
         if (get(db, 'SELECT 1 FROM session_base WHERE dir_id = ? AND (item_id = ? OR path = ?)', row.dir_id, item_id, v.path)) return;
         const d = this.dirs(row.dir_id);
-        if ((await safeHash(d.upper, v.path)) !== null) return;
-        await safeWrite(d.upper, v.path, await this.drive.blobs.get(v.blob_hash));
+        if (this.fsd) {
+          if ((await this.fsd.read(row.dir_id, v.path, 0, { upperOnly: true })) !== null) return;
+        } else {
+          if ((await safeHash(d.upper, v.path)) !== null) return;
+          await safeWrite(d.upper, v.path, await this.drive.blobs.get(v.blob_hash));
+        }
         tx(db, () => {
           run(db, "INSERT INTO session_view (dir_id, path, kind, item_id, version, target, writable) VALUES (?, ?, 'file', ?, ?, NULL, 1)", row.dir_id, v.path, item_id, v.version);
           run(db, 'INSERT INTO session_base (dir_id, path, item_id, version, blob_hash) VALUES (?, ?, ?, ?, ?)', row.dir_id, v.path, item_id, v.version, v.blob_hash);
           this.bumpEpoch(row.dir_id);
         });
+        await this.refreshView(row.dir_id);
+        // A path the session deleted earlier (or a folder above it) shows the item too, as the copy does.
+        if (this.fsd) await this.fsd.rebase(row.dir_id, { unwhite: [v.path] });
         shown.push(row.dir_id);
       });
     }
@@ -346,14 +398,17 @@ export class Sessions {
       const d = this.dirs(dir_id);
       const id = this.sandboxId(dir_id);
       // A non-root sandbox user must own what the host wrote into /drive and /work.
+      // In daemon mode the daemon gives it everything in /drive itself (and upper/ may be
+      // changing under a running session, so it is not walked here).
       const u = this.sandbox.user;
       if (u && u.uid !== 0) {
-        await chownTree(d.upper, u.uid, u.gid);
+        if (!this.fsd) await chownTree(d.upper, u.uid, u.gid);
         await chownTree(d.work, u.uid, u.gid);
       }
+      await this.ensureFs(dir_id);
       const sock = await this.ensureSocket(dir_id);
       await this.sandbox.create({
-        id, driveDir: d.upper, workDir: d.work, stateDir: d.state,
+        id, driveDir: this.driveDir(dir_id), workDir: d.work, stateDir: d.state,
         ...(sock ? { readOnlyMounts: [{ source: DRIVE_BIN_DIR, destination: '/opt/drive/bin' }, { source: d.sock, destination: '/run/drive' }], hostSockets: true, pathPrefix: '/opt/drive/bin' } : {}),
       });
       const t0 = Date.now();
@@ -391,9 +446,8 @@ export class Sessions {
   async read(dir_id: string, p: string): Promise<{ path: string; text: string; size: number; truncated: boolean; binary: boolean }> {
     const rel = cleanDrivePath(p);
     return this.lock.run(dir_id, async () => {
-      const d = this.dirs(dir_id);
       // Same answer for a missing path and a hidden one: nothing to learn from the error.
-      const got = await safeRead(d.upper, rel, READ_CAP);
+      const got = await this.readAt(dir_id, 'drive', rel, READ_CAP);
       if (!got) throw new ToolError('not_found', `/drive/${rel} does not exist in this session`);
       const binary = got.data.subarray(0, 8192).includes(0);
       const base = get<{ item_id: string }>(this.drive.db, 'SELECT item_id FROM session_base WHERE dir_id = ? AND path = ?', dir_id, rel);
@@ -407,8 +461,7 @@ export class Sessions {
     const rel = cleanDrivePath(p);
     if (Buffer.byteLength(content) > WRITE_CAP) throw new ToolError('too_large', 'write is for small text files; use run for larger ones');
     return this.lock.run(dir_id, async () => {
-      const d = this.dirs(dir_id);
-      await safeWrite(d.upper, rel, content);
+      await this.writeAt(dir_id, 'drive', rel, content);
       this.drive.activity({ dir_id, actor: 'agent', op: 'write', detail: { path: rel, bytes: Buffer.byteLength(content) } });
       return { path: `/drive/${rel}`, bytes: Buffer.byteLength(content) };
     });
@@ -434,11 +487,45 @@ export class Sessions {
     return where === 'drive' ? d.upper : d.work;
   }
 
+  /** Where /drive is on the host: upper/ (copy mode) or the daemon's mount (daemon mode). */
+  driveDir(dir_id: string): string {
+    const d = this.dirs(dir_id);
+    return this.fsd ? d.mnt : d.upper;
+  }
+
+  /**
+   * Daemon mode: make sure the session's daemon runs (it starts with the sandbox, or for the
+   * server's own writes to /drive). A sandbox whose daemon died has lost its /drive and is
+   * replaced. The caller holds the session lock.
+   */
+  async ensureFs(dir_id: string): Promise<void> {
+    if (!this.fsd || this.fsd.running(dir_id)) return;
+    if (this.fsd.died(dir_id)) await this.sandbox.destroy(this.sandboxId(dir_id));
+    mkdirSync(this.dirs(dir_id).upper, { recursive: true });
+    await this.fsd.start(dir_id, this.sandbox.user);
+  }
+
+  /** A file as the session sees it (daemon mode: upper/ or the view, never through a link). */
+  private async readAt(dir_id: string, where: 'drive' | 'work', rel: string, cap: number): Promise<{ data: Buffer; size: number } | null> {
+    if (where === 'drive' && this.fsd) return this.fsd.read(dir_id, rel, cap);
+    return safeRead(this.rootOf(dir_id, where), rel, cap);
+  }
+
+  /** Write a file the way the session would (daemon mode: through its mount, so copy-up, whiteouts and the kernel's caches follow). */
+  private async writeAt(dir_id: string, where: 'drive' | 'work', rel: string, content: string): Promise<void> {
+    if (where === 'drive' && this.fsd) {
+      await this.ensureFs(dir_id);
+      await this.fsd.write(dir_id, rel, content);
+      return;
+    }
+    await safeWrite(this.rootOf(dir_id, where), rel, content);
+  }
+
   /** Read a file under /drive or /work, up to `cap` bytes. Missing and hidden read the same. */
   async readAny(dir_id: string, p: string, cap = FILE_TOOL_CAP): Promise<{ shown: string; data: Buffer; size: number; binary: boolean }> {
     const r = this.resolvePath(p);
     return this.lock.run(dir_id, async () => {
-      const got = await safeRead(this.rootOf(dir_id, r.where), r.rel, cap);
+      const got = await this.readAt(dir_id, r.where, r.rel, cap);
       if (!got) throw new ToolError('not_found', `${r.shown} does not exist in this session`);
       const base = r.where === 'drive' ? get<{ item_id: string }>(this.drive.db, 'SELECT item_id FROM session_base WHERE dir_id = ? AND path = ?', dir_id, r.rel) : undefined;
       this.drive.activity({ dir_id, actor: 'agent', op: 'read', item_id: base?.item_id ?? null, bytes: got.data.length, detail: { path: r.shown } });
@@ -452,7 +539,7 @@ export class Sessions {
     const bytes = Buffer.byteLength(content);
     if (bytes > WRITE_CAP) throw new ToolError('too_large', `write takes up to ${WRITE_CAP / 1024 / 1024} MB; this content is ${bytes} bytes`);
     return this.lock.run(dir_id, async () => {
-      await safeWrite(this.rootOf(dir_id, r.where), r.rel, content);
+      await this.writeAt(dir_id, r.where, r.rel, content);
       this.drive.activity({ dir_id, actor: 'agent', op: 'write', detail: { path: r.shown, bytes } });
       return { ...r, bytes };
     });
@@ -464,8 +551,7 @@ export class Sessions {
     if (!oldStr) throw new ToolError('edit_no_match', 'old_string is empty');
     if (oldStr === newStr) throw new ToolError('edit_no_change', 'old_string and new_string are the same');
     return this.lock.run(dir_id, async () => {
-      const root = this.rootOf(dir_id, r.where);
-      const got = await safeRead(root, r.rel, WRITE_CAP + 1);
+      const got = await this.readAt(dir_id, r.where, r.rel, WRITE_CAP + 1);
       if (!got) throw new ToolError('not_found', `${r.shown} does not exist in this session`);
       if (got.size > WRITE_CAP) throw new ToolError('too_large', `${r.shown} is ${got.size} bytes; edit takes files up to ${WRITE_CAP / 1024 / 1024} MB`);
       if (got.data.subarray(0, 8192).includes(0)) throw new ToolError('binary_file', `${r.shown} is a binary file`);
@@ -476,7 +562,7 @@ export class Sessions {
       if (count > 1 && !replaceAll) throw new ToolError('edit_not_unique', `old_string appears ${count} times in ${r.shown}`);
       const at = text.indexOf(oldStr);
       const out = replaceAll ? text.split(oldStr).join(newStr) : text.slice(0, at) + newStr + text.slice(at + oldStr.length);
-      await safeWrite(root, r.rel, out);
+      await this.writeAt(dir_id, r.where, r.rel, out);
       this.drive.activity({ dir_id, actor: 'agent', op: 'edit', detail: { path: r.shown, replaced: replaceAll ? count : 1 } });
       return { ...r, count: replaceAll ? count : 1, text: out, at };
     });
@@ -485,6 +571,16 @@ export class Sessions {
   /** A cheap fingerprint of /drive (paths, sizes, modification times; tool caches left out): did a command change anything? */
   async driveStamp(dir_id: string): Promise<string> {
     const h = createHash('sha256');
+    if (this.fsd) {
+      // upper/ (what the session wrote) and whiteouts (what it deleted) are all its changes.
+      const m = await this.fsd.manifest(dir_id);
+      for (const e of m.entries) {
+        if (isToolCache(e.type === 'd' ? `${e.path}/x` : e.path)) continue;
+        h.update(`${e.path}\0${e.type === 'd' || e.type === 'f' ? e.type : 'o'}\0${e.size}\0${e.mtime_ns}\n`);
+      }
+      for (const w of m.whiteouts) h.update(`-${w}\n`);
+      return h.digest('hex');
+    }
     const root = this.dirs(dir_id).upper;
     const walk = async (dir: string, rel: string): Promise<void> => {
       let entries;
@@ -520,13 +616,16 @@ export class Sessions {
 
   async destroySandbox(dir_id: string): Promise<void> {
     await this.sandbox.destroy(this.sandboxId(dir_id));
+    // The daemon goes with the sandbox (it unmounts); upper/ and whiteouts stay for the next one.
+    await this.fsd?.stop(dir_id);
     await this.sockets.get(dir_id)?.close();
     this.sockets.delete(dir_id);
   }
 
-  /** Stop every sandbox this server's prefix owns, and every session socket (shutdown, tests). */
+  /** Stop every sandbox this server's prefix owns, every daemon, and every session socket (shutdown, tests). */
   async destroyAll(): Promise<void> {
     for (const id of await this.sandbox.list()) await this.sandbox.destroy(id);
+    await this.fsd?.stopAll();
     for (const s of this.sockets.values()) await s.close();
     this.sockets.clear();
   }
@@ -537,6 +636,8 @@ export class Sessions {
   }
 
   async removeDirs(dir_id: string): Promise<void> {
+    // Never recurse into a live mount.
+    await this.fsd?.stop(dir_id);
     await fsp.rm(this.dirs(dir_id).root, { recursive: true, force: true });
   }
 }

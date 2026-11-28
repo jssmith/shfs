@@ -12,6 +12,7 @@ import type { OAuthClientInformationMixed, OAuthClientMetadata, OAuthTokens } fr
 import { createContext, type Context, type Surface } from '../../../server/src/context.js';
 import { startHttp, type HttpServer } from '../../../server/src/http.js';
 import { addDevice, setOwnerPassword } from '../../../server/src/auth/owner.js';
+import { TEST_FS_CONFIG } from '../../../server/src/testing.js';
 
 export const PASSWORD = 'synthetic-owner-password';
 
@@ -43,6 +44,7 @@ export async function startDrive(basePort: number, opts: { surface?: Surface } =
     rootfs: ROOTFS ?? '',
     sandboxPrefix: `${PREFIX}-e2e${port}-`,
     surface: opts.surface ?? 'v0',
+    ...TEST_FS_CONFIG,
   });
   setOwnerPassword(ctx.drive.db, PASSWORD);
   const deviceToken = addDevice(ctx.drive.db, 'test laptop').token;

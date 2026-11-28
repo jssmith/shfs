@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from 'vitest';
 import { existsSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { tempContext, upload, settle } from '../testing.js';
+import { tempContext, upload, settle, sessionDrive } from '../testing.js';
 import { mergeSession, diffSession } from '../merge/merge.js';
 import { ringCheck } from '../ingest/reading-stub.js';
 import { newSessionId } from '../util/ids.js';
@@ -33,7 +33,7 @@ test('symlinks planted in the working space never lead the host outside it', asy
   await upload(ctx, { 'evil/f.txt': 'drive file', 'ok.txt': 'fine' });
   await settle(ctx);
   const { row } = await ctx.sessions.start('c', 'p', {});
-  const up = ctx.sessions.dirs(row.dir_id).upper;
+  const up = await sessionDrive(ctx, row.dir_id);
   // The sandbox replaces a directory with a symlink to a host path, and adds file symlinks.
   rmSync(path.join(up, 'evil'), { recursive: true });
   symlinkSync(outside, path.join(up, 'evil'));
