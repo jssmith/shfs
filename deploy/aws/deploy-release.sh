@@ -65,7 +65,7 @@ log() { printf '%s [deploy %s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${version
 fail() { log "FAILED: $*"; exit 1; }
 aws_() { if [ -n "$region" ]; then aws --region "$region" "$@"; else aws "$@"; fi; }
 
-# --- tools this script needs; the VM may have nothing beyond the Ubuntu image.
+# --- tools this script needs; the VM may have nothing beyond the Debian image.
 ensure_tools() {
   local missing=()
   for t in zstd jq curl openssl flock sha256sum; do command -v "$t" >/dev/null || missing+=("$t"); done
@@ -75,9 +75,10 @@ ensure_tools() {
     apt-get update -q && apt-get install -y -q --no-install-recommends zstd jq curl openssl util-linux coreutils
   fi
   if ! command -v aws >/dev/null; then
-    # The AWS CLI v2 snap, published by AWS; snapd verifies its signature.
-    log "installing the AWS CLI (snap aws-cli)"
-    snap install aws-cli --classic
+    # Debian's awscli package (apt verifies it); the VM's first boot installs it
+    # too. snap is the fallback on Ubuntu machines without it.
+    log "installing the AWS CLI"
+    if apt-get install -y -q --no-install-recommends awscli; then :; else snap install aws-cli --classic; fi
   fi
 }
 

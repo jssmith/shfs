@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The build steps. The builder MicroVM runs them from the commit it builds
-# (deploy/aws/builder/run.sh); they also run on any Linux machine with the tools.
+# The build steps. GitHub Actions runs them (.github/workflows/ci.yml for every
+# push and pull request, release.yml for a version tag); they also run on any
+# Linux machine with the tools.
 #
 #   deploy/aws/ci.sh install            Node 22, system packages, runsc, Docker daemon
 #   deploy/aws/ci.sh smoke ROOTFS       start one gVisor sandbox with debug logs
@@ -10,13 +11,14 @@
 #   deploy/aws/ci.sh publish <out>      sign the manifest with KMS, upload to S3 (never
 #                                       overwriting), run AgentDrive-Deploy on the dev VM, wait
 #
-# Environment (the builder MicroVM sets these; deploy/aws/builder/run.sh):
+# Environment (release.yml sets these):
 #   BUILD_SOURCE_VERSION   the commit; it is the release version
-#   BUILD_ID, BUILD_ARN    recorded in the manifest; SOURCE_URL (default github.com/jssmith/shfs)
+#   BUILD_ID, BUILD_ARN    recorded in the manifest (the workflow run); SOURCE_URL (default
+#                          github.com/jssmith/shfs); RELEASE_TAG, the version tag
 #   ARTIFACT_BUCKET, SIGNING_KEY_ARN, DEPLOY_DOCUMENT (AgentDrive-Deploy),
 #   DEPLOY_TAG_VALUE (dev), AWS_REGION
 #   AGENT_DRIVE_ROOTFS     a ready sandbox rootfs; unset, test builds one with Docker
-#   TEST_MAX_WORKERS       cap on vitest's parallel workers (the builder sets 4)
+#   TEST_MAX_WORKERS       cap on vitest's parallel workers (default: one per CPU)
 #   GVISOR_TESTS   run (default) | skip   skip leaves AGENT_DRIVE_RUNSC unset, so the
 #                                         gVisor e2e suites skip themselves
 #   DEPLOY_WAIT_SECONDS  how long to wait for the deploy (default 2400)
@@ -159,11 +161,11 @@ c_archive() { # stage out
   jq -n --arg v "$version" --arg b "$built" '{version: $v, built_at: $b}' > "$stage/RELEASE"
   tar -C "$stage" --sort=name --owner=0 --group=0 --numeric-owner -cf - . | zstd -q -10 -T0 -o "$out/release.tar.zst"
   local nodev=""; command -v node >/dev/null && nodev=$(node -v)
-  jq -n --arg v "$version" --arg id "${BUILD_ID:-local}" --arg arn "${BUILD_ARN:-}" --arg src "${SOURCE_URL:-https://github.com/jssmith/shfs}" \
+  jq -n --arg v "$version" --arg id "${BUILD_ID:-local}" --arg arn "${BUILD_ARN:-}" --arg src "${SOURCE_URL:-https://github.com/jssmith/shfs}" --arg tag "${RELEASE_TAG:-}" \
     --arg b "$built" --arg node "$nodev" --arg a "$(sha256 "$out/release.tar.zst")" \
     --argjson size "$(stat -c %s "$out/release.tar.zst")" \
     --arg setup "$(sha256 "$stage/deploy/aws/setup.sh")" --arg prov "$(provision_hash "$stage")" \
-    '{format: 1, version: $v, source: $src, build_id: $id, build_arn: $arn,
+    '{format: 1, version: $v, tag: $tag, source: $src, build_id: $id, build_arn: $arn,
       built_at: $b, node_version: $node, archive: {name: "release.tar.zst", sha256: $a, size: $size},
       setup_sha256: $setup, provision_sha256: $prov}' > "$out/manifest.json"
   log "release $version: $(du -h "$out/release.tar.zst" | cut -f1)"

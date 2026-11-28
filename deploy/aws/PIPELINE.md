@@ -1,20 +1,18 @@
 # Deployment pipeline
 
-A builder Lambda MicroVM in AWS clones the public repository, tests (gVisor
-suites included), and makes signed, versioned releases; the drive VM, which has
-no GitHub access and no long-lived secrets, deploys a given release through one
-fixed SSM document. Design: `design-agent-drive/docs/deployment-pipeline.md`;
-why a MicroVM: decision 0007.
+GitHub Actions tests every push and pull request. A pushed version tag on a
+commit of `main` reruns the tests, then makes a signed, versioned release in
+S3 and deploys it to the dev VM, which has no GitHub access and no long-lived
+secrets, through one fixed SSM document. The release process for people:
+`docs/releasing.md`. History: decision 0007 (CodeBuild could not run gVisor; a
+Lambda MicroVM builder worked but its speed varied 4x between starts).
 
 ```
-push to main ──▶ GitHub webhook ──▶ Lambda agent-drive-build-trigger (function URL)
-                   checks X-Hub-Signature-256, keeps pushes to main of jssmith/shfs,
-                   │ RunMicrovm agent-drive-builder with {commit} (none if one is building)
-                   ▼
-                 builder MicroVM (deploy/aws/builder): git clone (public, no token),
-                   commit on main? → the commit's deploy/aws/ci.sh test | package | publish
-                   │ kms:Sign the manifest's digest → manifest.sig; result → builds/<sha>/
-                   │ main moved meanwhile? build the new head; then terminate itself
+push / pull request ──▶ .github/workflows/ci.yml: ci.sh test (gVisor suites included), Rust tests
+tag v* on main ──▶ .github/workflows/release.yml
+                   ci.yml again → tag on main? → npm ci, build → ci.sh package
+                   │ GitHub OIDC token → sts:AssumeRoleWithWebIdentity agent-drive-release-us-east-2
+                   │ ci.sh publish: kms:Sign the manifest's digest → manifest.sig
                    ▼
                  s3://agent-drive-artifacts-<account>-<region>/releases/<sha>/  (put-if-absent)
                    │ ssm:SendCommand AgentDrive-Deploy Version=<sha>, tag agent-drive=dev
@@ -29,16 +27,17 @@ push to main ──▶ GitHub webhook ──▶ Lambda agent-drive-build-trigger
 
 | File | What |
 | --- | --- |
-| `pipeline.yaml` | Stack `agent-drive-pipeline`: bucket, signing key, builder roles and logs, webhook secret, trigger function and URL, SSM document |
-| `builder/` | The builder MicroVM image: `make-image.sh` (zip with the Dockerfile), `runner.mjs` (hooks), `run.sh` (one build), `prepare.sh` (cgroups for gVisor), `warm.sh` (snapshot prefetch), `sandbox-hash.sh` |
-| `trigger/` | The trigger function (`index.mjs`, tested by `index.test.mjs`) and `make-zip.sh` |
-| `dev-vm.yaml` | The VM stack; `ReleaseReadPolicy` lets its instance role read releases and the public key |
-| `ci.sh` | Build steps: test, package, publish (sign, upload, deploy, wait); run by the builder from the commit being built |
+| `../../.github/workflows/ci.yml` | Tests on every push to `main` and every pull request; reused by `release.yml` |
+| `../../.github/workflows/release.yml` | On a `v*` tag: CI, then package, sign, upload, deploy |
+| `pipeline.yaml` | Stack `agent-drive-pipeline`: bucket, signing key, GitHub OIDC provider, release role, SSM document |
+| `dev-vm.yaml` | The VM stack (Debian 13); `ReleaseReadPolicy` lets its instance role read releases and the public key |
+| `ci.sh` | Build steps: test, package, publish (sign, upload, deploy, wait) |
 | `deploy-release.sh` | VM-side deploy; embedded verbatim in the document |
 | `sync-deploy-document.py` | Copies `deploy-release.sh` into `pipeline.yaml`; run it after changing the script |
 | `test/test-deploy-release.sh` | Local test of publish and deploy with stub `aws`, `systemctl`, `curl` and a real P-256 key |
 | `test/test-release-smoke.sh` | Packages this checkout, deploys it with stubs, and checks the real server's `/healthz` |
 | `test/check-deploy-document.py` | The document takes only a sha, embeds the current script, and parses with `sh -n` |
+| `test-setup-in-container.sh` | `setup.sh` in a fresh Debian 13 container |
 
 ## A release
 
@@ -47,10 +46,10 @@ push to main ──▶ GitHub webhook ──▶ Lambda agent-drive-build-trigger
 | Object | Contents |
 | --- | --- |
 | `release.tar.zst` | `package.json`, lockfile, `server/` and `cli/` (`dist`, `package.json`, data files from `src/`), production `node_modules`, `deploy/`, `sandbox/`, `RELEASE` |
-| `manifest.json` | `format`, `version`, `source`, `build_id` (the builder MicroVM), `build_arn`, `built_at`, `node_version`, `archive.{name,sha256,size}`, `setup_sha256`, `provision_sha256` |
+| `manifest.json` | `format`, `version`, `tag`, `source`, `build_id` and `build_arn` (the workflow run), `built_at`, `node_version`, `archive.{name,sha256,size}`, `setup_sha256`, `provision_sha256` |
 | `manifest.sig` | ECDSA P-256 signature (DER) by KMS over the SHA-256 digest of `manifest.json` |
 
-Each object is uploaded with `If-None-Match: *`, and the builder role may only make
+Each object is uploaded with `If-None-Match: *`, and the release role may only make
 conditional puts, so a release is never overwritten. A rebuild of the same commit
 fails at upload; redeploy an existing release with the document instead. The
 manifest goes up last, so a manifest means a complete release.
@@ -98,34 +97,14 @@ needs AWS's signing key embedded in the document and kept current.
 All commands use `--region us-east-2`; the lead runs them through the AWS
 connector, showing each call first.
 
-1. **Trigger zip.** `deploy/aws/trigger/make-zip.sh trigger.zip`, upload to
-   `s3://<bucket>/builder/trigger-<sha256 prefix>.zip`.
-2. **Update the pipeline stack** with `TriggerCodeKey` set to that key. Read the
-   change set first: it removes the CodeBuild project, its role and the GitHub
-   connection, adds the builder and trigger resources, and modifies the signing
-   key's policy (the builder role becomes the only signer). Bucket and key are
+1. **Pipeline stack** (`pipeline.yaml`): bucket, key, OIDC provider, release
+   role, document. Read the change set before running it; bucket and key are
    modified, never replaced.
-3. **Builder image.** `deploy/aws/builder/make-image.sh builder.zip`, upload to
-   `s3://<bucket>/builder/image-<sha256 prefix>.zip`, then `CreateMicrovmImage`
-   (first time) or `UpdateMicrovmImage` named `agent-drive-builder`: base
-   `al2023-1`, build role `agent-drive-builder-image-us-east-2`,
-   `cpuConfigurations` `X86_64`, `resources` 8192 MiB, `additionalOsCapabilities`
-   `ALL`, hooks on port 9000 (`ready` 120 s, `validate` 900 s, `run` 5 s),
-   logging to `/aws/lambda-microvms/agent-drive-builder`. About 9 minutes. Set
-   the stack's `BuilderImageVersion` to the new version.
-4. **A first build by hand** (`BuildCommit` output), follow it in
-   `/aws/lambda-microvms/agent-drive-builder`; the result lands in
-   `s3://<bucket>/builds/<sha>/<microvm>.json`.
-5. **Johann adds the webhook on GitHub**: jssmith/shfs > Settings > Webhooks >
-   Add webhook. Payload URL: the stack's `WebhookUrl`; content type
-   `application/json`; Secret: the value of the Secrets Manager secret
-   `agent-drive/github-webhook` (console: Secrets Manager > the secret >
-   *Retrieve secret value*); *Just the push event*. GitHub sends a ping, which
-   the trigger answers with 200.
-
-Rebuild the builder image (step 3) when `sandbox/` or the toolchain changes:
-a commit whose `sandbox/` differs from the image's is tested but not released
-(its result says so).
+2. **VM stack** (`dev-vm.yaml`, `PipelineStackName=agent-drive-pipeline`): its
+   first boot installs the SSM agent and the AWS CLI; `RunSetup=false` leaves
+   the rest to the first release.
+3. **A release:** push a version tag on a commit of `main` (`docs/releasing.md`).
+   The first deploy runs `setup.sh` (provisioning changed from none).
 
 ## Deploying or rolling back by hand
 
@@ -144,34 +123,26 @@ restarted). To list releases: `aws s3 ls s3://agent-drive-artifacts-277611628110
 The `AgentDriveDev` permission set allows `ssm:SendCommand` with
 `AWS-RunShellScript` only; to let that identity deploy, add
 `arn:aws:ssm:*:*:document/AgentDrive-Deploy` to its `RunCommandDocument`
-statement (and `lambda:InvokeFunction` on `agent-drive-build-trigger` and
-`logs:GetLogEvents` on `/aws/lambda-microvms/agent-drive-builder` to start and follow builds).
+statement.
 
 ## What each role can and cannot do
 
-**Builder role** `agent-drive-builder-us-east-2` (the builder MicroVM's execution role):
+**Release role** `agent-drive-release-us-east-2`, assumable only with GitHub's
+OIDC token for a workflow running on a `v*` tag of `jssmith/shfs`
+(`sub` = `repo:jssmith/shfs:ref:refs/tags/v*`, `aud` = `sts.amazonaws.com`),
+for at most an hour:
 
 | Can | Resource |
 | --- | --- |
-| `logs:CreateLogGroup`, `CreateLogStream`, `PutLogEvents` | log groups `/aws/lambda-microvms/*` |
 | `s3:PutObject`, only with `If-None-Match` | `releases/*` in the artifact bucket |
 | `s3:GetObject` | `releases/*` |
-| `s3:PutObject` | `builds/*` (build results) |
 | `kms:Sign` (ECDSA_SHA_256), `kms:GetPublicKey`, `kms:Verify` | the release signing key |
 | `ssm:SendCommand` | document `AgentDrive-Deploy`, on instances tagged `agent-drive=dev` |
 | `ssm:GetCommandInvocation`, `ssm:ListCommandInvocations` | `*` (no resource-level permissions exist) |
-| `lambda:TerminateMicrovm` | `*` (to stop itself when done) |
 
 It cannot: overwrite or delete a release, list the bucket, run any other SSM
 document or any shell of its choosing on the VM, reach untagged instances,
-change IAM, KMS or the stack, or write to GitHub (it holds no GitHub credential).
-
-**Trigger role** `agent-drive-build-trigger-us-east-2`: read the webhook secret;
-`lambda:RunMicrovm`, `lambda:ListMicrovms`; pass the AWS default network
-connectors and the builder role. Nothing else.
-
-**Image build role** `agent-drive-builder-image-us-east-2`: read `builder/*` in
-the bucket and write logs, while Lambda builds the MicroVM image.
+change IAM, KMS or the stack. A branch push or pull request cannot assume it.
 
 **VM instance role** `agent-drive-dev-instance-us-east-2`:
 
@@ -186,7 +157,7 @@ reach GitHub with any credential (it holds none).
 
 **Signing key** `alias/agent-drive-release-signing` (ECC_NIST_P256, SIGN_VERIFY):
 account root administers it; an explicit Deny keeps every principal except the
-builder role from `kms:Sign`, administrators included. The private key never
+release role from `kms:Sign`, administrators included. The private key never
 leaves KMS.
 
 **Bucket**: versioned, SSE-S3, all public access blocked, ACLs disabled, TLS-only
@@ -196,22 +167,20 @@ signature provides integrity, and readers need no extra KMS permissions.
 
 ## Trust
 
-Whoever can push to `main` can deploy to dev: that is the design. The trigger
-is public but checks GitHub's signature; even a forged trigger only names a sha:
-the builder clones the repository itself and releases only a commit on `main`,
-so the worst a forged call can do is start a build of code already on `main`. The VM accepts
-only a manifest signed by the KMS key, for the version it was asked for (a
-manifest copied from another version's path is refused), and only an archive
-whose sha256 is in that manifest. A compromised bucket can withhold releases but
-not change one. A compromised VM can read releases (public code) and verify
-signatures, nothing more.
+Whoever can push a version tag can deploy to dev; `main` itself only changes
+through pull requests that pass CI (the `main` ruleset). A tag on a commit not
+on `main` is refused by the workflow. The VM accepts only a manifest signed by
+the KMS key, for the version it was asked for (a manifest copied from another
+version's path is refused), and only an archive whose sha256 is in that
+manifest. A compromised bucket can withhold releases but not change one. A
+compromised VM can read releases (public code) and verify signatures, nothing
+more.
 
 ## Not covered yet
 
 - ECR for the sandbox image: the VM builds its rootfs from `sandbox/` with
   Docker when provisioning changes. A rollback does not roll the rootfs back.
-- The Rust `fs/` daemon is not built, tested or shipped by the builder (not in use by the server).
-- OCR tests: Amazon Linux 2023 has no tesseract package, so the builder skips them.
-- Commit statuses on GitHub (needs a GitHub App with commit-status write); results are in `builds/` and the logs.
+- The Rust `fs/` daemon is tested by CI but not shipped in releases (not in use by the server yet).
+- A ruleset on `v*` tags (who may create them; no moving or deleting).
 - Production (`agent-drive=prod`, manual approval) and restricting the VM's
   outbound network.

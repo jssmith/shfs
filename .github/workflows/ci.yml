@@ -8,6 +8,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:   # release.yml runs the same checks before it releases
 permissions:
   contents: read
 concurrency:

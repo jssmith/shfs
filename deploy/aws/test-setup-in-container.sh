@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run setup.sh in a fresh Ubuntu 24.04 container, as close to a new VM as a
+# Run setup.sh in a fresh Debian 13 container, as close to a new VM as a
 # container gets: a loop device stands in for the EBS data volume, the host's
 # Docker daemon builds the sandbox image, and there is no systemd (units are
 # written, not enabled). Removes the container and the loop device at the end;
@@ -11,7 +11,7 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 name="${NAME:-a3-setup-test}"
 out="${OUT:-/tmp/a3-data/setup-test}"
-image="${IMAGE:-public.ecr.aws/ubuntu/ubuntu:24.04}"
+image="${IMAGE:-public.ecr.aws/docker/library/debian:trixie}"
 mkdir -p "$out"
 
 # A 4 GB sparse file as the "data volume".

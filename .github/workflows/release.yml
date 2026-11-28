@@ -1,0 +1,66 @@
+name: release
+# A pushed version tag (v*) on a commit of main: the full CI again, then a
+# signed release in S3, deployed to the dev VM (deploy/aws/PIPELINE.md,
+# docs/releasing.md). AWS access is ReleaseRole's short-lived credentials,
+# from GitHub's OIDC token; no AWS keys are stored here.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+concurrency:
+  group: release   # one release at a time, so deploys never overlap
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  RELEASE_ROLE_ARN: arn:aws:iam::277611628110:role/agent-drive-release-us-east-2
+  ARTIFACT_BUCKET: agent-drive-artifacts-277611628110-us-east-2
+  SIGNING_KEY_ARN: arn:aws:kms:us-east-2:277611628110:key/90e2a770-c860-4ec5-811e-ba5bc95fb091
+  DEPLOY_DOCUMENT: AgentDrive-Deploy
+  DEPLOY_TAG_VALUE: dev
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write   # GitHub's OIDC token, exchanged for ReleaseRole
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The tag is on main
+        run: |
+          git fetch -q origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not on main"; exit 1; }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: System packages
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends jq zstd
+      - name: Build
+        run: npm ci --no-fund --no-audit && npm run build
+      - name: Package
+        env:
+          BUILD_SOURCE_VERSION: ${{ github.sha }}
+          BUILD_ID: ${{ github.run_id }}
+          BUILD_ARN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: deploy/aws/ci.sh package "$RUNNER_TEMP/release"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.RELEASE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: release-${{ github.run_id }}
+      - name: Sign, upload and deploy
+        env:
+          BUILD_ID: ${{ github.run_id }}
+        run: deploy/aws/ci.sh publish "$RUNNER_TEMP/release"
